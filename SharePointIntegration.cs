@@ -1,19 +1,15 @@
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
-using System.Text;
 using System.Security.Cryptography;
-using System.ServiceProcess;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Newtonsoft.Json;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 
 namespace EventLogOutEmployeeService
 {
@@ -22,12 +18,10 @@ namespace EventLogOutEmployeeService
         private readonly string _tenantId;
         private readonly string _clientId;
         private readonly string _clientSecret;
-        private readonly string _resource;
         private readonly string _siteId;
         private readonly string _listId;
         private static bool _hasWaitedForNetwork = false;
         private static readonly object _networkWaitLock = new object();
-        private static DateTime _serviceStartTime = DateTime.Now;
         private static DateTime _lastShutdownEventTime = DateTime.MinValue;
         private static DateTime _lastSleepEventTime = DateTime.MinValue;
         private static readonly TimeSpan ShutdownEventWindow = TimeSpan.FromMinutes(2);
@@ -35,7 +29,7 @@ namespace EventLogOutEmployeeService
 
         public static void SetServiceStartTime(DateTime startTime)
         {
-            _serviceStartTime = startTime;
+            _ = startTime;
         }
 
         public static void MarkShutdownEvent(DateTime eventTime)
@@ -59,53 +53,70 @@ namespace EventLogOutEmployeeService
             try
             {
                 string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "");
-                string configPath = Path.Combine(basePath, "appsettings.json.encrypted");
-
-                // Read encrypted file
-                byte[] encryptedData = File.ReadAllBytes(configPath);
-                
-                // Decrypt using DPAPI
-                byte[] decryptedData = ProtectedData.Unprotect(
-                    encryptedData, 
-                    null, 
-                    DataProtectionScope.LocalMachine
-                );
-                
-                string jsonContent = Encoding.UTF8.GetString(decryptedData);
-                
-                var configBuilder = new ConfigurationBuilder();
-                using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(jsonContent)))
-                {
-                    configBuilder.AddJsonStream(stream);
-                }
-                
-                var configuration = configBuilder.Build();
+                var configuration = LoadConfiguration(basePath);
 
                 var azureSettings = configuration.GetSection("AzureSettings");
                 var sharePointSettings = configuration.GetSection("SharePointSettings");
 
-                _tenantId = azureSettings["TenantId"];
-                _clientId = azureSettings["ClientId"];
-                _clientSecret = azureSettings["ClientSecret"];
-                _resource = azureSettings["Resource"];
-                _siteId = sharePointSettings["SiteId"];
-                _listId = sharePointSettings["ListId"];
+                _tenantId = azureSettings["TenantId"] ?? throw new InvalidOperationException("AzureSettings:TenantId is missing");
+                _clientId = azureSettings["ClientId"] ?? throw new InvalidOperationException("AzureSettings:ClientId is missing");
+                _clientSecret = azureSettings["ClientSecret"] ?? throw new InvalidOperationException("AzureSettings:ClientSecret is missing");
+                _siteId = sharePointSettings["SiteId"] ?? throw new InvalidOperationException("SharePointSettings:SiteId is missing");
+                _listId = sharePointSettings["ListId"] ?? throw new InvalidOperationException("SharePointSettings:ListId is missing");
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"Error loading SharePoint configuration: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"Error loading SharePoint configuration: {ex.Message}",
                     EventLogEntryType.Error, 1012);
                 throw;
             }
         }
 
-        public async Task<string> GetAccessTokenAsync(DateTime eventTime, int eventId)
+
+        private IConfiguration LoadConfiguration(string baseDirectory)
+        {
+            string plainConfigPath = Path.Combine(baseDirectory, "appsettings.json");
+            if (File.Exists(plainConfigPath))
+            {
+                var plainConfigBuilder = new ConfigurationBuilder()
+                    .SetBasePath(baseDirectory)
+                    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false);
+
+                return plainConfigBuilder.Build();
+            }
+
+            string encryptedConfigPath = Path.Combine(baseDirectory, "appsettings.json.encrypted");
+            if (!File.Exists(encryptedConfigPath))
+            {
+                throw new FileNotFoundException(
+                    $"Configuration file not found. Expected either '{plainConfigPath}' or '{encryptedConfigPath}'.");
+            }
+
+            byte[] encryptedData = File.ReadAllBytes(encryptedConfigPath);
+            byte[] decryptedData = ProtectedData.Unprotect(
+                encryptedData,
+                null,
+                DataProtectionScope.LocalMachine
+            );
+
+            string jsonContent = Encoding.UTF8.GetString(decryptedData);
+
+            var configBuilder = new ConfigurationBuilder();
+            using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(jsonContent)))
+            {
+                configBuilder.AddJsonStream(stream);
+            }
+
+            return configBuilder.Build();
+        }
+
+        public async Task<string?> GetAccessTokenAsync(DateTime eventTime, int eventId)
         {
             bool isShutdownEvent = (eventId == 1074 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42);
             bool inShutdownWindow = (DateTime.Now - _lastShutdownEventTime) < ShutdownEventWindow;
             bool needsNetworkWait = false;
-            
+
             if (!_hasWaitedForNetwork)
             {
                 if (isShutdownEvent || inShutdownWindow)
@@ -117,7 +128,7 @@ namespace EventLogOutEmployeeService
                     needsNetworkWait = true;
                 }
             }
-            
+
             lock (_networkWaitLock)
             {
                 if (needsNetworkWait && !_hasWaitedForNetwork)
@@ -150,7 +161,7 @@ namespace EventLogOutEmployeeService
                         {
                             string responseBody = await response.Content.ReadAsStringAsync();
                             var token = JsonConvert.DeserializeObject<TokenResponse>(responseBody);
-                            return token.access_token;
+                            return token?.access_token;
                         }
                         else
                         {
@@ -178,7 +189,7 @@ namespace EventLogOutEmployeeService
                         throw;
                     }
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
                     if (attempt < maxRetries)
                     {
@@ -198,7 +209,7 @@ namespace EventLogOutEmployeeService
         public async Task AddRecordToSharePointAsync(string accessToken, string username, DateTime eventTime, int eventId, string eventType, string computerName)
         {
             bool isShutdownEvent = (eventId == 1074 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42);
-            
+
             int maxRetries = isShutdownEvent ? 2 : 3;
             int timeoutSeconds = isShutdownEvent ? 10 : 30;
             int delayMs = isShutdownEvent ? 1000 : 3000;
@@ -264,7 +275,7 @@ namespace EventLogOutEmployeeService
             try
             {
                 string accessToken = await GetAccessTokenAsync(DateTime.Now, 0);
-                
+
                 if (string.IsNullOrEmpty(accessToken))
                     return;
 
@@ -301,7 +312,7 @@ namespace EventLogOutEmployeeService
 
                             string eventTimeStr = fields.EventTime.ToString();
                             DateTime eventTime;
-                            
+
                             if (!DateTime.TryParse(eventTimeStr, out eventTime))
                                 continue;
 
@@ -322,8 +333,8 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"Error in cleanup task: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"Error in cleanup task: {ex.Message}",
                     EventLogEntryType.Warning, 1013);
             }
         }
