@@ -1,0 +1,331 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Text;
+using System.Security.Cryptography;
+using System.ServiceProcess;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+
+namespace EventLogOutEmployeeService
+{
+    public class SharePointIntegration
+    {
+        private readonly string _tenantId;
+        private readonly string _clientId;
+        private readonly string _clientSecret;
+        private readonly string _resource;
+        private readonly string _siteId;
+        private readonly string _listId;
+        private static bool _hasWaitedForNetwork = false;
+        private static readonly object _networkWaitLock = new object();
+        private static DateTime _serviceStartTime = DateTime.Now;
+        private static DateTime _lastShutdownEventTime = DateTime.MinValue;
+        private static DateTime _lastSleepEventTime = DateTime.MinValue;
+        private static readonly TimeSpan ShutdownEventWindow = TimeSpan.FromMinutes(2);
+        private static readonly TimeSpan SleepEventWindow = TimeSpan.FromHours(2);
+
+        public static void SetServiceStartTime(DateTime startTime)
+        {
+            _serviceStartTime = startTime;
+        }
+
+        public static void MarkShutdownEvent(DateTime eventTime)
+        {
+            _lastShutdownEventTime = eventTime;
+        }
+
+        public static void MarkSleepEvent(DateTime eventTime)
+        {
+            _lastSleepEventTime = eventTime;
+        }
+
+        public static bool IsValidWakeEvent(DateTime eventTime)
+        {
+            var timeSinceSleep = eventTime - _lastSleepEventTime;
+            return (timeSinceSleep.TotalHours > 0 && timeSinceSleep.TotalHours <= 2);
+        }
+
+        public SharePointIntegration()
+        {
+            try
+            {
+                string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "");
+                string configPath = Path.Combine(basePath, "appsettings.json.encrypted");
+
+                // Read encrypted file
+                byte[] encryptedData = File.ReadAllBytes(configPath);
+                
+                // Decrypt using DPAPI
+                byte[] decryptedData = ProtectedData.Unprotect(
+                    encryptedData, 
+                    null, 
+                    DataProtectionScope.LocalMachine
+                );
+                
+                string jsonContent = Encoding.UTF8.GetString(decryptedData);
+                
+                var configBuilder = new ConfigurationBuilder();
+                using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(jsonContent)))
+                {
+                    configBuilder.AddJsonStream(stream);
+                }
+                
+                var configuration = configBuilder.Build();
+
+                var azureSettings = configuration.GetSection("AzureSettings");
+                var sharePointSettings = configuration.GetSection("SharePointSettings");
+
+                _tenantId = azureSettings["TenantId"];
+                _clientId = azureSettings["ClientId"];
+                _clientSecret = azureSettings["ClientSecret"];
+                _resource = azureSettings["Resource"];
+                _siteId = sharePointSettings["SiteId"];
+                _listId = sharePointSettings["ListId"];
+            }
+            catch (Exception ex)
+            {
+                EventLog.WriteEntry("Application", 
+                    $"Error loading SharePoint configuration: {ex.Message}", 
+                    EventLogEntryType.Error, 1012);
+                throw;
+            }
+        }
+
+        public async Task<string> GetAccessTokenAsync(DateTime eventTime, int eventId)
+        {
+            bool isShutdownEvent = (eventId == 1074 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42);
+            bool inShutdownWindow = (DateTime.Now - _lastShutdownEventTime) < ShutdownEventWindow;
+            bool needsNetworkWait = false;
+            
+            if (!_hasWaitedForNetwork)
+            {
+                if (isShutdownEvent || inShutdownWindow)
+                {
+                    _hasWaitedForNetwork = true;
+                }
+                else
+                {
+                    needsNetworkWait = true;
+                }
+            }
+            
+            lock (_networkWaitLock)
+            {
+                if (needsNetworkWait && !_hasWaitedForNetwork)
+                {
+                    Thread.Sleep(30000);
+                    _hasWaitedForNetwork = true;
+                }
+            }
+
+            string authority = $"https://login.microsoftonline.com/{_tenantId}/oauth2/v2.0/token";
+            int maxRetries = 3;
+            int delayMs = 5000;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    using (var client = new HttpClient())
+                    {
+                        client.Timeout = TimeSpan.FromSeconds(30);
+
+                        var requestBody = new StringContent(
+                            $"grant_type=client_credentials&client_id={_clientId}&client_secret={_clientSecret}&scope=https://graph.microsoft.com/.default",
+                            Encoding.UTF8,
+                            "application/x-www-form-urlencoded"
+                        );
+
+                        HttpResponseMessage response = await client.PostAsync(authority, requestBody);
+                        if (response.IsSuccessStatusCode)
+                        {
+                            string responseBody = await response.Content.ReadAsStringAsync();
+                            var token = JsonConvert.DeserializeObject<TokenResponse>(responseBody);
+                            return token.access_token;
+                        }
+                        else
+                        {
+                            if (attempt < maxRetries)
+                            {
+                                await Task.Delay(delayMs);
+                                delayMs *= 2;
+                            }
+                            else
+                            {
+                                throw new Exception($"Failed to get access token after {maxRetries} attempts");
+                            }
+                        }
+                    }
+                }
+                catch (HttpRequestException ex) when (ex.InnerException is SocketException)
+                {
+                    if (attempt < maxRetries)
+                    {
+                        await Task.Delay(delayMs);
+                        delayMs *= 2;
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (attempt < maxRetries)
+                    {
+                        await Task.Delay(delayMs);
+                        delayMs *= 2;
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        public async Task AddRecordToSharePointAsync(string accessToken, string username, DateTime eventTime, int eventId, string eventType, string computerName)
+        {
+            bool isShutdownEvent = (eventId == 1074 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42);
+            
+            int maxRetries = isShutdownEvent ? 2 : 3;
+            int timeoutSeconds = isShutdownEvent ? 10 : 30;
+            int delayMs = isShutdownEvent ? 1000 : 3000;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    string eventTimeLocal = eventTime.ToString("yyyy-MM-ddTHH:mm:ss");
+
+                    var postData = new
+                    {
+                        fields = new
+                        {
+                            Title = $"{computerName}\\{eventId}\\{username}",
+                            Username = username,
+                            EventID = eventId,
+                            EventTime = eventTimeLocal,
+                            EventType = eventType,
+                            ComputerName = computerName
+                        }
+                    };
+
+                    using (var client = new HttpClient())
+                    {
+                        client.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
+                        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                        var content = new StringContent(JsonConvert.SerializeObject(postData), Encoding.UTF8, "application/json");
+
+                        string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items";
+
+                        HttpResponseMessage response = await client.PostAsync(url, content);
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            return;
+                        }
+                        else
+                        {
+                            if (attempt < maxRetries)
+                            {
+                                await Task.Delay(delayMs);
+                                delayMs = Math.Min(delayMs * 2, 10000);
+                            }
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    if (attempt < maxRetries)
+                    {
+                        await Task.Delay(delayMs);
+                        delayMs = Math.Min(delayMs * 2, 10000);
+                    }
+                }
+            }
+        }
+
+        public async Task CleanupOldRecordsAsync(int retentionMonths = 6)
+        {
+            try
+            {
+                string accessToken = await GetAccessTokenAsync(DateTime.Now, 0);
+                
+                if (string.IsNullOrEmpty(accessToken))
+                    return;
+
+                DateTime cutoffDate = DateTime.Now.AddMonths(-retentionMonths);
+
+                using (var client = new HttpClient())
+                {
+                    client.Timeout = TimeSpan.FromMinutes(5);
+                    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                    client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                    client.DefaultRequestHeaders.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
+
+                    string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items?$expand=fields&$select=id,fields&$top=5000";
+
+                    HttpResponseMessage response = await client.GetAsync(url);
+                    string responseContent = await response.Content.ReadAsStringAsync();
+
+                    if (!response.IsSuccessStatusCode)
+                        return;
+
+                    dynamic result = JsonConvert.DeserializeObject(responseContent);
+                    var items = result.value;
+
+                    if (items == null || items.Count == 0)
+                        return;
+
+                    foreach (var item in items)
+                    {
+                        try
+                        {
+                            var fields = item.fields;
+                            if (fields == null || fields.EventTime == null)
+                                continue;
+
+                            string eventTimeStr = fields.EventTime.ToString();
+                            DateTime eventTime;
+                            
+                            if (!DateTime.TryParse(eventTimeStr, out eventTime))
+                                continue;
+
+                            if (eventTime < cutoffDate)
+                            {
+                                string itemId = item.id;
+                                string deleteUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items/{itemId}";
+
+                                await client.DeleteAsync(deleteUrl);
+                                await Task.Delay(200);
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                EventLog.WriteEntry("Application", 
+                    $"Error in cleanup task: {ex.Message}", 
+                    EventLogEntryType.Warning, 1013);
+            }
+        }
+    }
+}
