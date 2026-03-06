@@ -1,27 +1,22 @@
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Net.Sockets;
-using System.Text;
-using System.Text.RegularExpressions;
 using System.Security.Cryptography;
 using System.ServiceProcess;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
-using Newtonsoft.Json;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 
 namespace EventLogOutEmployeeService
 {
     public class LoginLogoutMonitorService : ServiceBase
     {
-        private EventLog securityEventLog;
-        private EventLog systemEventLog;
+        private EventLog? securityEventLog;
+        private EventLog? systemEventLog;
         private string lastActiveUser = string.Empty;
         private CancellationTokenSource? cancellationTokenSource;
         private CancellationToken? cancellationToken;
@@ -37,8 +32,8 @@ namespace EventLogOutEmployeeService
                 if (Environment.OSVersion.Platform == PlatformID.Win32NT)
                 {
                     int retryCount = 3;
-                    Exception lastException = null;
-                    
+                    Exception? lastException = null;
+
                     for (int i = 0; i < retryCount; i++)
                     {
                         try
@@ -46,19 +41,19 @@ namespace EventLogOutEmployeeService
                             securityEventLog = new EventLog("Security");
                             systemEventLog = new EventLog("System");
                             serviceStartTime = DateTime.Now;
-                            
+
                             SharePointIntegration.SetServiceStartTime(serviceStartTime);
-                            
+
                             if (securityEventLog != null)
                             {
                                 securityEventLog.EntryWritten += new EntryWrittenEventHandler(OnSecurityEventWritten);
                             }
-                            
+
                             if (systemEventLog != null)
                             {
                                 systemEventLog.EntryWritten += new EntryWrittenEventHandler(OnSystemEventWritten);
                             }
-                            
+
                             break;
                         }
                         catch (Exception ex)
@@ -70,7 +65,7 @@ namespace EventLogOutEmployeeService
                             }
                         }
                     }
-                    
+
                     if (lastException != null && securityEventLog == null)
                     {
                         throw lastException;
@@ -79,48 +74,44 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"EmployeeLoginLogoutService constructor error: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"EmployeeLoginLogoutService constructor error: {ex.Message}",
                     EventLogEntryType.Error, 1001);
                 throw;
             }
+        }
+
+
+        public void StartForConsole(string[] args)
+        {
+            OnStart(args);
+        }
+
+        public void StopForConsole()
+        {
+            OnStop();
         }
 
         protected override void OnStart(string[] args)
         {
             int maxRetries = 5;
             int currentRetry = 0;
-            
+
             while (currentRetry < maxRetries)
             {
                 try
                 {
                     currentRetry++;
-                    
+
                     int delaySeconds = (currentRetry == 1) ? 10 : 3;
                     Thread.Sleep(delaySeconds * 1000);
-                    
+
                     string publishDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "");
                     Directory.SetCurrentDirectory(publishDirectory);
 
-                    string configPath = Path.Combine(publishDirectory, "appsettings.json.encrypted");
-                    if (!File.Exists(configPath))
-                    {
-                        if (currentRetry < maxRetries)
-                        {
-                            continue;
-                        }
-                        else
-                        {
-                            EventLog.WriteEntry("Application", 
-                                $"Configuration file not found: {configPath}", 
-                                EventLogEntryType.Error, 1003);
-                            return;
-                        }
-                    }
-
-                    // Load encrypted configuration
-                    var configuration = LoadEncryptedConfiguration(configPath);
+                    // Validate configuration (prefer plain appsettings.json for development,
+                    // fallback to appsettings.json.encrypted for production)
+                    _ = LoadConfiguration(publishDirectory);
 
                     cancellationTokenSource = new CancellationTokenSource();
                     cancellationToken = cancellationTokenSource.Token;
@@ -129,59 +120,69 @@ namespace EventLogOutEmployeeService
                     monitoringThread.IsBackground = true;
                     monitoringThread.Start();
 
-                    EventLog.WriteEntry("Application", 
-                        "EmployeeLoginLogoutService started successfully", 
+                    EventLog.WriteEntry("Application",
+                        "EmployeeLoginLogoutService started successfully",
                         EventLogEntryType.Information, 1000);
-                    
+
                     break;
                 }
                 catch (Exception ex)
                 {
                     if (currentRetry >= maxRetries)
                     {
-                        EventLog.WriteEntry("Application", 
-                            $"EmployeeLoginLogoutService failed to start after {maxRetries} attempts: {ex.Message}", 
+                        EventLog.WriteEntry("Application",
+                            $"EmployeeLoginLogoutService failed to start after {maxRetries} attempts: {ex.Message}",
                             EventLogEntryType.Error, 1002);
                         return;
                     }
-                    
+
                     Thread.Sleep(2000);
                 }
             }
         }
 
-        private IConfiguration LoadEncryptedConfiguration(string encryptedFilePath)
+        private IConfiguration LoadConfiguration(string baseDirectory)
         {
+            string plainConfigPath = Path.Combine(baseDirectory, "appsettings.json");
+            if (File.Exists(plainConfigPath))
+            {
+                var plainConfigBuilder = new ConfigurationBuilder()
+                    .SetBasePath(baseDirectory)
+                    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false);
+
+                return plainConfigBuilder.Build();
+            }
+
+            string encryptedConfigPath = Path.Combine(baseDirectory, "appsettings.json.encrypted");
+            if (!File.Exists(encryptedConfigPath))
+            {
+                throw new FileNotFoundException(
+                    $"Configuration file not found. Expected either '{plainConfigPath}' or '{encryptedConfigPath}'.");
+            }
+
             try
             {
-                // Read encrypted file
-                byte[] encryptedData = File.ReadAllBytes(encryptedFilePath);
-                
-                // Decrypt using DPAPI (LocalMachine scope)
+                byte[] encryptedData = File.ReadAllBytes(encryptedConfigPath);
                 byte[] decryptedData = ProtectedData.Unprotect(
-                    encryptedData, 
-                    null, 
+                    encryptedData,
+                    null,
                     DataProtectionScope.LocalMachine
                 );
-                
-                // Convert to JSON string
+
                 string jsonContent = Encoding.UTF8.GetString(decryptedData);
-                
-                // Create configuration from JSON string
+
                 var configBuilder = new ConfigurationBuilder();
-                
-                // Write to temporary memory stream
                 using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(jsonContent)))
                 {
                     configBuilder.AddJsonStream(stream);
                 }
-                
+
                 return configBuilder.Build();
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"Failed to decrypt configuration: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"Failed to decrypt configuration: {ex.Message}",
                     EventLogEntryType.Error, 1004);
                 throw;
             }
@@ -196,7 +197,7 @@ namespace EventLogOutEmployeeService
                     securityEventLog.EnableRaisingEvents = false;
                     securityEventLog.EntryWritten -= OnSecurityEventWritten;
                 }
-                
+
                 if (systemEventLog != null)
                 {
                     systemEventLog.EnableRaisingEvents = false;
@@ -206,14 +207,14 @@ namespace EventLogOutEmployeeService
                 cancellationTokenSource?.Cancel();
                 Thread.Sleep(1000);
 
-                EventLog.WriteEntry("Application", 
-                    "EmployeeLoginLogoutService stopped", 
+                EventLog.WriteEntry("Application",
+                    "EmployeeLoginLogoutService stopped",
                     EventLogEntryType.Information, 1005);
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"Error in OnStop: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"Error in OnStop: {ex.Message}",
                     EventLogEntryType.Warning, 1006);
             }
         }
@@ -241,8 +242,8 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"Error in MonitorEvents: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"Error in MonitorEvents: {ex.Message}",
                     EventLogEntryType.Error, 1007);
             }
         }
@@ -251,14 +252,14 @@ namespace EventLogOutEmployeeService
         {
             int cleanupHour = 3;
             int retentionMonths = 6;
-            
+
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
                     DateTime now = DateTime.Now;
                     DateTime nextRun = now.Date.AddHours(cleanupHour);
-                    
+
                     if (now.Hour >= cleanupHour)
                     {
                         nextRun = nextRun.AddDays(1);
@@ -266,12 +267,12 @@ namespace EventLogOutEmployeeService
 
                     DateTime todaysCleanup = now.Date.AddHours(cleanupHour);
                     bool missedCleanup = (now.Hour > cleanupHour) && (now.Date == todaysCleanup.Date);
-                    
+
                     if (missedCleanup)
                     {
                         int randomDelay = new Random(Environment.MachineName.GetHashCode()).Next(0, 300000);
                         await Task.Delay(randomDelay, cancellationToken);
-                        
+
                         var sharePointMissed = new SharePointIntegration();
                         await sharePointMissed.CleanupOldRecordsAsync(retentionMonths);
                     }
@@ -291,10 +292,10 @@ namespace EventLogOutEmployeeService
                 }
                 catch (Exception ex)
                 {
-                    EventLog.WriteEntry("Application", 
-                        $"Error in CleanupOldRecordsTask: {ex.Message}", 
+                    EventLog.WriteEntry("Application",
+                        $"Error in CleanupOldRecordsTask: {ex.Message}",
                         EventLogEntryType.Warning, 1008);
-                    
+
                     try
                     {
                         await Task.Delay(TimeSpan.FromHours(1), cancellationToken);
@@ -313,10 +314,10 @@ namespace EventLogOutEmployeeService
             {
                 if (e?.Entry == null || e.Entry.Message == null)
                     return;
-                
+
                 var log = e.Entry;
                 int eventId = log.EventID;
-                
+
                 if (eventId != 4624 && eventId != 4647)
                     return;
 
@@ -327,7 +328,7 @@ namespace EventLogOutEmployeeService
                     return;
 
                 var timeSinceServiceStart = eventTime - serviceStartTime;
-                
+
                 if (timeSinceServiceStart.TotalMinutes < -30)
                     return;
 
@@ -352,27 +353,27 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"Error in OnSecurityEventWritten: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"Error in OnSecurityEventWritten: {ex.Message}",
                     EventLogEntryType.Warning, 1009);
             }
         }
 
-        private string GetMostRecentUser(DateTime beforeTime)
+        private string? GetMostRecentUser(DateTime beforeTime)
         {
             try
             {
                 DateTime lookbackTime = beforeTime.AddHours(-1);
                 EventLog secLog = new EventLog("Security");
-                
+
                 int checkCount = 0;
                 int maxCheck = 50;
-                
+
                 for (int i = secLog.Entries.Count - 1; i >= 0 && checkCount < maxCheck; i--)
                 {
                     checkCount++;
                     EventLogEntry entry = secLog.Entries[i];
-                    
+
                     if ((entry.EventID == 4624 || entry.EventID == 4647) &&
                         entry.TimeGenerated >= lookbackTime &&
                         entry.TimeGenerated <= beforeTime)
@@ -380,7 +381,7 @@ namespace EventLogOutEmployeeService
                         if (entry.Message != null)
                         {
                             string username = GetUsernameFromEvent(entry.Message, entry.EventID);
-                            
+
                             if (!string.IsNullOrEmpty(username) && IsValidUsername(username))
                             {
                                 return username;
@@ -393,7 +394,7 @@ namespace EventLogOutEmployeeService
             {
                 // Silent fail
             }
-            
+
             return null;
         }
 
@@ -403,10 +404,10 @@ namespace EventLogOutEmployeeService
             {
                 if (e?.Entry == null || e.Entry.Message == null)
                     return;
-                
+
                 var log = e.Entry;
                 int eventId = log.EventID;
-                
+
                 if (eventId != 1074 && eventId != 6008 && eventId != 41 && eventId != 42)
                     return;
 
@@ -430,7 +431,7 @@ namespace EventLogOutEmployeeService
                 if (string.IsNullOrEmpty(username))
                 {
                     username = GetMostRecentUser(eventTime);
-                    
+
                     if (string.IsNullOrEmpty(username))
                         return;
                 }
@@ -448,8 +449,8 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"Error in OnSystemEventWritten: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"Error in OnSystemEventWritten: {ex.Message}",
                     EventLogEntryType.Warning, 1010);
             }
         }
@@ -458,9 +459,9 @@ namespace EventLogOutEmployeeService
         {
             string eventKey = $"{eventId}_{username}";
             var semaphore = eventProcessingLocks.GetOrAdd(eventKey, _ => new SemaphoreSlim(1, 1));
-            
+
             await semaphore.WaitAsync();
-            
+
             try
             {
                 if (eventFirstTimeDict.TryGetValue(eventKey, out DateTime firstEventTime))
@@ -502,8 +503,7 @@ namespace EventLogOutEmployeeService
 
             try
             {
-                var regex = new System.Text.RegularExpressions.Regex(@"Shut-down Type:\s*([^\r\n]+)", 
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                var regex = new Regex(@"Shut-down Type:\s*([^\r\n]+)", RegexOptions.IgnoreCase);
                 var match = regex.Match(eventMessage);
 
                 if (match.Success)
@@ -528,7 +528,7 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        private async Task ProcessEvent(int eventId, string username, DateTime eventTime, string computerName, string logType, string eventMessage = null)
+        private async Task ProcessEvent(int eventId, string username, DateTime eventTime, string computerName, string logType, string? eventMessage = null)
         {
             try
             {
@@ -563,7 +563,7 @@ namespace EventLogOutEmployeeService
 
                 var sharePoint = new SharePointIntegration();
                 string accessToken = await sharePoint.GetAccessTokenAsync(eventTime, eventId);
-                
+
                 if (string.IsNullOrEmpty(accessToken))
                     return;
 
@@ -571,13 +571,13 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application", 
-                    $"Error in ProcessEvent: {ex.Message}", 
+                EventLog.WriteEntry("Application",
+                    $"Error in ProcessEvent: {ex.Message}",
                     EventLogEntryType.Warning, 1011);
             }
         }
 
-        private string GetUsernameFromEvent(string message, int eventId)
+        private string? GetUsernameFromEvent(string message, int eventId)
         {
             try
             {
@@ -589,7 +589,7 @@ namespace EventLogOutEmployeeService
 
                     string newLogonSection = message.Substring(newLogonIndex);
 
-                    var regexAccountName = new System.Text.RegularExpressions.Regex(@"Account Name:\s*([^\r\n]+)");
+                    var regexAccountName = new Regex(@"Account Name:\s*([^\r\n]+)");
                     var matchAccountName = regexAccountName.Match(newLogonSection);
 
                     if (matchAccountName.Success)
@@ -622,7 +622,7 @@ namespace EventLogOutEmployeeService
 
                     string subjectSection = message.Substring(subjectIndex);
 
-                    var regexAccountName = new System.Text.RegularExpressions.Regex(@"Account Name:\s*([^\r\n]+)");
+                    var regexAccountName = new Regex(@"Account Name:\s*([^\r\n]+)");
                     var matchAccountName = regexAccountName.Match(subjectSection);
 
                     if (matchAccountName.Success)
