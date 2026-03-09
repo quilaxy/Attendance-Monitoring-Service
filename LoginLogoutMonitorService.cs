@@ -647,7 +647,7 @@ namespace EventLogOutEmployeeService
         private string ParseShutdownType(string? eventMessage)
         {
             if (string.IsNullOrEmpty(eventMessage))
-                return "Shutdown/Restart";
+                return "Shutdown/Restart Initiated";
 
             try
             {
@@ -660,19 +660,19 @@ namespace EventLogOutEmployeeService
 
                     if (shutdownType.Contains("restart") || shutdownType.Contains("reboot"))
                     {
-                        return "Restart";
+                        return "Restart Initiated";
                     }
                     else if (shutdownType.Contains("power off") || shutdownType.Contains("shutdown"))
                     {
-                        return "Shutdown";
+                        return "Shutdown Initiated";
                     }
                 }
 
-                return "Shutdown/Restart";
+                return "Shutdown/Restart Initiated";
             }
             catch
             {
-                return "Shutdown/Restart";
+                return "Shutdown/Restart Initiated";
             }
         }
 
@@ -684,17 +684,17 @@ namespace EventLogOutEmployeeService
                 {
                     "Security" => eventId switch
                     {
-                        4624 => "Login",
-                        4647 => "Logout",
+                        4624 => "User Login",
+                        4647 => "User Logout",
                         _ => "Unknown Security Event"
                     },
                     "System" => eventId switch
                     {
                         1074 => ParseShutdownType(eventMessage),
-                        6006 => "Fully Shutdown",
+                        6006 => "Shutdown Completed",
                         6008 => "Unexpected Shutdown",
-                        41 => "Crash/Rebooted",
-                        42 => "Sleep/Standby",
+                        41 => "System Crash",
+                        42 => "Sleep",
                         _ => "Unknown System Event"
                     },
                     _ => "Unknown Event"
