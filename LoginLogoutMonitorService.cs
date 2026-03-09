@@ -316,7 +316,7 @@ namespace EventLogOutEmployeeService
                     return;
 
                 var log = e.Entry;
-                int eventId = log.EventID;
+                int eventId = unchecked((int)log.InstanceId);
 
                 if (eventId != 4624 && eventId != 4647)
                     return;
@@ -333,7 +333,7 @@ namespace EventLogOutEmployeeService
                     return;
 
                 string eventMessage = log.Message;
-                string username = GetUsernameFromEvent(eventMessage, eventId);
+                string? username = GetUsernameFromEvent(eventMessage, eventId);
 
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
                     return;
@@ -374,13 +374,13 @@ namespace EventLogOutEmployeeService
                     checkCount++;
                     EventLogEntry entry = secLog.Entries[i];
 
-                    if ((entry.EventID == 4624 || entry.EventID == 4647) &&
+                    if ((unchecked((int)entry.InstanceId) == 4624 || unchecked((int)entry.InstanceId) == 4647) &&
                         entry.TimeGenerated >= lookbackTime &&
                         entry.TimeGenerated <= beforeTime)
                     {
                         if (entry.Message != null)
                         {
-                            string username = GetUsernameFromEvent(entry.Message, entry.EventID);
+                            string? username = GetUsernameFromEvent(entry.Message, unchecked((int)entry.InstanceId));
 
                             if (!string.IsNullOrEmpty(username) && IsValidUsername(username))
                             {
@@ -406,9 +406,9 @@ namespace EventLogOutEmployeeService
                     return;
 
                 var log = e.Entry;
-                int eventId = log.EventID;
+                int eventId = unchecked((int)log.InstanceId);
 
-                if (eventId != 1074 && eventId != 6008 && eventId != 41 && eventId != 42)
+                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     return;
 
                 DateTime eventTime = log.TimeGenerated;
@@ -421,7 +421,7 @@ namespace EventLogOutEmployeeService
                 if (timeSinceServiceStart.TotalMinutes < -30)
                     return;
 
-                string username;
+                string? username;
 
                 lock (userLock)
                 {
@@ -444,7 +444,7 @@ namespace EventLogOutEmployeeService
                 if (!await ShouldProcessEventAsync(eventId, username, eventTime))
                     return;
 
-                string eventMessage = (eventId == 1074) ? log.Message : null;
+                string? eventMessage = (eventId == 1074) ? log.Message : null;
                 await ProcessEvent(eventId, username, eventTime, computerName, "System", eventMessage);
             }
             catch (Exception ex)
@@ -496,7 +496,7 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        private string ParseShutdownType(string eventMessage)
+        private string ParseShutdownType(string? eventMessage)
         {
             if (string.IsNullOrEmpty(eventMessage))
                 return "Shutdown/Restart";
@@ -543,6 +543,7 @@ namespace EventLogOutEmployeeService
                     "System" => eventId switch
                     {
                         1074 => ParseShutdownType(eventMessage),
+                        6006 => "Fully Shutdown",
                         6008 => "Unexpected Shutdown",
                         41 => "Crash/Rebooted",
                         42 => "Sleep/Standby",
@@ -556,18 +557,37 @@ namespace EventLogOutEmployeeService
                     eventTime = DateTime.SpecifyKind(eventTime, DateTimeKind.Local);
                 }
 
-                if (eventId == 1074 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42)
+                if (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42)
                 {
                     SharePointIntegration.MarkShutdownEvent(eventTime);
                 }
 
                 var sharePoint = new SharePointIntegration();
-                string accessToken = await sharePoint.GetAccessTokenAsync(eventTime, eventId);
+                string? accessToken = await sharePoint.GetAccessTokenAsync(eventTime, eventId);
 
                 if (string.IsNullOrEmpty(accessToken))
                     return;
 
-                await sharePoint.AddRecordToSharePointAsync(accessToken, username, eventTime, eventId, eventType, computerName);
+                var rawTask = sharePoint.AddRecordToSharePointAsync(accessToken, username, eventTime, eventId, eventType, computerName);
+
+                Task? summaryTask = null;
+                if (eventId == 4624)
+                {
+                    summaryTask = sharePoint.UpsertDailySummaryLoginAsync(accessToken, username, computerName, eventTime);
+                }
+                else if (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 6008 || eventId == 41)
+                {
+                    summaryTask = sharePoint.TryUpdateDailySummaryShutdownAsync(accessToken, username, computerName, eventTime, eventId, eventType);
+                }
+
+                if (summaryTask != null)
+                {
+                    await Task.WhenAll(rawTask, summaryTask);
+                }
+                else
+                {
+                    await rawTask;
+                }
             }
             catch (Exception ex)
             {
