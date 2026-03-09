@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace EventLogOutEmployeeService
 {
@@ -20,6 +21,7 @@ namespace EventLogOutEmployeeService
         private readonly string _clientSecret;
         private readonly string _siteId;
         private readonly string _listId;
+        private readonly string? _summaryListId;
         private static bool _hasWaitedForNetwork = false;
         private static readonly object _networkWaitLock = new object();
         private static DateTime _lastShutdownEventTime = DateTime.MinValue;
@@ -63,6 +65,7 @@ namespace EventLogOutEmployeeService
                 _clientSecret = azureSettings["ClientSecret"] ?? throw new InvalidOperationException("AzureSettings:ClientSecret is missing");
                 _siteId = sharePointSettings["SiteId"] ?? throw new InvalidOperationException("SharePointSettings:SiteId is missing");
                 _listId = sharePointSettings["ListId"] ?? throw new InvalidOperationException("SharePointSettings:ListId is missing");
+                _summaryListId = sharePointSettings["SummaryListId"];
             }
             catch (Exception ex)
             {
@@ -113,7 +116,7 @@ namespace EventLogOutEmployeeService
 
         public async Task<string?> GetAccessTokenAsync(DateTime eventTime, int eventId)
         {
-            bool isShutdownEvent = (eventId == 1074 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42);
+            bool isShutdownEvent = (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42);
             bool inShutdownWindow = (DateTime.Now - _lastShutdownEventTime) < ShutdownEventWindow;
             bool needsNetworkWait = false;
 
@@ -208,7 +211,7 @@ namespace EventLogOutEmployeeService
 
         public async Task AddRecordToSharePointAsync(string accessToken, string username, DateTime eventTime, int eventId, string eventType, string computerName)
         {
-            bool isShutdownEvent = (eventId == 1074 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42);
+            bool isShutdownEvent = (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 6008 || eventId == 41 || eventId == 42);
 
             int maxRetries = isShutdownEvent ? 2 : 3;
             int timeoutSeconds = isShutdownEvent ? 10 : 30;
@@ -270,11 +273,212 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        public async Task UpsertDailySummaryLoginAsync(string accessToken, string username, string computerName, DateTime loginTime)
+        {
+            if (string.IsNullOrWhiteSpace(_summaryListId))
+                return;
+
+            string workDate = loginTime.ToString("yyyy-MM-dd");
+            string summaryKey = BuildSummaryKey(computerName, username, workDate);
+            DateTime expectedTimeOut = loginTime.AddHours(9);
+
+            using var client = CreateGraphClient(accessToken, 30);
+            string escapedSummaryKey = EscapeODataLiteral(summaryKey);
+            string findUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items?$expand=fields&$filter=fields/Title eq '{escapedSummaryKey}'&$top=1";
+
+            HttpResponseMessage findResponse = await client.GetAsync(findUrl);
+            if (!findResponse.IsSuccessStatusCode)
+                return;
+
+            var findBody = await findResponse.Content.ReadAsStringAsync();
+            var findObject = JsonConvert.DeserializeObject<JObject>(findBody);
+            var existingItems = findObject?["value"] as JArray;
+
+            if (existingItems != null && existingItems.Count > 0)
+            {
+                return;
+            }
+
+            var postData = new
+            {
+                fields = new
+                {
+                    Title = summaryKey,
+                    Username = username,
+                    ComputerName = computerName,
+                    WorkDate = workDate,
+                    LoginTime = loginTime.ToString("yyyy-MM-ddTHH:mm:ss"),
+                    ExpectedTimeOut = expectedTimeOut.ToString("yyyy-MM-ddTHH:mm:ss"),
+                    ShutdownType = string.Empty
+                }
+            };
+
+            var createContent = new StringContent(JsonConvert.SerializeObject(postData), Encoding.UTF8, "application/json");
+            await client.PostAsync($"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items", createContent);
+        }
+
+        public async Task TryUpdateDailySummaryShutdownAsync(string accessToken, string username, string computerName, DateTime shutdownTime, int eventId, string eventType)
+        {
+            if (string.IsNullOrWhiteSpace(_summaryListId))
+                return;
+
+            string workDate = shutdownTime.ToString("yyyy-MM-dd");
+            string summaryKey = BuildSummaryKey(computerName, username, workDate);
+
+            using var client = CreateGraphClient(accessToken, 30);
+            string escapedSummaryKey = EscapeODataLiteral(summaryKey);
+            string findUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items?$expand=fields&$filter=fields/Title eq '{escapedSummaryKey}'&$top=1";
+
+            HttpResponseMessage findResponse = await client.GetAsync(findUrl);
+            if (!findResponse.IsSuccessStatusCode)
+                return;
+
+            var findBody = await findResponse.Content.ReadAsStringAsync();
+            var findObject = JsonConvert.DeserializeObject<JObject>(findBody);
+            var existingItems = findObject?["value"] as JArray;
+            if (existingItems == null || existingItems.Count == 0)
+                return;
+
+            var summaryItem = existingItems[0];
+            string? itemId = summaryItem?["id"]?.ToString();
+            if (string.IsNullOrWhiteSpace(itemId))
+                return;
+
+            var fields = summaryItem?["fields"] as JObject;
+            DateTime? loginTime = ParseFieldDateTime(fields, "LoginTime");
+            DateTime? expectedTimeOut = ParseFieldDateTime(fields, "ExpectedTimeOut");
+            DateTime? currentShutdown = ParseFieldDateTime(fields, "ShutdownTime");
+            string? currentShutdownType = fields?["ShutdownType"]?.ToString();
+
+            if (!IsValidShutdownCandidate(eventId, eventType, shutdownTime, loginTime, expectedTimeOut))
+                return;
+
+            int newPriority = GetShutdownPriority(eventId, eventType);
+            int currentPriority = GetPriorityFromShutdownType(currentShutdownType);
+
+            if (newPriority < currentPriority)
+                return;
+
+            if (newPriority == currentPriority && currentShutdown.HasValue && currentShutdown.Value >= shutdownTime)
+                return;
+
+            string shutdownType = BuildShutdownType(eventId, eventType);
+            var updateData = new
+            {
+                fields = new
+                {
+                    ShutdownTime = shutdownTime.ToString("yyyy-MM-ddTHH:mm:ss"),
+                    ShutdownType = shutdownType
+                }
+            };
+
+            var patchContent = new StringContent(JsonConvert.SerializeObject(updateData), Encoding.UTF8, "application/json");
+            using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"), $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
+            {
+                Content = patchContent
+            };
+
+            await client.SendAsync(patchRequest);
+        }
+
+        private HttpClient CreateGraphClient(string accessToken, int timeoutSeconds)
+        {
+            var client = new HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(timeoutSeconds)
+            };
+
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            return client;
+        }
+
+        private static string BuildSummaryKey(string computerName, string username, string workDate)
+        {
+            return $"{computerName}\\{username}\\{workDate}";
+        }
+
+        private static string EscapeODataLiteral(string value)
+        {
+            return value.Replace("'", "''");
+        }
+
+        private static DateTime? ParseFieldDateTime(JObject? fields, string fieldName)
+        {
+            string? value = fields?[fieldName]?.ToString();
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+
+            return DateTime.TryParse(value, out DateTime parsed) ? parsed : null;
+        }
+
+        private static string BuildShutdownType(int eventId, string eventType)
+        {
+            return $"{eventId} - {eventType}";
+        }
+
+        private static int GetPriorityFromShutdownType(string? shutdownType)
+        {
+            if (string.IsNullOrWhiteSpace(shutdownType))
+                return 0;
+
+            string[] parts = shutdownType.Split('-', 2, StringSplitOptions.TrimEntries);
+            if (parts.Length == 0)
+                return 0;
+
+            if (!int.TryParse(parts[0], out int existingEventId))
+                return 0;
+
+            string existingEventType = parts.Length > 1 ? parts[1] : string.Empty;
+            return GetShutdownPriority(existingEventId, existingEventType);
+        }
+
+        private static bool IsValidShutdownCandidate(int eventId, string eventType, DateTime shutdownTime, DateTime? loginTime, DateTime? expectedTimeOut)
+        {
+            if (eventId == 1074 && eventType.Contains("Restart", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            DateTime referenceLogin = loginTime ?? shutdownTime.AddHours(-9);
+            DateTime referenceExpected = expectedTimeOut ?? referenceLogin.AddHours(9);
+
+            if (eventId == 6008 || eventId == 41)
+            {
+                return shutdownTime >= referenceExpected;
+            }
+
+            if (eventId == 4647)
+            {
+                return shutdownTime >= referenceExpected.AddHours(-2);
+            }
+
+            return true;
+        }
+
+        private static int GetShutdownPriority(int eventId, string eventType)
+        {
+            if (eventId == 6006)
+                return 5;
+
+            if (eventId == 1074 && !eventType.Contains("Restart", StringComparison.OrdinalIgnoreCase))
+                return 4;
+
+            if (eventId == 4647)
+                return 3;
+
+            if (eventId == 6008)
+                return 2;
+
+            if (eventId == 41)
+                return 1;
+
+            return 0;
+        }
+
         public async Task CleanupOldRecordsAsync(int retentionMonths = 6)
         {
             try
             {
-                string accessToken = await GetAccessTokenAsync(DateTime.Now, 0);
+                string? accessToken = await GetAccessTokenAsync(DateTime.Now, 0);
 
                 if (string.IsNullOrEmpty(accessToken))
                     return;
@@ -296,29 +500,30 @@ namespace EventLogOutEmployeeService
                     if (!response.IsSuccessStatusCode)
                         return;
 
-                    dynamic result = JsonConvert.DeserializeObject(responseContent);
-                    var items = result.value;
+                    var result = JsonConvert.DeserializeObject<JObject>(responseContent);
+                    var items = result?["value"] as JArray;
 
                     if (items == null || items.Count == 0)
                         return;
 
-                    foreach (var item in items)
+                    foreach (JToken item in items)
                     {
                         try
                         {
-                            var fields = item.fields;
-                            if (fields == null || fields.EventTime == null)
+                            var fields = item["fields"] as JObject;
+                            string? eventTimeStr = fields?["EventTime"]?.ToString();
+                            if (string.IsNullOrWhiteSpace(eventTimeStr))
                                 continue;
 
-                            string eventTimeStr = fields.EventTime.ToString();
-                            DateTime eventTime;
-
-                            if (!DateTime.TryParse(eventTimeStr, out eventTime))
+                            if (!DateTime.TryParse(eventTimeStr, out DateTime eventTime))
                                 continue;
 
                             if (eventTime < cutoffDate)
                             {
-                                string itemId = item.id;
+                                string? itemId = item["id"]?.ToString();
+                                if (string.IsNullOrWhiteSpace(itemId))
+                                    continue;
+
                                 string deleteUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items/{itemId}";
 
                                 await client.DeleteAsync(deleteUrl);
