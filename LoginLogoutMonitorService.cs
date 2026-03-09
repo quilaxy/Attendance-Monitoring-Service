@@ -22,11 +22,15 @@ namespace EventLogOutEmployeeService
         private readonly object userLock = new object();
         private DateTime serviceStartTime;
 
+        private static readonly string DataDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "Attendance-Monitoring-Service");
+
         private readonly string replayCheckpointPath =
-            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "event-replay.checkpoint");
+            Path.Combine(DataDirectory, "event-replay.checkpoint");
 
         private readonly PersistentEventQueue eventQueue =
-            new PersistentEventQueue(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "event-queue.json"));
+            new PersistentEventQueue(Path.Combine(DataDirectory, "event-queue.json"));
 
         public LoginLogoutMonitorService()
         {
