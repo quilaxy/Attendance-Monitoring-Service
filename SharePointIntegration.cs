@@ -223,11 +223,13 @@ namespace EventLogOutEmployeeService
                 {
                     string eventTimeLocal = eventTime.ToString("yyyy-MM-ddTHH:mm:ss");
 
+                    string title = $"{computerName}\\{eventId}\\{username}";
+
                     var postData = new
                     {
                         fields = new
                         {
-                            Title = $"{computerName}\\{eventId}\\{username}",
+                            Title = title,
                             Username = username,
                             EventID = eventId,
                             EventTime = eventTimeLocal,
@@ -241,6 +243,23 @@ namespace EventLogOutEmployeeService
                         client.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
                         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
                         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                        string escapedTitle = EscapeODataLiteral(title);
+                        string escapedEventTime = EscapeODataLiteral(eventTimeLocal);
+                        string checkUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items?$expand=fields&$filter=fields/Title eq '{escapedTitle}' and fields/EventTime eq '{escapedEventTime}'&$top=1";
+                        HttpResponseMessage checkResponse = await client.GetAsync(checkUrl);
+
+                        if (checkResponse.IsSuccessStatusCode)
+                        {
+                            var checkBody = await checkResponse.Content.ReadAsStringAsync();
+                            var checkObject = JsonConvert.DeserializeObject<JObject>(checkBody);
+                            var existingItems = checkObject?["value"] as JArray;
+
+                            if (existingItems != null && existingItems.Count > 0)
+                            {
+                                return;
+                            }
+                        }
 
                         var content = new StringContent(JsonConvert.SerializeObject(postData), Encoding.UTF8, "application/json");
 
