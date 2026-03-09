@@ -22,6 +22,7 @@ namespace EventLogOutEmployeeService
         private readonly object userLock = new object();
         private DateTime serviceStartTime;
         private readonly string replayCheckpointPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "event-replay.checkpoint");
+        private readonly PersistentEventQueue eventQueue = new PersistentEventQueue(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "event-queue.json"));
 
         public LoginLogoutMonitorService()
         {
@@ -215,7 +216,7 @@ namespace EventLogOutEmployeeService
                 if (eventId != 4624 && eventId != 4647)
                     continue;
 
-                _ = ProcessSecurityEntryAsync(entry, writeRawRecord);
+                ProcessSecurityEntryAsync(entry, writeRawRecord).GetAwaiter().GetResult();
             }
         }
 
@@ -239,7 +240,7 @@ namespace EventLogOutEmployeeService
                 if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     continue;
 
-                _ = ProcessSystemEntryAsync(entry, writeRawRecord);
+                ProcessSystemEntryAsync(entry, writeRawRecord).GetAwaiter().GetResult();
             }
         }
 
@@ -336,6 +337,7 @@ namespace EventLogOutEmployeeService
                 }
 
                 Task.Run(() => CleanupOldRecordsTask(cancellationToken), cancellationToken);
+                Task.Run(() => ProcessQueuedEventsTask(cancellationToken), cancellationToken);
 
                 while (!cancellationToken.IsCancellationRequested)
                 {
@@ -347,6 +349,98 @@ namespace EventLogOutEmployeeService
                 EventLog.WriteEntry("Application",
                     $"Error in MonitorEvents: {ex.Message}",
                     EventLogEntryType.Error, 1007);
+            }
+        }
+
+        private async Task ProcessQueuedEventsTask(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    QueuedAttendanceEvent? nextEvent = await eventQueue.PeekAsync(cancellationToken);
+                    if (nextEvent == null)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                        continue;
+                    }
+
+                    bool sent = await TryDispatchQueuedEventAsync(nextEvent);
+                    if (sent)
+                    {
+                        await eventQueue.RemoveByIdAsync(nextEvent.QueueId, cancellationToken);
+                        continue;
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+                }
+                catch (TaskCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    EventLog.WriteEntry("Application",
+                        $"Error in ProcessQueuedEventsTask: {ex.Message}",
+                        EventLogEntryType.Warning, 1015);
+
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(15), cancellationToken);
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        private async Task<bool> TryDispatchQueuedEventAsync(QueuedAttendanceEvent item)
+        {
+            try
+            {
+                var sharePoint = new SharePointIntegration();
+                string? accessToken = await sharePoint.GetAccessTokenAsync(item.EventTime, item.EventId);
+                if (string.IsNullOrEmpty(accessToken))
+                    return false;
+
+                Task? rawTask = null;
+                if (item.WriteRawRecord)
+                {
+                    rawTask = sharePoint.AddRecordToSharePointAsync(accessToken, item.Username, item.EventTime, item.EventId, item.EventType, item.ComputerName);
+                }
+
+                Task? summaryTask = null;
+                if (item.EventId == 4624)
+                {
+                    DateTime loginTime = item.LoginTime ?? item.EventTime;
+                    summaryTask = sharePoint.UpsertDailySummaryLoginAsync(accessToken, item.Username, item.ComputerName, loginTime);
+                }
+                else if (item.EventId == 1074 || item.EventId == 6006 || item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41)
+                {
+                    DateTime shutdownTime = item.ShutdownTime ?? item.EventTime;
+                    summaryTask = sharePoint.TryUpdateDailySummaryShutdownAsync(accessToken, item.Username, item.ComputerName, shutdownTime, item.EventId, item.EventType);
+                }
+
+                if (rawTask != null && summaryTask != null)
+                {
+                    await Task.WhenAll(rawTask, summaryTask);
+                }
+                else if (rawTask != null)
+                {
+                    await rawTask;
+                }
+                else if (summaryTask != null)
+                {
+                    await summaryTask;
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -553,7 +647,7 @@ namespace EventLogOutEmployeeService
         private string ParseShutdownType(string? eventMessage)
         {
             if (string.IsNullOrEmpty(eventMessage))
-                return "Shutdown/Restart Initiated";
+                return "Shutdown/Restart";
 
             try
             {
@@ -566,19 +660,19 @@ namespace EventLogOutEmployeeService
 
                     if (shutdownType.Contains("restart") || shutdownType.Contains("reboot"))
                     {
-                        return "Restart Initiated";
+                        return "Restart";
                     }
                     else if (shutdownType.Contains("power off") || shutdownType.Contains("shutdown"))
                     {
-                        return "Shutdown Initiated";
+                        return "Shutdown";
                     }
                 }
 
-                return "Shutdown/Restart Initiated";
+                return "Shutdown/Restart";
             }
             catch
             {
-                return "Shutdown/Restart Initiated";
+                return "Shutdown/Restart";
             }
         }
 
@@ -590,17 +684,17 @@ namespace EventLogOutEmployeeService
                 {
                     "Security" => eventId switch
                     {
-                        4624 => "User Login",
-                        4647 => "User Logout",
+                        4624 => "Login",
+                        4647 => "Logout",
                         _ => "Unknown Security Event"
                     },
                     "System" => eventId switch
                     {
                         1074 => ParseShutdownType(eventMessage),
-                        6006 => "Shutdown Completed",
+                        6006 => "Fully Shutdown",
                         6008 => "Unexpected Shutdown",
-                        41 => "System Crash",
-                        42 => "Sleep",
+                        41 => "Crash/Rebooted",
+                        42 => "Sleep/Standby",
                         _ => "Unknown System Event"
                     },
                     _ => "Unknown Event"
@@ -616,40 +710,38 @@ namespace EventLogOutEmployeeService
                     SharePointIntegration.MarkShutdownEvent(eventTime);
                 }
 
-                var sharePoint = new SharePointIntegration();
-                string? accessToken = await sharePoint.GetAccessTokenAsync(eventTime, eventId);
+                DateTime? loginTime = null;
+                DateTime? expectedTimeOut = null;
+                DateTime? shutdownTime = null;
+                string? shutdownType = null;
 
-                if (string.IsNullOrEmpty(accessToken))
-                    return;
-
-                Task? rawTask = null;
-                if (writeRawRecord)
-                {
-                    rawTask = sharePoint.AddRecordToSharePointAsync(accessToken, username, eventTime, eventId, eventType, computerName);
-                }
-
-                Task? summaryTask = null;
                 if (eventId == 4624)
                 {
-                    summaryTask = sharePoint.UpsertDailySummaryLoginAsync(accessToken, username, computerName, eventTime);
+                    loginTime = eventTime;
+                    expectedTimeOut = eventTime.AddHours(9);
                 }
                 else if (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 6008 || eventId == 41)
                 {
-                    summaryTask = sharePoint.TryUpdateDailySummaryShutdownAsync(accessToken, username, computerName, eventTime, eventId, eventType);
+                    shutdownTime = eventTime;
+                    shutdownType = $"{eventId} - {eventType}";
                 }
 
-                if (rawTask != null && summaryTask != null)
+                var queuedEvent = new QueuedAttendanceEvent
                 {
-                    await Task.WhenAll(rawTask, summaryTask);
-                }
-                else if (rawTask != null)
-                {
-                    await rawTask;
-                }
-                else if (summaryTask != null)
-                {
-                    await summaryTask;
-                }
+                    QueueId = Guid.NewGuid().ToString("N"),
+                    EventId = eventId,
+                    Username = username,
+                    EventTime = eventTime,
+                    ComputerName = computerName,
+                    EventType = eventType,
+                    LoginTime = loginTime,
+                    ExpectedTimeOut = expectedTimeOut,
+                    ShutdownTime = shutdownTime,
+                    ShutdownType = shutdownType,
+                    WriteRawRecord = writeRawRecord
+                };
+
+                await eventQueue.EnqueueAsync(queuedEvent);
             }
             catch (Exception ex)
             {
