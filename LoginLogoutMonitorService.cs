@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -20,10 +19,9 @@ namespace EventLogOutEmployeeService
         private string lastActiveUser = string.Empty;
         private CancellationTokenSource? cancellationTokenSource;
         private CancellationToken? cancellationToken;
-        private ConcurrentDictionary<string, DateTime> eventFirstTimeDict = new ConcurrentDictionary<string, DateTime>();
-        private ConcurrentDictionary<string, SemaphoreSlim> eventProcessingLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
         private readonly object userLock = new object();
         private DateTime serviceStartTime;
+        private readonly string replayCheckpointPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "event-replay.checkpoint");
 
         public LoginLogoutMonitorService()
         {
@@ -103,18 +101,21 @@ namespace EventLogOutEmployeeService
                 {
                     currentRetry++;
 
+                    serviceStartTime = DateTime.Now;
+                    SharePointIntegration.SetServiceStartTime(serviceStartTime);
+
                     int delaySeconds = (currentRetry == 1) ? 10 : 3;
                     Thread.Sleep(delaySeconds * 1000);
 
                     string publishDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "");
                     Directory.SetCurrentDirectory(publishDirectory);
 
-                    // Validate configuration (prefer plain appsettings.json for development,
-                    // fallback to appsettings.json.encrypted for production)
                     _ = LoadConfiguration(publishDirectory);
 
                     cancellationTokenSource = new CancellationTokenSource();
                     cancellationToken = cancellationTokenSource.Token;
+
+                    ReplayMissedEventsFromCheckpoint(writeRawRecord: true);
 
                     Thread monitoringThread = new Thread(() => MonitorEvents(cancellationToken.Value));
                     monitoringThread.IsBackground = true;
@@ -138,6 +139,107 @@ namespace EventLogOutEmployeeService
 
                     Thread.Sleep(2000);
                 }
+            }
+        }
+
+        private void ReplayMissedEventsFromCheckpoint(bool writeRawRecord)
+        {
+            try
+            {
+                DateTime replayTo = DateTime.Now;
+                DateTime? replayFrom = LoadReplayCheckpoint();
+
+                ReplaySecurityEvents(replayFrom, replayTo, writeRawRecord);
+                ReplaySystemEvents(replayFrom, replayTo, writeRawRecord);
+
+                SaveReplayCheckpoint(replayTo);
+            }
+            catch (Exception ex)
+            {
+                EventLog.WriteEntry("Application",
+                    $"Error while replaying startup events: {ex.Message}",
+                    EventLogEntryType.Warning, 1014);
+            }
+        }
+
+        private DateTime? LoadReplayCheckpoint()
+        {
+            try
+            {
+                if (!File.Exists(replayCheckpointPath))
+                    return null;
+
+                string value = File.ReadAllText(replayCheckpointPath).Trim();
+                if (DateTime.TryParse(value, null, System.Globalization.DateTimeStyles.RoundtripKind, out DateTime parsed))
+                {
+                    return parsed.ToLocalTime();
+                }
+            }
+            catch
+            {
+                // ignore malformed checkpoint and do full replay
+            }
+
+            return null;
+        }
+
+        private void SaveReplayCheckpoint(DateTime checkpoint)
+        {
+            try
+            {
+                File.WriteAllText(replayCheckpointPath, checkpoint.ToUniversalTime().ToString("O"));
+            }
+            catch
+            {
+                // ignore checkpoint write failures
+            }
+        }
+
+        private void ReplaySecurityEvents(DateTime? fromTime, DateTime toTime, bool writeRawRecord)
+        {
+            if (securityEventLog == null)
+                return;
+
+            for (int i = securityEventLog.Entries.Count - 1; i >= 0; i--)
+            {
+                EventLogEntry entry = securityEventLog.Entries[i];
+                DateTime eventTime = entry.TimeGenerated;
+
+                if (fromTime.HasValue && eventTime <= fromTime.Value)
+                    break;
+
+                if (eventTime > toTime)
+                    continue;
+
+                int eventId = unchecked((int)entry.InstanceId);
+                if (eventId != 4624 && eventId != 4647)
+                    continue;
+
+                _ = ProcessSecurityEntryAsync(entry, writeRawRecord);
+            }
+        }
+
+        private void ReplaySystemEvents(DateTime? fromTime, DateTime toTime, bool writeRawRecord)
+        {
+            if (systemEventLog == null)
+                return;
+
+            for (int i = systemEventLog.Entries.Count - 1; i >= 0; i--)
+            {
+                EventLogEntry entry = systemEventLog.Entries[i];
+                DateTime eventTime = entry.TimeGenerated;
+
+                if (fromTime.HasValue && eventTime <= fromTime.Value)
+                    break;
+
+                if (eventTime > toTime)
+                    continue;
+
+                int eventId = unchecked((int)entry.InstanceId);
+                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
+                    continue;
+
+                _ = ProcessSystemEntryAsync(entry, writeRawRecord);
             }
         }
 
@@ -310,12 +412,19 @@ namespace EventLogOutEmployeeService
 
         private async void OnSecurityEventWritten(object sender, EntryWrittenEventArgs e)
         {
+            if (e?.Entry == null)
+                return;
+
+            await ProcessSecurityEntryAsync(e.Entry, writeRawRecord: true);
+        }
+
+        private async Task ProcessSecurityEntryAsync(EventLogEntry log, bool writeRawRecord)
+        {
             try
             {
-                if (e?.Entry == null || e.Entry.Message == null)
+                if (log.Message == null)
                     return;
 
-                var log = e.Entry;
                 int eventId = unchecked((int)log.InstanceId);
 
                 if (eventId != 4624 && eventId != 4647)
@@ -323,14 +432,6 @@ namespace EventLogOutEmployeeService
 
                 DateTime eventTime = log.TimeGenerated;
                 string computerName = log.MachineName;
-
-                if (eventTime.Date < DateTime.Now.Date)
-                    return;
-
-                var timeSinceServiceStart = eventTime - serviceStartTime;
-
-                if (timeSinceServiceStart.TotalMinutes < -30)
-                    return;
 
                 string eventMessage = log.Message;
                 string? username = GetUsernameFromEvent(eventMessage, eventId);
@@ -346,10 +447,7 @@ namespace EventLogOutEmployeeService
                     }
                 }
 
-                if (!await ShouldProcessEventAsync(eventId, username, eventTime))
-                    return;
-
-                await ProcessEvent(eventId, username, eventTime, computerName, "Security");
+                await ProcessEvent(eventId, username, eventTime, computerName, "Security", null, writeRawRecord);
             }
             catch (Exception ex)
             {
@@ -400,12 +498,19 @@ namespace EventLogOutEmployeeService
 
         private async void OnSystemEventWritten(object sender, EntryWrittenEventArgs e)
         {
+            if (e?.Entry == null)
+                return;
+
+            await ProcessSystemEntryAsync(e.Entry, writeRawRecord: true);
+        }
+
+        private async Task ProcessSystemEntryAsync(EventLogEntry log, bool writeRawRecord)
+        {
             try
             {
-                if (e?.Entry == null || e.Entry.Message == null)
+                if (log.Message == null)
                     return;
 
-                var log = e.Entry;
                 int eventId = unchecked((int)log.InstanceId);
 
                 if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
@@ -413,13 +518,6 @@ namespace EventLogOutEmployeeService
 
                 DateTime eventTime = log.TimeGenerated;
                 string computerName = log.MachineName;
-
-                if (eventTime.Date < DateTime.Now.Date)
-                    return;
-
-                var timeSinceServiceStart = eventTime - serviceStartTime;
-                if (timeSinceServiceStart.TotalMinutes < -30)
-                    return;
 
                 string? username;
 
@@ -441,58 +539,14 @@ namespace EventLogOutEmployeeService
                     SharePointIntegration.MarkSleepEvent(eventTime);
                 }
 
-                if (!await ShouldProcessEventAsync(eventId, username, eventTime))
-                    return;
-
                 string? eventMessage = (eventId == 1074) ? log.Message : null;
-                await ProcessEvent(eventId, username, eventTime, computerName, "System", eventMessage);
+                await ProcessEvent(eventId, username, eventTime, computerName, "System", eventMessage, writeRawRecord);
             }
             catch (Exception ex)
             {
                 EventLog.WriteEntry("Application",
                     $"Error in OnSystemEventWritten: {ex.Message}",
                     EventLogEntryType.Warning, 1010);
-            }
-        }
-
-        private async Task<bool> ShouldProcessEventAsync(int eventId, string username, DateTime eventTime)
-        {
-            string eventKey = $"{eventId}_{username}";
-            var semaphore = eventProcessingLocks.GetOrAdd(eventKey, _ => new SemaphoreSlim(1, 1));
-
-            await semaphore.WaitAsync();
-
-            try
-            {
-                if (eventFirstTimeDict.TryGetValue(eventKey, out DateTime firstEventTime))
-                {
-                    var timeDiff = eventTime - firstEventTime;
-
-                    if (timeDiff.TotalMinutes < 0 || timeDiff.TotalDays > 1)
-                    {
-                        eventFirstTimeDict[eventKey] = eventTime;
-                        return true;
-                    }
-
-                    if (timeDiff.TotalMinutes < 10)
-                    {
-                        return false;
-                    }
-                    else
-                    {
-                        eventFirstTimeDict[eventKey] = eventTime;
-                    }
-                }
-                else
-                {
-                    eventFirstTimeDict[eventKey] = eventTime;
-                }
-
-                return true;
-            }
-            finally
-            {
-                semaphore.Release();
             }
         }
 
@@ -528,7 +582,7 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        private async Task ProcessEvent(int eventId, string username, DateTime eventTime, string computerName, string logType, string? eventMessage = null)
+        private async Task ProcessEvent(int eventId, string username, DateTime eventTime, string computerName, string logType, string? eventMessage = null, bool writeRawRecord = true)
         {
             try
             {
@@ -568,7 +622,11 @@ namespace EventLogOutEmployeeService
                 if (string.IsNullOrEmpty(accessToken))
                     return;
 
-                var rawTask = sharePoint.AddRecordToSharePointAsync(accessToken, username, eventTime, eventId, eventType, computerName);
+                Task? rawTask = null;
+                if (writeRawRecord)
+                {
+                    rawTask = sharePoint.AddRecordToSharePointAsync(accessToken, username, eventTime, eventId, eventType, computerName);
+                }
 
                 Task? summaryTask = null;
                 if (eventId == 4624)
@@ -580,13 +638,17 @@ namespace EventLogOutEmployeeService
                     summaryTask = sharePoint.TryUpdateDailySummaryShutdownAsync(accessToken, username, computerName, eventTime, eventId, eventType);
                 }
 
-                if (summaryTask != null)
+                if (rawTask != null && summaryTask != null)
                 {
                     await Task.WhenAll(rawTask, summaryTask);
                 }
-                else
+                else if (rawTask != null)
                 {
                     await rawTask;
+                }
+                else if (summaryTask != null)
+                {
+                    await summaryTask;
                 }
             }
             catch (Exception ex)
