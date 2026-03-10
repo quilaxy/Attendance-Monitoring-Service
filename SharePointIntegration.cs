@@ -29,6 +29,14 @@ namespace EventLogOutEmployeeService
         private static DateTime _lastShutdownEventTime = DateTime.MinValue;
         private static DateTime _lastSleepEventTime = DateTime.MinValue;
         private static readonly TimeSpan ShutdownEventWindow = TimeSpan.FromMinutes(2);
+        private static readonly object _configLock = new object();
+        private static bool _configLoaded = false;
+        private static string _cachedTenantId = string.Empty;
+        private static string _cachedClientId = string.Empty;
+        private static string _cachedClientSecret = string.Empty;
+        private static string _cachedSiteId = string.Empty;
+        private static string _cachedListId = string.Empty;
+        private static string? _cachedSummaryListId = null;
 
         // ── Static helpers ────────────────────────────────────────────────────────
 
@@ -61,18 +69,14 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "");
-                var configuration = LoadConfiguration(basePath);
+                EnsureConfigurationLoaded();
 
-                var azureSettings = configuration.GetSection("AzureSettings");
-                var sharePointSettings = configuration.GetSection("SharePointSettings");
-
-                _tenantId     = azureSettings["TenantId"]     ?? throw new InvalidOperationException("AzureSettings:TenantId is missing");
-                _clientId     = azureSettings["ClientId"]     ?? throw new InvalidOperationException("AzureSettings:ClientId is missing");
-                _clientSecret = azureSettings["ClientSecret"] ?? throw new InvalidOperationException("AzureSettings:ClientSecret is missing");
-                _siteId       = sharePointSettings["SiteId"]  ?? throw new InvalidOperationException("SharePointSettings:SiteId is missing");
-                _listId       = sharePointSettings["ListId"]  ?? throw new InvalidOperationException("SharePointSettings:ListId is missing");
-                _summaryListId = sharePointSettings["SummaryListId"];
+                _tenantId = _cachedTenantId;
+                _clientId = _cachedClientId;
+                _clientSecret = _cachedClientSecret;
+                _siteId = _cachedSiteId;
+                _listId = _cachedListId;
+                _summaryListId = _cachedSummaryListId;
             }
             catch (Exception ex)
             {
@@ -84,6 +88,32 @@ namespace EventLogOutEmployeeService
         }
 
         // ── Configuration ─────────────────────────────────────────────────────────
+
+        private void EnsureConfigurationLoaded()
+        {
+            if (_configLoaded)
+                return;
+
+            lock (_configLock)
+            {
+                if (_configLoaded)
+                    return;
+
+                string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "");
+                var configuration = LoadConfiguration(basePath);
+
+                var azureSettings = configuration.GetSection("AzureSettings");
+                var sharePointSettings = configuration.GetSection("SharePointSettings");
+
+                _cachedTenantId = azureSettings["TenantId"] ?? throw new InvalidOperationException("AzureSettings:TenantId is missing");
+                _cachedClientId = azureSettings["ClientId"] ?? throw new InvalidOperationException("AzureSettings:ClientId is missing");
+                _cachedClientSecret = azureSettings["ClientSecret"] ?? throw new InvalidOperationException("AzureSettings:ClientSecret is missing");
+                _cachedSiteId = sharePointSettings["SiteId"] ?? throw new InvalidOperationException("SharePointSettings:SiteId is missing");
+                _cachedListId = sharePointSettings["ListId"] ?? throw new InvalidOperationException("SharePointSettings:ListId is missing");
+                _cachedSummaryListId = sharePointSettings["SummaryListId"];
+                _configLoaded = true;
+            }
+        }
 
         private IConfiguration LoadConfiguration(string baseDirectory)
         {
@@ -116,29 +146,23 @@ namespace EventLogOutEmployeeService
         public async Task<string?> GetAccessTokenAsync(DateTime eventTime, int eventId)
         {
             bool isShutdownEvent = IsShutdownEventId(eventId);
-            bool inShutdownWindow = (DateTime.Now - _lastShutdownEventTime) < ShutdownEventWindow;
-            bool needsNetworkWait = false;
-
-            if (!_hasWaitedForNetwork)
-            {
-                if (isShutdownEvent || inShutdownWindow)
-                {
-                    // Shutdown/logoff events must NOT wait — network is going down
-                    lock (_networkWaitLock)
-                        _hasWaitedForNetwork = true;
-                }
-                else
-                {
-                    needsNetworkWait = true;
-                }
-            }
 
             lock (_networkWaitLock)
             {
-                if (needsNetworkWait && !_hasWaitedForNetwork)
+                bool inShutdownWindow = (DateTime.Now - _lastShutdownEventTime) < ShutdownEventWindow;
+
+                if (!_hasWaitedForNetwork)
                 {
-                    Thread.Sleep(30000); // wait 30 s for network on fresh boot
-                    _hasWaitedForNetwork = true;
+                    if (isShutdownEvent || inShutdownWindow)
+                    {
+                        // Shutdown/logoff events must NOT wait — network is going down
+                        _hasWaitedForNetwork = true;
+                    }
+                    else
+                    {
+                        Thread.Sleep(30000); // wait 30 s for network on fresh boot
+                        _hasWaitedForNetwork = true;
+                    }
                 }
             }
 
@@ -409,35 +433,10 @@ namespace EventLogOutEmployeeService
                 client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
                 client.DefaultRequestHeaders.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
 
-                string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
-                             $"?$expand=fields&$select=id,fields&$top=5000";
+                await CleanupListByDateFieldAsync(client, _listId, "EventTime", cutoffDate);
 
-                var response = await client.GetAsync(url);
-                if (!response.IsSuccessStatusCode) return;
-
-                var result = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
-                var items  = result?["value"] as JArray;
-                if (items == null || items.Count == 0) return;
-
-                foreach (JToken item in items)
-                {
-                    try
-                    {
-                        var itemFields    = item["fields"] as JObject;
-                        string? eventTimeStr = itemFields?["EventTime"]?.ToString();
-                        if (string.IsNullOrWhiteSpace(eventTimeStr)) continue;
-                        if (!DateTime.TryParse(eventTimeStr, out DateTime eventTime)) continue;
-                        if (eventTime >= cutoffDate) continue;
-
-                        string? itemId = item["id"]?.ToString();
-                        if (string.IsNullOrWhiteSpace(itemId)) continue;
-
-                        await client.DeleteAsync(
-                            $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items/{itemId}");
-                        await Task.Delay(200);
-                    }
-                    catch { /* continue deleting */ }
-                }
+                if (!string.IsNullOrWhiteSpace(_summaryListId))
+                    await CleanupListByDateFieldAsync(client, _summaryListId, "WorkDate", cutoffDate);
             }
             catch (Exception ex)
             {
@@ -448,6 +447,48 @@ namespace EventLogOutEmployeeService
         }
 
         // ── Private helpers ───────────────────────────────────────────────────────
+
+        private async Task CleanupListByDateFieldAsync(
+            HttpClient client, string listId, string dateField, DateTime cutoffDate)
+        {
+            string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items" +
+                         $"?$expand=fields&$select=id,fields&$top=5000";
+
+            var response = await client.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return;
+
+            var result = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
+            var items = result?["value"] as JArray;
+            if (items == null || items.Count == 0) return;
+
+            foreach (JToken item in items)
+            {
+                try
+                {
+                    var itemFields = item["fields"] as JObject;
+                    string? dateValue = itemFields?[dateField]?.ToString();
+                    if (string.IsNullOrWhiteSpace(dateValue))
+                        continue;
+
+                    if (!DateTime.TryParse(dateValue, out DateTime parsed))
+                        continue;
+
+                    if (parsed >= cutoffDate)
+                        continue;
+
+                    string? itemId = item["id"]?.ToString();
+                    if (string.IsNullOrWhiteSpace(itemId))
+                        continue;
+
+                    await client.DeleteAsync($"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items/{itemId}");
+                    await Task.Delay(200);
+                }
+                catch
+                {
+                    // continue deleting remaining items
+                }
+            }
+        }
 
         private HttpClient CreateGraphClient(string accessToken, int timeoutSeconds)
         {
@@ -525,7 +566,7 @@ namespace EventLogOutEmployeeService
         /// Exclusion rules:
         ///   • 1074 Restart → never written to Summary (not a real end-of-day).
         ///   • 4647 (User Logout) → only accepted if the logout time is within the window
-        ///     [expectedTimeOut - 2h, expectedTimeOut + 2h]. This filters out mid-day
+        ///     [expectedTimeOut - 5h, expectedTimeOut + 5h]. This filters out mid-day
         ///     lock/logoffs while still catching early or slightly-late departures.
         ///   • 6008/41 (Unexpected Shutdown/Crash) → only accepted after expectedTimeOut,
         ///     i.e. the machine crashed at or after the expected end of day.
