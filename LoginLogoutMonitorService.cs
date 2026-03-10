@@ -35,6 +35,9 @@ namespace EventLogOutEmployeeService
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "Attendance-Monitoring-Service");
 
+        private readonly string stopCheckpointPath =
+            Path.Combine(DataDirectory, "event-stop.checkpoint");
+
         private readonly string replayCheckpointPath =
             Path.Combine(DataDirectory, "event-replay.checkpoint");
 
@@ -156,7 +159,7 @@ namespace EventLogOutEmployeeService
             try
             {
                 DateTime replayTo = DateTime.Now;
-                DateTime? replayFrom = LoadReplayCheckpoint();
+                DateTime? replayFrom = LoadStopCheckpoint();
 
                 if (replayFrom.HasValue)
                 {
@@ -174,14 +177,14 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        private DateTime? LoadReplayCheckpoint()
+        private DateTime? LoadStopCheckpoint()
         {
             try
             {
-                if (!File.Exists(replayCheckpointPath))
+                if (!File.Exists(stopCheckpointPath))
                     return null;
 
-                string value = File.ReadAllText(replayCheckpointPath).Trim();
+                string value = File.ReadAllText(stopCheckpointPath).Trim();
                 if (DateTime.TryParse(value, null,
                         System.Globalization.DateTimeStyles.RoundtripKind, out DateTime parsed))
                     return parsed.ToLocalTime();
@@ -189,6 +192,16 @@ namespace EventLogOutEmployeeService
             catch { /* ignore malformed checkpoint */ }
 
             return null;
+        }
+
+        private void SaveStopCheckpoint(DateTime checkpoint)
+        {
+            try
+            {
+                File.WriteAllText(stopCheckpointPath,
+                    checkpoint.ToUniversalTime().ToString("O"));
+            }
+            catch { /* ignore write failures */ }
         }
 
         private void SaveReplayCheckpoint(DateTime checkpoint)
@@ -296,7 +309,7 @@ namespace EventLogOutEmployeeService
             {
                 // Save checkpoint first with a safety buffer to guarantee replay coverage
                 // for events written right around shutdown/startup transitions.
-                SaveReplayCheckpoint(DateTime.Now.AddMinutes(-2));
+                SaveStopCheckpoint(DateTime.Now.AddMinutes(-2));
 
                 if (securityEventLog != null)
                 {
