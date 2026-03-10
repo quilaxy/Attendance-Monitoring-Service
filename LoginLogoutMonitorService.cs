@@ -144,8 +144,11 @@ namespace EventLogOutEmployeeService
                 DateTime replayTo = DateTime.Now;
                 DateTime? replayFrom = LoadReplayCheckpoint();
 
-                ReplaySecurityEvents(replayFrom, replayTo);
-                ReplaySystemEvents(replayFrom, replayTo);
+                if (replayFrom.HasValue)
+                {
+                    ReplaySecurityEvents(replayFrom, replayTo);
+                    ReplaySystemEvents(replayFrom, replayTo);
+                }
 
                 SaveReplayCheckpoint(replayTo);
             }
@@ -291,6 +294,10 @@ namespace EventLogOutEmployeeService
 
                 cancellationTokenSource?.Cancel();
 
+                // Persist stop-time checkpoint so next startup can replay events that happened
+                // right after the service stopped (e.g. 1074/6006 during shutdown).
+                SaveReplayCheckpoint(DateTime.Now);
+
                 // Wait up to 15 seconds for the queue worker to finish its current HTTP call
                 // so we don't lose an in-flight dispatch on restart
                 int waited = 0;
@@ -376,6 +383,12 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
+        {
+            return item.EventId == 4624 || item.EventId == 1074 || item.EventId == 6006 ||
+                   item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41;
+        }
+
         private async Task<bool> TryDispatchQueuedEventAsync(QueuedAttendanceEvent item)
         {
             try
@@ -385,36 +398,42 @@ namespace EventLogOutEmployeeService
                 if (string.IsNullOrEmpty(accessToken))
                     return false;
 
-                Task? rawTask = null;
-                if (item.WriteRawRecord)
-                    rawTask = sharePoint.AddRecordToSharePointAsync(
+                bool needsRaw = item.WriteRawRecord && !item.RawRecordDispatched;
+                bool needsSummary = ShouldProcessSummary(item) && !item.SummaryDispatched;
+
+                if (needsRaw)
+                {
+                    await sharePoint.AddRecordToSharePointAsync(
                         accessToken, item.Username, item.EventTime,
                         item.EventId, item.EventType, item.ComputerName);
 
-                Task? summaryTask = null;
-                if (item.EventId == 4624)
-                {
-                    summaryTask = sharePoint.UpsertDailySummaryLoginAsync(
-                        accessToken, item.Username, item.ComputerName,
-                        item.LoginTime ?? item.EventTime);
-                }
-                else if (item.EventId == 1074 || item.EventId == 6006 ||
-                         item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41)
-                {
-                    summaryTask = sharePoint.TryUpdateDailySummaryShutdownAsync(
-                        accessToken, item.Username, item.ComputerName,
-                        item.ShutdownTime ?? item.EventTime,
-                        item.EventId, item.EventType);
+                    await eventQueue.UpdateDispatchStateAsync(item.QueueId, rawRecordDispatched: true);
+                    item.RawRecordDispatched = true;
                 }
 
-                if (rawTask != null && summaryTask != null)
-                    await Task.WhenAll(rawTask, summaryTask);
-                else if (rawTask != null)
-                    await rawTask;
-                else if (summaryTask != null)
-                    await summaryTask;
+                if (needsSummary)
+                {
+                    if (item.EventId == 4624)
+                    {
+                        await sharePoint.UpsertDailySummaryLoginAsync(
+                            accessToken, item.Username, item.ComputerName,
+                            item.LoginTime ?? item.EventTime);
+                    }
+                    else
+                    {
+                        await sharePoint.TryUpdateDailySummaryShutdownAsync(
+                            accessToken, item.Username, item.ComputerName,
+                            item.ShutdownTime ?? item.EventTime,
+                            item.EventId, item.EventType);
+                    }
 
-                return true;
+                    await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
+                    item.SummaryDispatched = true;
+                }
+
+                bool doneRaw = !item.WriteRawRecord || item.RawRecordDispatched;
+                bool doneSummary = !ShouldProcessSummary(item) || item.SummaryDispatched;
+                return doneRaw && doneSummary;
             }
             catch
             {
@@ -477,8 +496,6 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                if (log.Message == null) return;
-
                 int eventId = unchecked((int)log.InstanceId);
                 if (eventId != 4624 && eventId != 4647) return;
 
@@ -490,6 +507,9 @@ namespace EventLogOutEmployeeService
                 int logonType = 0;
                 if (eventId == 4624)
                     logonType = ParseLogonType(eventMessage);
+
+                if (eventId == 4624 && !IsRelevantLogonType(logonType))
+                    return;
 
                 string? username = GetUsernameFromEvent(eventMessage, eventId);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
@@ -522,18 +542,24 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                if (log.Message == null) return;
-
                 int eventId = unchecked((int)log.InstanceId);
                 if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
+                    return;
+
+                if (eventId == 1074 && log.Message == null)
                     return;
 
                 DateTime eventTime = log.TimeGenerated;
                 string computerName = log.MachineName;
 
-                string? username;
-                lock (userLock)
-                    username = lastActiveUser;
+                string? eventMessage = (eventId == 1074) ? log.Message : null;
+                string? username = (eventId == 1074) ? GetUserFromSystem1074Message(eventMessage) : null;
+
+                if (string.IsNullOrEmpty(username))
+                {
+                    lock (userLock)
+                        username = lastActiveUser;
+                }
 
                 if (string.IsNullOrEmpty(username))
                 {
@@ -545,7 +571,6 @@ namespace EventLogOutEmployeeService
                 if (eventId == 42)
                     SharePointIntegration.MarkSleepEvent(eventTime);
 
-                string? eventMessage = (eventId == 1074) ? log.Message : null;
                 await ProcessEvent(eventId, username, eventTime, computerName,
                     "System", 0, eventMessage, writeRawRecord);
             }
@@ -571,7 +596,7 @@ namespace EventLogOutEmployeeService
                 {
                     "Security" => eventId switch
                     {
-                        4624 => "User Login",
+                        4624 => $"User Login\nLogon Type: {FormatLogonType(logonType)}",
                         4647 => "User Logout",
                         _ => "Unknown Security Event"
                     },
@@ -650,11 +675,11 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                DateTime lookbackTime = beforeTime.AddHours(-1);
+                DateTime lookbackTime = beforeTime.AddHours(-12);
                 EventLog secLog = new EventLog("Security");
                 int checkCount = 0;
 
-                for (int i = secLog.Entries.Count - 1; i >= 0 && checkCount < 50; i--)
+                for (int i = secLog.Entries.Count - 1; i >= 0 && checkCount < 500; i--)
                 {
                     checkCount++;
                     EventLogEntry entry = secLog.Entries[i];
@@ -665,7 +690,15 @@ namespace EventLogOutEmployeeService
                         entry.TimeGenerated <= beforeTime &&
                         entry.Message != null)
                     {
-                        string? u = GetUsernameFromEvent(entry.Message, unchecked((int)entry.InstanceId));
+                        int secEventId = unchecked((int)entry.InstanceId);
+                        if (secEventId == 4624)
+                        {
+                            int lt = ParseLogonType(entry.Message);
+                            if (!IsRelevantLogonType(lt))
+                                continue;
+                        }
+
+                        string? u = GetUsernameFromEvent(entry.Message, secEventId);
                         if (!string.IsNullOrEmpty(u) && IsValidUsername(u))
                             return u;
                     }
@@ -687,6 +720,18 @@ namespace EventLogOutEmployeeService
             }
             catch { /* silent fail */ }
             return 0;
+        }
+
+        private string FormatLogonType(int logonType)
+        {
+            return logonType switch
+            {
+                2  => "2 - Interactive",
+                7  => "7 - Unlock",
+                10 => "10 - RemoteInteractive",
+                11 => "11 - CachedInteractive",
+                _  => $"{logonType} - Other"
+            };
         }
 
         private string ParseShutdownType(string? eventMessage)
@@ -755,6 +800,42 @@ namespace EventLogOutEmployeeService
             catch { /* silent fail */ }
 
             return null;
+        }
+
+        private bool IsRelevantLogonType(int logonType)
+        {
+            // Keep only interactive user-session logons to avoid duplicate 4624 records.
+            return logonType == 2 || logonType == 7 || logonType == 10 || logonType == 11;
+        }
+
+        private string? GetUserFromSystem1074Message(string? message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return null;
+
+            try
+            {
+                var match = Regex.Match(message, @"on behalf of user\s+([^\r\n]+)", RegexOptions.IgnoreCase);
+                if (!match.Success)
+                    return null;
+
+                string candidate = match.Groups[1].Value.Trim();
+                int reasonIndex = candidate.IndexOf(" for the following reason", StringComparison.OrdinalIgnoreCase);
+                if (reasonIndex > 0)
+                    candidate = candidate.Substring(0, reasonIndex).Trim();
+
+                if (candidate.Contains("\\"))
+                    candidate = candidate.Substring(candidate.LastIndexOf('\\') + 1).Trim();
+
+                if (candidate.Contains("@"))
+                    candidate = candidate.Split('@')[0].Trim();
+
+                return IsValidUsername(candidate) ? candidate : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private bool IsValidUsername(string username)
