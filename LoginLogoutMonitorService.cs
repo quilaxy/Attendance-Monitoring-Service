@@ -87,6 +87,7 @@ namespace EventLogOutEmployeeService
         {
             int maxRetries = 5;
             int currentRetry = 0;
+            bool started = false;
 
             while (currentRetry < maxRetries)
             {
@@ -118,10 +119,7 @@ namespace EventLogOutEmployeeService
                     monitoringThread.IsBackground = true;
                     monitoringThread.Start();
 
-                    EventLog.WriteEntry("Attendance-Service",
-                        "Service started successfully.",
-                        EventLogEntryType.Information, 0);
-
+                    started = true;
                     break;
                 }
                 catch (Exception ex)
@@ -135,6 +133,13 @@ namespace EventLogOutEmployeeService
                     }
                     Thread.Sleep(2000);
                 }
+            }
+
+            if (started)
+            {
+                EventLog.WriteEntry("Attendance-Service",
+                    "Service started successfully.",
+                    EventLogEntryType.Information, 0);
             }
         }
 
@@ -283,6 +288,10 @@ namespace EventLogOutEmployeeService
         {
             try
             {
+                // Save checkpoint first with a safety buffer to guarantee replay coverage
+                // for events written right around shutdown/startup transitions.
+                SaveReplayCheckpoint(DateTime.Now.AddMinutes(-2));
+
                 if (securityEventLog != null)
                 {
                     securityEventLog.EnableRaisingEvents = false;
@@ -296,10 +305,6 @@ namespace EventLogOutEmployeeService
                 }
 
                 cancellationTokenSource?.Cancel();
-
-                // Persist stop-time checkpoint so next startup can replay events that happened
-                // right after the service stopped (e.g. 1074/6006 during shutdown).
-                SaveReplayCheckpoint(DateTime.Now);
 
                 // Wait up to 15 seconds for the queue worker to finish its current HTTP call
                 // so we don't lose an in-flight dispatch on restart
