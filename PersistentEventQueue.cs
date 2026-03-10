@@ -226,7 +226,7 @@ namespace EventLogOutEmployeeService
             string content = JsonConvert.SerializeObject(items, Formatting.Indented);
 
             string directory = Path.GetDirectoryName(filePath) ?? string.Empty;
-            string tempPath = Path.Combine(directory, $"{Path.GetFileName(filePath)}.{Guid.NewGuid():N}.tmp");
+            string tempPath = filePath + ".tmp";
             string backupPath = Path.Combine(directory, $"{Path.GetFileName(filePath)}.bak");
 
             await File.WriteAllTextAsync(tempPath, content);
@@ -244,3 +244,4 @@ namespace EventLogOutEmployeeService
         }
     }
 }
+
