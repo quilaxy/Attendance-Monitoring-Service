@@ -1,0 +1,378 @@
+Data yang terkirim ke SharePoint
+Title	Username	Event ID	Event Time	Event Type	PC Name
+ON-083\4624\annafi	annafi	4624	3/10/2026 7:37	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/10/2026 7:37	User Login	ON-083
+ON-083\4647\annafi	annafi	4647	3/9/2026 15:46	User Logout	ON-083
+ON-083\4647\annafi	annafi	4647	3/9/2026 15:46	User Logout	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 15:07	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 15:07	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 15:07	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 15:07	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 15:07	User Login	ON-083
+ON-083\4647\annafi	annafi	4647	3/9/2026 15:06	User Logout	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 15:04	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 15:04	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 15:04	User Login	ON-083
+ON-083\4647\annafi	annafi	4647	3/9/2026 15:03	User Logout	ON-083
+ON-083\4647\annafi	annafi	4647	3/9/2026 15:03	User Logout	ON-083
+ON-083\4647\annafi	annafi	4647	3/9/2026 15:03	User Logout	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 14:18	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 14:18	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 12:43	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 12:28	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 11:58	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 9:27	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 8:51	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 8:50	User Login	ON-083
+ON-083\4647\annafi	annafi	4647	3/9/2026 8:50	User Logout	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 8:39	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 8:38	User Login	ON-083
+ON-083\4647\annafi	annafi	4647	3/9/2026 8:37	User Logout	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 8:23	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/9/2026 7:25	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/9/2026 7:23	User Login	ON-083
+ON-083\4647\annafi	annafi	4647	3/6/2026 16:05	User Logout	ON-083
+ON-083\4624\annafi	annafi	4624	3/6/2026 15:46	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/6/2026 14:41	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/6/2026 14:32	User Login	ON-083
+ON-083\4647\annafi	annafi	4647	3/6/2026 14:30	User Logout	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/6/2026 14:26	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/6/2026 13:25	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/6/2026 12:56	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/6/2026 10:49	User Login	ON-083
+ON-083\4647\annafi	annafi	4647	3/6/2026 10:48	User Logout	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/6/2026 10:46	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/6/2026 10:36	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/6/2026 9:04	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/6/2026 8:13	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/6/2026 8:03	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/6/2026 7:50	User Login	ON-083
+ON-083\4624\kidannafi	kidannafi	4624	3/6/2026 7:39	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/6/2026 7:30	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/5/2026 15:58	User Login	ON-083
+ON-083\4624\gzero.testuser01	gzero.testuser01	4624	3/5/2026 15:38	User Login	ON-083
+ON-083\4624\annafi	annafi	4624	3/5/2026 15:34	User Login	ON-083
+ON-083\4647\gzero.testuser01	gzero.testuser01	4647	3/2/2026 13:50	User Logout	ON-083
+ON-083\4624\gzero.testuser01	gzero.testuser01	4624	3/2/2026 13:50	User Login	ON-083
+ON-083\4624\gzero.testuser01	gzero.testuser01	4624	3/2/2026 13:04	User Login	ON-083
+ON-083\4624\gzero.testuser01	gzero.testuser01	4624	3/2/2026 9:07	User Login	ON-083
+ON-083\4647\gzero.testuser01	gzero.testuser01	4647	3/1/2026 16:59	User Logout	ON-083
+
+Harusnya data nya cuma dari tanggal 9 Maret jam 12.39an, karena service baru nya baru di running jam segitu. terus data di sharepoint lama udah aku hapus semua sebelumnya, sebelum aku start service baru. Dan awalnya tuh dia emang cuma record dari tanggal 9, cuma gak lama setelah aku refresh, itu muncul semua dari tanggal 1. Terus ada data yang duplikat juga, entah karena logon type nya beda atau gimana. atau perlu tambahin logon type di payload?. terus itu juga gak nge record event 6006 dan 1074 ke sharepoint.
+
+Application Log
+Information	09/03/2026 12:44:43	Attendance-Service	0	None Service started successfully.
+Information	09/03/2026 12:44:43	Attendance-Service	0	None Service started successfully.
+Information	09/03/2026 15:04:04	Attendance-Service	0	None Service has been successfully shut down.
+Information	09/03/2026 15:04:50	Attendance-Service	0	None Service started successfully.
+Information	09/03/2026 15:04:50	Attendance-Service	0	None Service started successfully.
+Information	09/03/2026 15:06:28	Attendance-Service	0	None Service has been successfully shut down.
+Information	09/03/2026 15:07:15	Attendance-Service	0	None Service started successfully.
+Information	09/03/2026 15:07:15	Attendance-Service	0	None Service started successfully.
+Information	10/03/2026 07:37:54	Attendance-Service	0	None Service started successfully.
+Information	10/03/2026 07:37:54	Attendance-Service	0	None Service started successfully.
+
+System Log
+Information	09/03/2026 15:03:55	User32	1074	None 
+The process C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe (ON-083) has initiated the restart of computer ON-083 on behalf of user KDDI-ID\annafi for the following reason: Other (Unplanned)
+ Reason Code: 0x0
+ Shut-down Type: restart
+Information	09/03/2026 15:04:04	EventLog	6006	None The Event log service was stopped.
+Information	09/03/2026 15:06:26	User32	1074	None
+The process C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe (ON-083) has initiated the restart of computer ON-083 on behalf of user KDDI-ID\annafi for the following reason: Other (Unplanned)
+ Reason Code: 0x0
+ Shut-down Type: restart
+Information	09/03/2026 15:06:28	EventLog	6006	None The Event log service was stopped.
+Information	09/03/2026 15:46:31	User32	1074	None
+The process C:\WINDOWS\system32\winlogon.exe (ON-083) has initiated the power off of computer ON-083 on behalf of user KDDI-ID\annafi for the following reason: No title for this reason could be found
+ Reason Code: 0x500ff
+ Shut-down Type: power off
+Information	09/03/2026 15:46:33	EventLog	6006	None The Event log service was stopped.
+
+(itu username buat event 1074 bisa diambil dari ...on behalf of user KDDI-ID\annafi gak sih? ambil setelah "\")
+Terus kalo 6006 gapake username gapapa? yang penting tau Computer mana yang mati? tapi nanti di listId jadi kurang ya info username nya. jadi kita tetep butuh lastActiveUser
+
+Security Log
+Audit Success	09/03/2026 15:03:56	Microsoft Windows security auditing.	4647	Logoff
+User initiated logoff:
+Subject:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi
+Audit Success	09/03/2026 15:06:27	Microsoft Windows security auditing.	4647	Logoff
+User initiated logoff:
+Subject:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi
+Audit Success	09/03/2026 15:46:32	Microsoft Windows security auditing.	4647	Logoff
+User initiated logoff:
+Subject:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi
+Audit Success	09/03/2026 12:28:06	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+        Logon Type:		11
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	09/03/2026 12:28:06	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		7
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	09/03/2026 12:43:09	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+Audit Success	09/03/2026 12:43:09	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+Audit Success	09/03/2026 12:43:39	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+Audit Success	09/03/2026 12:43:39	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+Audit Success	09/03/2026 14:18:57	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		11
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	09/03/2026 14:18:59	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		7
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	09/03/2026 15:04:59	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		11
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	09/03/2026 15:04:59	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		7
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	09/03/2026 15:07:21	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		11
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	09/03/2026 15:07:21	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		7
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	09/03/2026 15:07:56	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+Audit Success	09/03/2026 15:07:56	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+Audit Success	10/03/2026 07:37:30	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		11
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	10/03/2026 07:37:53	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		11
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	10/03/2026 07:37:56	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		7
+New Logon:
+	Security ID:		KDDI-ID\annafi
+	Account Name:		annafi@kddi.co.id
+Audit Success	10/03/2026 07:42:58	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+Audit Success	10/03/2026 07:42:58	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+
+
+dan summaryListId belum ada isi datanya, padahal sudah ada event login pertama di hari ini
+aku sudah cek, id list di appsettings.json untuk summaryListId sudah sesuai
+  "SharePointSettings": {
+    "SiteId": "xxx",
+    "ListId": "xxx",
+    "SummaryListId ": "xxx"
+  }
+
+ini isi kolumn untuk list Summary
+    "value": [
+        {
+            "columnGroup": "Custom Columns",
+            "description": "",
+            "displayName": "Title",
+            "enforceUniqueValues": false,
+            "hidden": false,
+            "id": "fa564e0f-0c70-4ab9-b863-0177e6ddd247",
+            "indexed": false,
+            "name": "Title",
+            "readOnly": false,
+            "required": false,
+            "text": {
+                "allowMultipleLines": false,
+                "appendChangesToExistingText": false,
+                "linesForEditing": 0,
+                "maxLength": 255
+            }
+        },
+        {
+            "columnGroup": "Custom Columns",
+            "description": "",
+            "displayName": "Username",
+            "enforceUniqueValues": false,
+            "hidden": false,
+            "id": "9fd2692a-f0d7-434d-8d76-932a9b67caec",
+            "indexed": false,
+            "name": "Username",
+            "readOnly": false,
+            "required": false,
+            "text": {
+                "allowMultipleLines": false,
+                "appendChangesToExistingText": false,
+                "linesForEditing": 0,
+                "maxLength": 255
+            }
+        },
+        {
+            "columnGroup": "Custom Columns",
+            "description": "",
+            "displayName": "ComputerName",
+            "enforceUniqueValues": false,
+            "hidden": false,
+            "id": "d90d41e5-ba00-49a1-b248-668d7837a49d",
+            "indexed": false,
+            "name": "ComputerName",
+            "readOnly": false,
+            "required": false,
+            "text": {
+                "allowMultipleLines": false,
+                "appendChangesToExistingText": false,
+                "linesForEditing": 0,
+                "maxLength": 255
+            }
+        },
+        {
+            "columnGroup": "Custom Columns",
+            "description": "",
+            "displayName": "WorkDate",
+            "enforceUniqueValues": false,
+            "hidden": false,
+            "id": "ea05d121-95c7-4e57-9d32-633895edb66a",
+            "indexed": false,
+            "name": "WorkDate",
+            "readOnly": false,
+            "required": false,
+            "dateTime": {
+                "displayAs": "standard",
+                "format": "dateOnly"
+            }
+        },
+        {
+            "columnGroup": "Custom Columns",
+            "description": "",
+            "displayName": "LoginTime",
+            "enforceUniqueValues": false,
+            "hidden": false,
+            "id": "90e365a1-6729-48b3-877c-bc1f88478e30",
+            "indexed": false,
+            "name": "LoginTime",
+            "readOnly": false,
+            "required": false,
+            "dateTime": {
+                "displayAs": "standard",
+                "format": "dateTime"
+            }
+        },
+        {
+            "columnGroup": "Custom Columns",
+            "description": "",
+            "displayName": "ExpectedTimeOut",
+            "enforceUniqueValues": false,
+            "hidden": false,
+            "id": "81b8c7eb-1d85-4842-b114-30cc567bbce7",
+            "indexed": false,
+            "name": "ExpectedTimeOut",
+            "readOnly": false,
+            "required": false,
+            "dateTime": {
+                "displayAs": "standard",
+                "format": "dateTime"
+            }
+        },
+        {
+            "columnGroup": "Custom Columns",
+            "description": "",
+            "displayName": "ShutdownTime",
+            "enforceUniqueValues": false,
+            "hidden": false,
+            "id": "ed6acbe1-8dfb-49d0-8d76-bcb5495a9c2d",
+            "indexed": false,
+            "name": "ShutdownTime",
+            "readOnly": false,
+            "required": false,
+            "dateTime": {
+                "displayAs": "standard",
+                "format": "dateTime"
+            }
+        },
+        {
+            "columnGroup": "Custom Columns",
+            "description": "",
+            "displayName": "ShutdownType",
+            "enforceUniqueValues": false,
+            "hidden": false,
+            "id": "896df3bf-8a27-4aa7-850e-f647484bafa0",
+            "indexed": false,
+            "name": "ShutdownType",
+            "readOnly": false,
+            "required": false,
+            "text": {
+                "allowMultipleLines": false,
+                "appendChangesToExistingText": false,
+                "linesForEditing": 0,
+                "maxLength": 255
+            }
+        },
+
+Event Queue isinya gini
+[]
+
+Event Replay Checkpoint gini isinya, masih dalam UTC bukan local
+2026-03-10T00:37:43.7029146Z -> berarti sekitar 07:37:43
