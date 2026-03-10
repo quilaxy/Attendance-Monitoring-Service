@@ -25,6 +25,12 @@ namespace EventLogOutEmployeeService
         private readonly Lazy<SharePointIntegration> sharePointIntegration =
             new Lazy<SharePointIntegration>(() => new SharePointIntegration());
 
+        // Shared 1074 state for resolving adjacent 6006 events.
+        private static readonly object last1074Lock = new object();
+        private static string? last1074Username;
+        private static DateTime last1074EventTime = DateTime.MinValue;
+        private static string? last1074ShutdownType;
+
         private static readonly string DataDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "Attendance-Monitoring-Service");
@@ -574,6 +580,15 @@ namespace EventLogOutEmployeeService
                 string? eventMessage = (eventId == 1074) ? log.Message : null;
                 string? username = (eventId == 1074) ? GetUserFromSystem1074Message(eventMessage) : null;
 
+                if (eventId == 1074 && !string.IsNullOrEmpty(username))
+                {
+                    string shutdownType = ParseShutdownType(eventMessage);
+                    StoreLast1074State(username, eventTime, shutdownType);
+                }
+
+                if (eventId == 6006)
+                    username = TryResolveUsernameFor6006(eventTime) ?? username;
+
                 if (string.IsNullOrEmpty(username))
                 {
                     lock (userLock)
@@ -854,6 +869,36 @@ namespace EventLogOutEmployeeService
             catch
             {
                 return null;
+            }
+        }
+
+        private void StoreLast1074State(string username, DateTime eventTime, string shutdownType)
+        {
+            if (!IsValidUsername(username))
+                return;
+
+            lock (last1074Lock)
+            {
+                last1074Username = username;
+                last1074EventTime = eventTime;
+                last1074ShutdownType = shutdownType;
+            }
+        }
+
+        private string? TryResolveUsernameFor6006(DateTime eventTime)
+        {
+            lock (last1074Lock)
+            {
+                if (string.IsNullOrWhiteSpace(last1074Username))
+                    return null;
+
+                // 6006 typically follows 1074 within a few seconds.
+                if (Math.Abs((eventTime - last1074EventTime).TotalSeconds) > 10)
+                    return null;
+
+                // Keep shutdown type in state for diagnostics/future behavior tuning.
+                _ = last1074ShutdownType;
+                return last1074Username;
             }
         }
 
