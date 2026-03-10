@@ -95,7 +95,6 @@ namespace EventLogOutEmployeeService
 
                 if (alreadyProcessed)
                 {
-                    await WriteProcessedIndexInternalAsync(processed);
                     return false;
                 }
 
@@ -334,3 +333,4 @@ namespace EventLogOutEmployeeService
         }
     }
 }
+
