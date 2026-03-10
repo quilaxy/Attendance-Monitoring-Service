@@ -32,18 +32,9 @@ namespace EventLogOutEmployeeService
         public bool SummaryDispatched { get; set; } = false;
     }
 
-    public class ProcessedEventStamp
-    {
-        public int EventId { get; set; }
-        public string Username { get; set; } = string.Empty;
-        public string ComputerName { get; set; } = string.Empty;
-        public DateTime EventTime { get; set; }
-    }
-
     public class PersistentEventQueue
     {
         private readonly string filePath;
-        private readonly string processedIndexPath;
         private readonly SemaphoreSlim fileLock = new SemaphoreSlim(1, 1);
 
         /// <summary>
@@ -54,9 +45,7 @@ namespace EventLogOutEmployeeService
         public PersistentEventQueue(string filePath)
         {
             this.filePath = filePath;
-            processedIndexPath = filePath + ".processed.json";
             EnsureQueueFile();
-            EnsureProcessedIndexFile();
         }
 
         /// <summary>
@@ -84,19 +73,6 @@ namespace EventLogOutEmployeeService
                     x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
                     x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
                     AbsDiff(x.EventTime, item.EventTime) < DedupWindow);
-
-                List<ProcessedEventStamp> processed = await ReadProcessedIndexInternalAsync();
-                processed = PruneProcessedStamps(processed, item.EventTime);
-                bool alreadyProcessed = processed.Any(x =>
-                    x.EventId == item.EventId &&
-                    x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
-                    x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
-                    AbsDiff(x.EventTime, item.EventTime) < DedupWindow);
-
-                if (alreadyProcessed)
-                {
-                    return false;
-                }
 
                 if (existing != null)
                 {
@@ -147,20 +123,6 @@ namespace EventLogOutEmployeeService
                 QueuedAttendanceEvent? removed = items.FirstOrDefault(x => x.QueueId == queueId);
                 items.RemoveAll(x => x.QueueId == queueId);
                 await WriteAllInternalAsync(items);
-
-                if (removed != null)
-                {
-                    List<ProcessedEventStamp> processed = await ReadProcessedIndexInternalAsync();
-                    processed.Add(new ProcessedEventStamp
-                    {
-                        EventId = removed.EventId,
-                        Username = removed.Username,
-                        ComputerName = removed.ComputerName,
-                        EventTime = removed.EventTime
-                    });
-                    processed = PruneProcessedStamps(processed, removed.EventTime);
-                    await WriteProcessedIndexInternalAsync(processed);
-                }
             }
             finally
             {
@@ -239,56 +201,6 @@ namespace EventLogOutEmployeeService
             return diff < TimeSpan.Zero ? diff.Negate() : diff;
         }
 
-        private void EnsureProcessedIndexFile()
-        {
-            string? directory = Path.GetDirectoryName(processedIndexPath);
-            if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
-                Directory.CreateDirectory(directory);
-
-            if (!File.Exists(processedIndexPath))
-                File.WriteAllText(processedIndexPath, "[]");
-        }
-
-        private async Task<List<ProcessedEventStamp>> ReadProcessedIndexInternalAsync()
-        {
-            EnsureProcessedIndexFile();
-            string content = await File.ReadAllTextAsync(processedIndexPath);
-            if (string.IsNullOrWhiteSpace(content))
-                return new List<ProcessedEventStamp>();
-
-            return JsonConvert.DeserializeObject<List<ProcessedEventStamp>>(content)
-                   ?? new List<ProcessedEventStamp>();
-        }
-
-        private async Task WriteProcessedIndexInternalAsync(List<ProcessedEventStamp> stamps)
-        {
-            string content = JsonConvert.SerializeObject(stamps, Formatting.Indented);
-
-            string directory = Path.GetDirectoryName(processedIndexPath) ?? string.Empty;
-            string tempPath = processedIndexPath + ".tmp";
-            string backupPath = Path.Combine(directory, $"{Path.GetFileName(processedIndexPath)}.bak");
-
-            await File.WriteAllTextAsync(tempPath, content);
-
-            if (File.Exists(processedIndexPath))
-            {
-                File.Replace(tempPath, processedIndexPath, backupPath, ignoreMetadataErrors: true);
-                if (File.Exists(backupPath))
-                    File.Delete(backupPath);
-            }
-            else
-            {
-                File.Move(tempPath, processedIndexPath);
-            }
-        }
-
-        private static List<ProcessedEventStamp> PruneProcessedStamps(
-            List<ProcessedEventStamp> stamps,
-            DateTime referenceTime)
-        {
-            return stamps.Where(x => AbsDiff(x.EventTime, referenceTime) < DedupWindow).ToList();
-        }
-
         private void EnsureQueueFile()
         {
             string? directory = Path.GetDirectoryName(filePath);
@@ -333,4 +245,3 @@ namespace EventLogOutEmployeeService
         }
     }
 }
-
