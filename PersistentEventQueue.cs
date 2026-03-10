@@ -224,7 +224,23 @@ namespace EventLogOutEmployeeService
         private async Task WriteAllInternalAsync(List<QueuedAttendanceEvent> items)
         {
             string content = JsonConvert.SerializeObject(items, Formatting.Indented);
-            await File.WriteAllTextAsync(filePath, content);
+
+            string directory = Path.GetDirectoryName(filePath) ?? string.Empty;
+            string tempPath = Path.Combine(directory, $"{Path.GetFileName(filePath)}.{Guid.NewGuid():N}.tmp");
+            string backupPath = Path.Combine(directory, $"{Path.GetFileName(filePath)}.bak");
+
+            await File.WriteAllTextAsync(tempPath, content);
+
+            if (File.Exists(filePath))
+            {
+                File.Replace(tempPath, filePath, backupPath, ignoreMetadataErrors: true);
+                if (File.Exists(backupPath))
+                    File.Delete(backupPath);
+            }
+            else
+            {
+                File.Move(tempPath, filePath);
+            }
         }
     }
 }
