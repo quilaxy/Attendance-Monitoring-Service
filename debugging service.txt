@@ -89,7 +89,7 @@ The process C:\WINDOWS\system32\winlogon.exe (ON-083) has initiated the power of
  Shut-down Type: power off
 Information	09/03/2026 15:46:33	EventLog	6006	None The Event log service was stopped.
 
-(itu username buat event 1074 bisa diambil dari ...on behalf of user KDDI-ID\annafi gak sih? ambil setelah "\")
+(itu username buat event 1074 bisa diambil dari ...on behalf of user KDDI-ID\annafi gak sih? ambil setelah "\"), atau tetap lebih baik pakai lastActiveUser aja? 
 Terus kalo 6006 gapake username gapapa? yang penting tau Computer mana yang mati? tapi nanti di listId jadi kurang ya info username nya. jadi kita tetep butuh lastActiveUser
 
 Security Log
@@ -375,4 +375,5 @@ Event Queue isinya gini
 []
 
 Event Replay Checkpoint gini isinya, masih dalam UTC bukan local
+
 2026-03-10T00:37:43.7029146Z -> berarti sekitar 07:37:43
