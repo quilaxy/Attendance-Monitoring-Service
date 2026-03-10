@@ -20,7 +20,10 @@ namespace EventLogOutEmployeeService
         private CancellationTokenSource? cancellationTokenSource;
         private CancellationToken? cancellationToken;
         private readonly object userLock = new object();
+        private int activeDispatchCount = 0;
         private DateTime serviceStartTime;
+        private readonly Lazy<SharePointIntegration> sharePointIntegration =
+            new Lazy<SharePointIntegration>(() => new SharePointIntegration());
 
         private static readonly string DataDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -192,14 +195,14 @@ namespace EventLogOutEmployeeService
             if (securityEventLog == null)
                 return;
 
-            // Walk backwards; break once we pass fromTime
+            // Walk backwards; skip entries outside [fromTime, toTime] (timestamps may be out-of-order).
             for (int i = securityEventLog.Entries.Count - 1; i >= 0; i--)
             {
                 EventLogEntry entry = securityEventLog.Entries[i];
                 DateTime eventTime = entry.TimeGenerated;
 
                 if (fromTime.HasValue && eventTime <= fromTime.Value)
-                    break;
+                    continue;
 
                 if (eventTime > toTime)
                     continue;
@@ -223,7 +226,7 @@ namespace EventLogOutEmployeeService
                 DateTime eventTime = entry.TimeGenerated;
 
                 if (fromTime.HasValue && eventTime <= fromTime.Value)
-                    break;
+                    continue;
 
                 if (eventTime > toTime)
                     continue;
@@ -304,7 +307,8 @@ namespace EventLogOutEmployeeService
                 while (waited < 15000)
                 {
                     int count = eventQueue.GetCountAsync().GetAwaiter().GetResult();
-                    if (count == 0) break;
+                    int processing = Volatile.Read(ref activeDispatchCount);
+                    if (count == 0 && processing == 0) break;
                     Thread.Sleep(500);
                     waited += 500;
                 }
@@ -362,7 +366,17 @@ namespace EventLogOutEmployeeService
                         continue;
                     }
 
-                    bool sent = await TryDispatchQueuedEventAsync(next);
+                    Interlocked.Increment(ref activeDispatchCount);
+                    bool sent;
+                    try
+                    {
+                        sent = await TryDispatchQueuedEventAsync(next);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref activeDispatchCount);
+                    }
+
                     if (sent)
                     {
                         await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
@@ -393,7 +407,7 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                var sharePoint = new SharePointIntegration();
+                var sharePoint = sharePointIntegration.Value;
                 string? accessToken = await sharePoint.GetAccessTokenAsync(item.EventTime, item.EventId);
                 if (string.IsNullOrEmpty(accessToken))
                     return false;
@@ -463,14 +477,14 @@ namespace EventLogOutEmployeeService
                     {
                         int randomDelay = new Random(Environment.MachineName.GetHashCode()).Next(0, 300000);
                         await Task.Delay(randomDelay, cancellationToken);
-                        await new SharePointIntegration().CleanupOldRecordsAsync(retentionMonths);
+                        await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
                     }
 
                     await Task.Delay(nextRun - DateTime.Now, cancellationToken);
 
                     int scheduledDelay = new Random(Environment.MachineName.GetHashCode()).Next(0, 300000);
                     await Task.Delay(scheduledDelay, cancellationToken);
-                    await new SharePointIntegration().CleanupOldRecordsAsync(retentionMonths);
+                    await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
                 }
                 catch (TaskCanceledException) { break; }
                 catch (Exception ex)
