@@ -28,6 +28,8 @@ namespace EventLogOutEmployeeService
         public DateTime? ShutdownTime { get; set; }
         public string? ShutdownType { get; set; }
         public bool WriteRawRecord { get; set; } = true;
+        public bool RawRecordDispatched { get; set; } = false;
+        public bool SummaryDispatched { get; set; } = false;
     }
 
     public class PersistentEventQueue
@@ -74,13 +76,14 @@ namespace EventLogOutEmployeeService
 
                 if (existing != null)
                 {
-                    // Login: keep the earliest timestamp (first login of the day matters)
-                    if (item.EventId == 4624 && item.EventTime < existing.EventTime)
+                    // Login: keep the earliest timestamp. If same timestamp, keep the more
+                    // meaningful logon type (e.g. Interactive over Unlock/Cached).
+                    if (item.EventId == 4624 && ShouldReplaceExistingLogin(existing, item))
                     {
                         items.Remove(existing);
                         items.Add(item);
                         await WriteAllInternalAsync(items);
-                        return true; // replaced with earlier event
+                        return true; // replaced with better candidate
                     }
 
                     // Everything else: skip duplicate
@@ -126,6 +129,34 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        public async Task UpdateDispatchStateAsync(
+            string queueId,
+            bool? rawRecordDispatched = null,
+            bool? summaryDispatched = null,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                QueuedAttendanceEvent? item = items.FirstOrDefault(x => x.QueueId == queueId);
+                if (item == null)
+                    return;
+
+                if (rawRecordDispatched.HasValue)
+                    item.RawRecordDispatched = rawRecordDispatched.Value;
+
+                if (summaryDispatched.HasValue)
+                    item.SummaryDispatched = summaryDispatched.Value;
+
+                await WriteAllInternalAsync(items);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
         public async Task<int> GetCountAsync(CancellationToken cancellationToken = default)
         {
             await fileLock.WaitAsync(cancellationToken);
@@ -138,6 +169,29 @@ namespace EventLogOutEmployeeService
             {
                 fileLock.Release();
             }
+        }
+
+        private static bool ShouldReplaceExistingLogin(QueuedAttendanceEvent existing, QueuedAttendanceEvent incoming)
+        {
+            if (incoming.EventTime < existing.EventTime)
+                return true;
+
+            if (incoming.EventTime > existing.EventTime)
+                return false;
+
+            return GetLogonTypePriority(incoming.LogonType) > GetLogonTypePriority(existing.LogonType);
+        }
+
+        private static int GetLogonTypePriority(int logonType)
+        {
+            return logonType switch
+            {
+                2  => 5, // Interactive
+                10 => 4, // RemoteInteractive
+                11 => 3, // CachedInteractive
+                7  => 2, // Unlock
+                _  => 1
+            };
         }
 
         private static TimeSpan AbsDiff(DateTime a, DateTime b)
