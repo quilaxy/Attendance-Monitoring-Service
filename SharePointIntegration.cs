@@ -223,6 +223,7 @@ namespace EventLogOutEmployeeService
 
             string eventTimeStr = eventTime.ToString("yyyy-MM-ddTHH:mm:ss");
             string title        = $"{computerName}\\{eventId}\\{username}";
+            Exception? lastException = null;
 
             for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
@@ -231,18 +232,8 @@ namespace EventLogOutEmployeeService
                     using var client = CreateGraphClient(accessToken, timeoutSeconds);
 
                     // ── Idempotency check ──────────────────────────────────────
-                    string checkUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
-                        $"?$expand=fields&$filter=fields/Title eq '{EscapeODataLiteral(title)}'" +
-                        $" and fields/EventTime eq '{EscapeODataLiteral(eventTimeStr)}'&$top=1";
-
-                    var checkResponse = await client.GetAsync(checkUrl);
-                    if (checkResponse.IsSuccessStatusCode)
-                    {
-                        var checkBody = JsonConvert.DeserializeObject<JObject>(
-                            await checkResponse.Content.ReadAsStringAsync());
-                        if ((checkBody?["value"] as JArray)?.Count > 0)
-                            return; // already exists — skip
-                    }
+                    if (await RawRecordAlreadyExistsAsync(client, title, eventTime))
+                        return;
 
                     // ── Insert ────────────────────────────────────────────────
                     var postData = new
@@ -264,13 +255,21 @@ namespace EventLogOutEmployeeService
 
                     if (response.IsSuccessStatusCode) return;
 
+                    lastException = new InvalidOperationException(
+                        $"Raw list insert failed ({(int)response.StatusCode}) for {title} at {eventTimeStr}.");
+
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs = Math.Min(delayMs * 2, 10000); }
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    lastException = ex;
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs = Math.Min(delayMs * 2, 10000); }
                 }
             }
+
+            throw new InvalidOperationException(
+                $"Failed to write raw event to SharePoint after {maxRetries} attempts. EventId={eventId}, User={username}, Time={eventTimeStr}.",
+                lastException);
         }
 
         // ── Summary list — Login ──────────────────────────────────────────────────
@@ -320,7 +319,12 @@ namespace EventLogOutEmployeeService
                     using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                         $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
                     { Content = patchContent };
-                    await client.SendAsync(patchRequest);
+                    var patchResponse = await client.SendAsync(patchRequest);
+                    if (!patchResponse.IsSuccessStatusCode)
+                    {
+                        throw new InvalidOperationException(
+                            $"Failed to update earlier LoginTime for summary key '{summaryKey}' (item {itemId}).");
+                    }
                 }
 
                 return; // row exists — nothing more to do
@@ -342,9 +346,14 @@ namespace EventLogOutEmployeeService
             };
 
             var createContent = new StringContent(JsonConvert.SerializeObject(postData), Encoding.UTF8, "application/json");
-            await client.PostAsync(
+            var createResponse = await client.PostAsync(
                 $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items",
                 createContent);
+            if (!createResponse.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to create summary login row for key '{summaryKey}'.");
+            }
         }
 
         // ── Summary list — Shutdown ───────────────────────────────────────────────
@@ -414,7 +423,12 @@ namespace EventLogOutEmployeeService
             using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                 $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
             { Content = patchContent };
-            await client.SendAsync(patchRequest);
+            var patchResult = await client.SendAsync(patchRequest);
+            if (!patchResult.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to update summary shutdown for item {itemId} ({eventId}).");
+            }
         }
 
         // ── Cleanup ───────────────────────────────────────────────────────────────
@@ -538,6 +552,38 @@ namespace EventLogOutEmployeeService
                 await findResponse.Content.ReadAsStringAsync());
 
             return findObject?["value"] as JArray;
+        }
+
+        private async Task<bool> RawRecordAlreadyExistsAsync(HttpClient client, string title, DateTime eventTime)
+        {
+            string checkUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
+                $"?$expand=fields&$filter=fields/Title eq '{EscapeODataLiteral(title)}'&$top=20";
+
+            var checkResponse = await client.GetAsync(checkUrl);
+            if (!checkResponse.IsSuccessStatusCode)
+                return false;
+
+            var checkObj = JsonConvert.DeserializeObject<JObject>(
+                await checkResponse.Content.ReadAsStringAsync());
+
+            var existing = checkObj?["value"] as JArray;
+            if (existing == null || existing.Count == 0)
+                return false;
+
+            DateTime eventUtc = eventTime.ToUniversalTime();
+            foreach (JToken row in existing)
+            {
+                var fields = row["fields"] as JObject;
+                DateTime? existingTime = ParseFieldDateTime(fields, "EventTime");
+                if (!existingTime.HasValue)
+                    continue;
+
+                DateTime existingUtc = existingTime.Value.ToUniversalTime();
+                if (Math.Abs((existingUtc - eventUtc).TotalSeconds) <= 2)
+                    return true;
+            }
+
+            return false;
         }
 
         private static string BuildSummaryKey(string computerName, string username, string workDate)
