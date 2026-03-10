@@ -198,10 +198,19 @@ namespace EventLogOutEmployeeService
         {
             try
             {
+                string? dir = Path.GetDirectoryName(stopCheckpointPath);
+                if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
                 File.WriteAllText(stopCheckpointPath,
                     checkpoint.ToUniversalTime().ToString("O"));
             }
-            catch { /* ignore write failures */ }
+            catch (Exception ex)
+            {
+                EventLog.WriteEntry("Application",
+                    $"Failed to save stop checkpoint: {ex.Message}",
+                    EventLogEntryType.Warning, 1017);
+            }
         }
 
         private void SaveReplayCheckpoint(DateTime checkpoint)
