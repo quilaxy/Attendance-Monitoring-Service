@@ -344,16 +344,11 @@ namespace EventLogOutEmployeeService
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
-            string workDate   = shutdownTime.ToString("yyyy-MM-dd");
-            string summaryKey = BuildSummaryKey(computerName, username, workDate);
-
             using var client = CreateGraphClient(accessToken, 30);
-            var existingItems = await FindSummaryItemAsync(client, summaryKey);
+            var summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime);
+            if (summaryItem == null)
+                return; // no compatible login row yet — skip
 
-            if (existingItems == null || existingItems.Count == 0)
-                return; // no login row yet — skip, cannot record shutdown without login context
-
-            var summaryItem = existingItems[0];
             string? itemId  = summaryItem?["id"]?.ToString();
             if (string.IsNullOrWhiteSpace(itemId)) return;
 
@@ -462,6 +457,34 @@ namespace EventLogOutEmployeeService
             return client;
         }
 
+        private async Task<JToken?> FindSummaryItemForShutdownAsync(
+            HttpClient client, string computerName, string username, DateTime shutdownTime)
+        {
+            // Prefer same-day summary row.
+            string todayKey = BuildSummaryKey(computerName, username, shutdownTime.ToString("yyyy-MM-dd"));
+            var todayItems = await FindSummaryItemAsync(client, todayKey);
+            if (todayItems != null && todayItems.Count > 0)
+                return todayItems[0];
+
+            // Fallback: previous-day row for overnight sessions.
+            string yesterdayKey = BuildSummaryKey(computerName, username, shutdownTime.AddDays(-1).ToString("yyyy-MM-dd"));
+            var yesterdayItems = await FindSummaryItemAsync(client, yesterdayKey);
+            if (yesterdayItems == null || yesterdayItems.Count == 0)
+                return null;
+
+            var item = yesterdayItems[0];
+            var fields = item?["fields"] as JObject;
+            DateTime? loginTime = ParseFieldDateTime(fields, "LoginTime");
+            if (!loginTime.HasValue)
+                return null;
+
+            // Accept overnight session up to 20h after login.
+            if (shutdownTime >= loginTime.Value && shutdownTime <= loginTime.Value.AddHours(20))
+                return item;
+
+            return null;
+        }
+
         private async Task<JArray?> FindSummaryItemAsync(HttpClient client, string summaryKey)
         {
             string findUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items" +
@@ -520,16 +543,26 @@ namespace EventLogOutEmployeeService
             DateTime refExpected = expectedTimeOut
                 ?? (loginTime?.AddHours(9) ?? shutdownTime.AddHours(-1));
 
+            // Guardrail: shutdown must belong to the same work session window.
+            if (loginTime.HasValue)
+            {
+                if (shutdownTime < loginTime.Value)
+                    return false;
+
+                if (shutdownTime > loginTime.Value.AddHours(20))
+                    return false;
+            }
+
             // Unexpected shutdown/crash: only count if it happened at or after expected time out
             if (eventId == 6008 || eventId == 41)
                 return shutdownTime >= refExpected;
 
-            // User logout: accept if within ±2 h of expectedTimeOut (filters mid-day logouts)
+            // User logout: accept if within ±5 h of expectedTimeOut (allow early leave/overtime)
             if (eventId == 4647)
-                return shutdownTime >= refExpected.AddHours(-2) &&
-                       shutdownTime <= refExpected.AddHours(2);
+                return shutdownTime >= refExpected.AddHours(-5) &&
+                       shutdownTime <= refExpected.AddHours(5);
 
-            // 6006 and 1074-Shutdown: always valid
+            // 6006 and 1074-Shutdown: valid within session guardrail above.
             return true;
         }
 
