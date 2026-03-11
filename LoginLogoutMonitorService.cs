@@ -280,16 +280,20 @@ namespace EventLogOutEmployeeService
 
                 string content = checkpoint.ToUniversalTime().ToString("O");
 
-                // Write both primary and backup atomically so at least one survives
-                // if shutdown cuts power mid-write
-                File.WriteAllText(stopCheckpointPath, content);
-                File.WriteAllText(stopCheckpointBackupPath, content);
+                // Write atomically via temp+rename so the file is never half-written
+                // if Windows kills the process mid-write during system shutdown.
+                // Primary path:
+                string tempPrimary = stopCheckpointPath + ".tmp";
+                File.WriteAllText(tempPrimary, content);
+                File.Move(tempPrimary, stopCheckpointPath, overwrite: true);
 
-                // Verify the write actually succeeded
-                bool exists = File.Exists(stopCheckpointPath);
-                string readBack = exists ? File.ReadAllText(stopCheckpointPath).Trim() : "(file missing!)";
+                // Backup path (same trick):
+                string tempBackup = stopCheckpointBackupPath + ".tmp";
+                File.WriteAllText(tempBackup, content);
+                File.Move(tempBackup, stopCheckpointBackupPath, overwrite: true);
+
                 EventLog.WriteEntry("Application",
-                    $"SaveStopCheckpoint: Exists={exists} Content='{readBack}'",
+                    $"SaveStopCheckpoint: written '{content}' to primary + backup.",
                     EventLogEntryType.Information, 1022);
             }
             catch (Exception ex)
@@ -454,8 +458,13 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                // Save checkpoint first with a safety buffer to guarantee replay coverage
-                // for events written right around shutdown/startup transitions.
+                // ── Step 1: Request extra shutdown time from SCM immediately.
+                // Windows system shutdown gives services only ~5 seconds by default.
+                // RequestAdditionalTime tells SCM we need more — prevents premature kill.
+                RequestAdditionalTime(8000);
+
+                // ── Step 2: Save checkpoint FIRST, before anything else.
+                // If Windows kills us after this line, replay will still cover missed events.
                 DateTime stopCheckpoint = DateTime.Now.AddMinutes(-5);
 
                 EventLog.WriteEntry("Application",
@@ -465,9 +474,10 @@ namespace EventLogOutEmployeeService
                 SaveStopCheckpoint(stopCheckpoint);
 
                 EventLog.WriteEntry("Application",
-                    $"OnStop: checkpoint saved, FileExists={File.Exists(stopCheckpointPath)}",
+                    $"OnStop: checkpoint saved.",
                     EventLogEntryType.Information, 1019);
 
+                // ── Step 3: Stop listening for new events
                 if (securityEventLog != null)
                 {
                     securityEventLog.EnableRaisingEvents = false;
@@ -482,16 +492,16 @@ namespace EventLogOutEmployeeService
 
                 cancellationTokenSource?.Cancel();
 
-                // Wait up to 15 seconds for the queue worker to finish its current HTTP call
-                // so we don't lose an in-flight dispatch on restart
+                // ── Step 4: Brief wait for any in-flight dispatch to finish.
+                // Keep this short (≤5s total) — we already saved the checkpoint so
+                // any un-sent events will be replayed on next start anyway.
                 int waited = 0;
-                while (waited < 15000)
+                while (waited < 4000)
                 {
-                    int count = eventQueue.GetCountAsync().GetAwaiter().GetResult();
                     int processing = Volatile.Read(ref activeDispatchCount);
-                    if (count == 0 && processing == 0) break;
-                    Thread.Sleep(500);
-                    waited += 500;
+                    if (processing == 0) break;
+                    Thread.Sleep(200);
+                    waited += 200;
                 }
 
                 EventLog.WriteEntry("Attendance-Service",
@@ -787,11 +797,15 @@ namespace EventLogOutEmployeeService
 
                 if (eventId == 6006)
                 {
-                    string? resolved = TryResolveUsernameFor6006(eventTime);
+                    var (resolved, confirmed1074ShutdownType) = TryResolve1074StateFor6006(eventTime);
                     EventLog.WriteEntry("Application",
-                        $"[DBG-6006] at {eventTime:O} | TryResolveUsernameFor6006 returned: '{resolved ?? "(null)"}'",
+                        $"[DBG-6006] at {eventTime:O} | resolved='{resolved ?? "(null)"}' " +
+                        $"confirmed1074ShutdownType='{confirmed1074ShutdownType ?? "(unconfirmed)"}'",
                         EventLogEntryType.Information, 2005);
                     username = resolved ?? username;
+                    // Pass confirmed1074ShutdownType via eventMessage slot for 6006 context.
+                    // ProcessEvent will use this to set the correct shutdownType on the queued event.
+                    eventMessage = confirmed1074ShutdownType;
                 }
 
                 if (string.IsNullOrEmpty(username))
@@ -859,7 +873,11 @@ namespace EventLogOutEmployeeService
                     "System" => eventId switch
                     {
                         1074 => ParseShutdownType(eventMessage),
-                        6006 => "Shutdown Completed",
+                        // For 6006: eventMessage carries the confirmed 1074 shutdown type (if paired).
+                        // If null, we don't know the cause — label it as unconfirmed.
+                        6006 => !string.IsNullOrEmpty(eventMessage)
+                                    ? $"Shutdown Completed ({eventMessage})"
+                                    : "Shutdown Completed (type unconfirmed)",
                         6008 => "Unexpected Shutdown",
                         41   => "System Crash",
                         42   => "Sleep",
@@ -1134,16 +1152,21 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        private string? TryResolveUsernameFor6006(DateTime eventTime)
+        /// <summary>
+        /// Tries to find a 1074 event within 60 seconds before the given 6006 event time.
+        /// Returns (username, shutdownType) if a matching 1074 exists, or (null, null) if not.
+        /// shutdownType will be null if the paired 1074 was a Restart (not a real power-off).
+        /// </summary>
+        private (string? Username, string? ShutdownType) TryResolve1074StateFor6006(DateTime eventTime)
         {
             lock (last1074Lock)
             {
                 if (string.IsNullOrWhiteSpace(last1074Username))
                 {
                     EventLog.WriteEntry("Application",
-                        $"[DBG-6006] TryResolve: last1074Username is empty.",
+                        $"[DBG-6006] TryResolve: no prior 1074 state in memory.",
                         EventLogEntryType.Information, 2010);
-                    return null;
+                    return (null, null);
                 }
 
                 double diffSeconds = Math.Abs((eventTime - last1074EventTime).TotalSeconds);
@@ -1155,16 +1178,34 @@ namespace EventLogOutEmployeeService
                         $"[DBG-6006] TryResolve: diff={diffSeconds:F0}s exceeds 60s window. " +
                         $"last1074Time={last1074EventTime:O} 6006Time={eventTime:O}",
                         EventLogEntryType.Information, 2011);
-                    return null;
+                    return (null, null);
                 }
 
+                // If the paired 1074 was a Restart, we have a username but no confirmed shutdown type.
+                // Return username but null shutdownType so caller knows this is unconfirmed.
+                bool isRestart = IsRestartShutdownType(last1074ShutdownType);
+                string? confirmedShutdownType = isRestart ? null : last1074ShutdownType;
+
                 EventLog.WriteEntry("Application",
-                    $"[DBG-6006] TryResolve: matched username='{last1074Username}' diff={diffSeconds:F1}s",
+                    $"[DBG-6006] TryResolve: matched username='{last1074Username}' diff={diffSeconds:F1}s " +
+                    $"1074Type='{last1074ShutdownType}' isRestart={isRestart}",
                     EventLogEntryType.Information, 2012);
 
-                _ = last1074ShutdownType;
-                return last1074Username;
+                return (last1074Username, confirmedShutdownType);
             }
+        }
+
+        /// <summary>
+        /// Returns true if the shutdown type string indicates a restart (not a power-off/shutdown).
+        /// Case-insensitive.
+        /// </summary>
+        private static bool IsRestartShutdownType(string? shutdownType)
+        {
+            if (string.IsNullOrWhiteSpace(shutdownType))
+                return false;
+
+            return shutdownType.Contains("restart", StringComparison.OrdinalIgnoreCase) ||
+                   shutdownType.Contains("reboot", StringComparison.OrdinalIgnoreCase);
         }
 
         private bool IsValidUsername(string username)
