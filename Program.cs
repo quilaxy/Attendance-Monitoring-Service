@@ -66,5 +66,8 @@ public class Program
             File.AppendAllText(crashLogPath, content);
         }
         catch 
+        {
+            
+        }
     }
 }
