@@ -684,8 +684,17 @@ namespace EventLogOutEmployeeService
                     continue;
 
                 DateTime existingUtc = existingTime.Value.ToUniversalTime();
-                if (Math.Abs((existingUtc - eventUtc).TotalSeconds) <= 2)
+                // 60-second window: Graph API has eventual consistency so a record
+                // inserted moments ago may not appear immediately in query results.
+                // A wide window is safe because title already encodes ComputerName+EventId+Username.
+                if (Math.Abs((existingUtc - eventUtc).TotalSeconds) <= 60)
+                {
+                    EventLog.WriteEntry("Application",
+                        $"[RAW] Idempotency hit: title='{title}' existing={existingUtc:O} incoming={eventUtc:O} " +
+                        $"diff={(existingUtc - eventUtc).TotalSeconds:F1}s",
+                        EventLogEntryType.Information, 4025);
                     return true;
+                }
             }
 
             return false;
