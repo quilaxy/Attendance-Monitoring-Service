@@ -634,12 +634,11 @@ namespace EventLogOutEmployeeService
         ///
         /// Exclusion rules:
         ///   • 1074 Restart → never written to Summary (not a real end-of-day).
-        ///   • 4647 (User Logout) → only accepted if the logout time is within the window
-        ///     [expectedTimeOut - 5h, expectedTimeOut + 5h]. This filters out mid-day
-        ///     lock/logoffs while still catching early or slightly-late departures.
-        ///   • 6008/41 (Unexpected Shutdown/Crash) → only accepted after expectedTimeOut,
-        ///     i.e. the machine crashed at or after the expected end of day.
-        ///   • 6006 / 1074-Shutdown → always accepted (highest priority, genuine shutdown).
+        ///   • 6006 unconfirmed (no paired 1074 shutdown) → treated like 4647, only accepted
+        ///     within ±5h of expectedTimeOut, because we can't tell if it was a restart.
+        ///   • 6006 confirmed shutdown (paired 1074 was power-off/shutdown) → always accepted.
+        ///   • 4647 (User Logout) → only accepted if within ±5h of expectedTimeOut.
+        ///   • 6008/41 (Unexpected Shutdown/Crash) → only accepted at or after expectedTimeOut.
         /// </summary>
         private static bool IsValidShutdownCandidate(
             int eventId, string eventType,
@@ -647,7 +646,7 @@ namespace EventLogOutEmployeeService
             DateTime? loginTime, DateTime? expectedTimeOut)
         {
             // 1074 Restart is never a final shutdown
-            if (eventId == 1074 && eventType.Contains("Restart", StringComparison.OrdinalIgnoreCase))
+            if (eventId == 1074 && IsRestartEventType(eventType))
                 return false;
 
             DateTime refExpected = expectedTimeOut
@@ -667,32 +666,57 @@ namespace EventLogOutEmployeeService
             if (eventId == 6008 || eventId == 41)
                 return shutdownTime >= refExpected;
 
-            // User logout: accept if within ±5 h of expectedTimeOut (allow early leave/overtime)
+            // User logout: accept if within ±5h of expectedTimeOut (allow early leave/overtime)
             if (eventId == 4647)
                 return shutdownTime >= refExpected.AddHours(-5) &&
                        shutdownTime <= refExpected.AddHours(5);
 
-            // 6006 and 1074-Shutdown: valid within session guardrail above.
+            // 6006 unconfirmed (eventType contains "unconfirmed"): apply same time window as 4647
+            // because we don't know if this was a restart or shutdown.
+            if (eventId == 6006 && IsUnconfirmed6006(eventType))
+                return shutdownTime >= refExpected.AddHours(-5) &&
+                       shutdownTime <= refExpected.AddHours(5);
+
+            // 6006 confirmed shutdown, and 1074 non-restart: valid within session guardrail above.
             return true;
         }
 
         /// <summary>
         /// Priority for Summary ShutdownTime. Higher value wins.
-        /// 6006=5, 1074-Shutdown=4, 4647=3, 6008=2, 41=1
+        ///   6006 confirmed shutdown = 5  (paired 1074 was power-off/shutdown)
+        ///   1074 Shutdown           = 4  (confirmed power-off, no 6006 yet)
+        ///   6006 unconfirmed        = 3  (no paired 1074 — could be restart, treated cautiously)
+        ///   4647 User Logout        = 2
+        ///   6008 Unexpected         = 1
+        ///   41   Crash              = 1
         /// </summary>
         private static int GetShutdownPriority(int eventId, string eventType)
         {
-            if (eventId == 6006) return 5;
-            if (eventId == 1074 && !eventType.Contains("Restart", StringComparison.OrdinalIgnoreCase)) return 4;
-            if (eventId == 4647) return 3;
-            if (eventId == 6008) return 2;
+            if (eventId == 6006)
+                return IsUnconfirmed6006(eventType) ? 3 : 5;
+
+            if (eventId == 1074 && !IsRestartEventType(eventType)) return 4;
+            if (eventId == 4647) return 2;
+            if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
             return 0;
         }
 
+        /// <summary>Returns true if the eventType string indicates a restart (case-insensitive).</summary>
+        private static bool IsRestartEventType(string eventType)
+            => eventType.Contains("restart", StringComparison.OrdinalIgnoreCase) ||
+               eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>Returns true if this 6006 event has no confirmed paired 1074 shutdown type.</summary>
+        private static bool IsUnconfirmed6006(string eventType)
+            => eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase);
+
         private static int GetPriorityFromShutdownType(string? shutdownType)
         {
             if (string.IsNullOrWhiteSpace(shutdownType)) return 0;
+            // Format stored: "6006 - Shutdown Completed (Shutdown Initiated)"
+            //             or "6006 - Shutdown Completed (type unconfirmed)"
+            //             or "1074 - Restart Initiated"  etc.
             string[] parts = shutdownType.Split('-', 2, StringSplitOptions.TrimEntries);
             if (parts.Length == 0 || !int.TryParse(parts[0], out int existingEventId)) return 0;
             string existingEventType = parts.Length > 1 ? parts[1] : string.Empty;
