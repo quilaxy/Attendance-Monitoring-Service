@@ -41,6 +41,9 @@ namespace EventLogOutEmployeeService
         private readonly string replayCheckpointPath =
             Path.Combine(DataDirectory, "event-replay.checkpoint");
 
+        private readonly string stopCheckpointBackupPath =
+            Path.Combine(DataDirectory, "event-stop.checkpoint.bak");
+
         private readonly PersistentEventQueue eventQueue =
             new PersistentEventQueue(Path.Combine(DataDirectory, "event-queue.json"));
 
@@ -161,10 +164,21 @@ namespace EventLogOutEmployeeService
                 DateTime replayTo = DateTime.Now;
                 DateTime? replayFrom = LoadStopCheckpoint();
 
+                EventLog.WriteEntry("Application",
+                    $"ReplayMissedEvents: replayFrom={replayFrom?.ToString("O") ?? "(none)"} replayTo={replayTo:O}",
+                    EventLogEntryType.Information, 1028);
+
                 if (replayFrom.HasValue)
                 {
+                    // Security events first so lastActiveUser is populated before system events run
                     ReplaySecurityEvents(replayFrom, replayTo);
                     ReplaySystemEvents(replayFrom, replayTo);
+                }
+                else
+                {
+                    EventLog.WriteEntry("Application",
+                        "ReplayMissedEvents: no checkpoint found, skipping replay.",
+                        EventLogEntryType.Information, 1029);
                 }
 
                 SaveReplayCheckpoint(replayTo);
@@ -181,17 +195,69 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                if (!File.Exists(stopCheckpointPath))
-                    return null;
+                // Primary checkpoint
+                DateTime? checkpoint = TryLoadCheckpoint(stopCheckpointPath);
+                if (checkpoint.HasValue)
+                {
+                    EventLog.WriteEntry("Application",
+                        $"LoadStopCheckpoint: loaded from primary '{stopCheckpointPath}' → {checkpoint.Value:O}",
+                        EventLogEntryType.Information, 1024);
+                    return checkpoint;
+                }
 
-                string value = File.ReadAllText(stopCheckpointPath).Trim();
-                if (DateTime.TryParse(value, null,
-                        System.Globalization.DateTimeStyles.RoundtripKind, out DateTime parsed))
-                    return parsed.ToLocalTime();
+                EventLog.WriteEntry("Application",
+                    $"LoadStopCheckpoint: primary not found at '{stopCheckpointPath}', trying backup.",
+                    EventLogEntryType.Warning, 1023);
+
+                // Backup checkpoint (in case primary write was interrupted mid-shutdown)
+                checkpoint = TryLoadCheckpoint(stopCheckpointBackupPath);
+                if (checkpoint.HasValue)
+                {
+                    EventLog.WriteEntry("Application",
+                        $"LoadStopCheckpoint: loaded from backup '{stopCheckpointBackupPath}' → {checkpoint.Value:O}",
+                        EventLogEntryType.Warning, 1023);
+                    return checkpoint;
+                }
+
+                // Last-resort: derive from replay checkpoint -5 min so we don't miss events
+                // written right before the previous service start
+                DateTime? replayCheckpoint = TryLoadCheckpoint(replayCheckpointPath);
+                if (replayCheckpoint.HasValue)
+                {
+                    DateTime derived = replayCheckpoint.Value.AddMinutes(-5);
+                    EventLog.WriteEntry("Application",
+                        $"LoadStopCheckpoint: both stop checkpoints missing — deriving from replay checkpoint " +
+                        $"({replayCheckpoint.Value:O}) -5min → {derived:O}",
+                        EventLogEntryType.Warning, 1023);
+                    return derived;
+                }
+
+                EventLog.WriteEntry("Application",
+                    "LoadStopCheckpoint: no checkpoint found (primary, backup, or replay) — replay skipped.",
+                    EventLogEntryType.Warning, 1023);
             }
-            catch { /* ignore malformed checkpoint */ }
+            catch (Exception ex)
+            {
+                EventLog.WriteEntry("Application",
+                    $"LoadStopCheckpoint: exception {ex.GetType().Name}: {ex.Message}",
+                    EventLogEntryType.Warning, 1027);
+            }
 
             return null;
+        }
+
+        /// <summary>Reads and parses a checkpoint file. Returns null if missing or malformed.</summary>
+        private static DateTime? TryLoadCheckpoint(string path)
+        {
+            if (!File.Exists(path))
+                return null;
+
+            string value = File.ReadAllText(path).Trim();
+            if (!DateTime.TryParse(value, null,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out DateTime parsed))
+                return null;
+
+            return parsed.ToLocalTime();
         }
 
         private void SaveStopCheckpoint(DateTime checkpoint)
@@ -199,16 +265,37 @@ namespace EventLogOutEmployeeService
             try
             {
                 string? dir = Path.GetDirectoryName(stopCheckpointPath);
-                if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
 
-                File.WriteAllText(stopCheckpointPath,
-                    checkpoint.ToUniversalTime().ToString("O"));
+                EventLog.WriteEntry("Application",
+                    $"SaveStopCheckpoint: dir='{dir}' path='{stopCheckpointPath}'",
+                    EventLogEntryType.Information, 1020);
+
+                if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                    EventLog.WriteEntry("Application",
+                        $"SaveStopCheckpoint: created directory '{dir}'",
+                        EventLogEntryType.Information, 1021);
+                }
+
+                string content = checkpoint.ToUniversalTime().ToString("O");
+
+                // Write both primary and backup atomically so at least one survives
+                // if shutdown cuts power mid-write
+                File.WriteAllText(stopCheckpointPath, content);
+                File.WriteAllText(stopCheckpointBackupPath, content);
+
+                // Verify the write actually succeeded
+                bool exists = File.Exists(stopCheckpointPath);
+                string readBack = exists ? File.ReadAllText(stopCheckpointPath).Trim() : "(file missing!)";
+                EventLog.WriteEntry("Application",
+                    $"SaveStopCheckpoint: Exists={exists} Content='{readBack}'",
+                    EventLogEntryType.Information, 1022);
             }
             catch (Exception ex)
             {
                 EventLog.WriteEntry("Application",
-                    $"Failed to save stop checkpoint: {ex.Message}",
+                    $"Failed to save stop checkpoint: {ex.GetType().Name}: {ex.Message} | Path='{stopCheckpointPath}'",
                     EventLogEntryType.Warning, 1017);
             }
         }
@@ -217,6 +304,10 @@ namespace EventLogOutEmployeeService
         {
             try
             {
+                string? dir = Path.GetDirectoryName(replayCheckpointPath);
+                if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
                 File.WriteAllText(replayCheckpointPath,
                     checkpoint.ToUniversalTime().ToString("O"));
             }
@@ -228,7 +319,9 @@ namespace EventLogOutEmployeeService
             if (securityEventLog == null)
                 return;
 
-            // Walk backwards; skip entries outside [fromTime, toTime] (timestamps may be out-of-order).
+            // Collect and sort ascending (oldest-first) for consistent ordering.
+            var entries = new List<(DateTime Time, EventLogEntry Entry, int EventId)>();
+
             for (int i = securityEventLog.Entries.Count - 1; i >= 0; i--)
             {
                 EventLogEntry entry = securityEventLog.Entries[i];
@@ -244,6 +337,29 @@ namespace EventLogOutEmployeeService
                 if (eventId != 4624 && eventId != 4647)
                     continue;
 
+                // Pre-filter 4624: skip irrelevant logon types early
+                if (eventId == 4624 && entry.Message != null)
+                {
+                    int lt = ParseLogonType(entry.Message);
+                    if (!IsRelevantLogonType(lt))
+                        continue;
+                }
+
+                entries.Add((eventTime, entry, eventId));
+            }
+
+            EventLog.WriteEntry("Application",
+                $"ReplaySecurityEvents: found {entries.Count} security events between {fromTime:O} and {toTime:O}.",
+                EventLogEntryType.Information, 1032);
+
+            entries.Sort((a, b) => a.Time.CompareTo(b.Time));
+
+            foreach (var (time, entry, eventId) in entries)
+            {
+                EventLog.WriteEntry("Application",
+                    $"ReplaySecurityEvents: processing EventId={eventId} at {time:O}",
+                    EventLogEntryType.Information, 1033);
+
                 ProcessSecurityEntryAsync(entry, writeRawRecord: true).GetAwaiter().GetResult();
             }
         }
@@ -252,6 +368,12 @@ namespace EventLogOutEmployeeService
         {
             if (systemEventLog == null)
                 return;
+
+            // ── Collect matching entries first, then sort ASCENDING (oldest first).
+            // This is CRITICAL: 1074 must be processed before 6006 so that
+            // TryResolveUsernameFor6006() can find the username set by StoreLast1074State().
+            // Walking backwards and calling GetAwaiter().GetResult() inline breaks this pairing.
+            var entries = new List<(DateTime Time, EventLogEntry Entry, int EventId)>();
 
             for (int i = systemEventLog.Entries.Count - 1; i >= 0; i--)
             {
@@ -267,6 +389,22 @@ namespace EventLogOutEmployeeService
                 int eventId = unchecked((int)entry.InstanceId);
                 if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     continue;
+
+                entries.Add((eventTime, entry, eventId));
+            }
+
+            EventLog.WriteEntry("Application",
+                $"ReplaySystemEvents: found {entries.Count} system events between {fromTime:O} and {toTime:O}.",
+                EventLogEntryType.Information, 1030);
+
+            // Sort oldest-first so 1074 is always processed before its paired 6006
+            entries.Sort((a, b) => a.Time.CompareTo(b.Time));
+
+            foreach (var (time, entry, eventId) in entries)
+            {
+                EventLog.WriteEntry("Application",
+                    $"ReplaySystemEvents: processing EventId={eventId} at {time:O} Source={entry.Source}",
+                    EventLogEntryType.Information, 1031);
 
                 ProcessSystemEntryAsync(entry, writeRawRecord: true).GetAwaiter().GetResult();
             }
@@ -492,8 +630,12 @@ namespace EventLogOutEmployeeService
                 bool doneSummary = !ShouldProcessSummary(item) || item.SummaryDispatched;
                 return doneRaw && doneSummary;
             }
-            catch
+            catch (Exception ex)
             {
+                EventLog.WriteEntry("Application",
+                    $"Dispatch failed: queueId={item.QueueId} eventId={item.EventId} user={item.Username} " +
+                    $"time={item.EventTime:O} error={ex.GetType().Name}: {ex.Message}",
+                    EventLogEntryType.Warning, 1027);
                 return false;
             }
         }
@@ -603,35 +745,83 @@ namespace EventLogOutEmployeeService
                 if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     return;
 
-                if (eventId == 1074 && log.Message == null)
-                    return;
-
                 DateTime eventTime = log.TimeGenerated;
                 string computerName = log.MachineName;
 
+                // ── 1074: Null-message guard + message preview for debugging ────────
+                if (eventId == 1074)
+                {
+                    if (log.Message == null)
+                    {
+                        EventLog.WriteEntry("Application",
+                            $"[DBG-1074] EventId=1074 at {eventTime:O} has NULL message — skipping.",
+                            EventLogEntryType.Warning, 2001);
+                        return;
+                    }
+
+                    // Log first 300 chars of message so we can verify regex match
+                    string preview = log.Message.Length > 300 ? log.Message.Substring(0, 300) : log.Message;
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-1074] at {eventTime:O} | MessagePreview: {preview}",
+                        EventLogEntryType.Information, 2002);
+                }
+
                 string? eventMessage = (eventId == 1074) ? log.Message : null;
                 string? username = (eventId == 1074) ? GetUserFromSystem1074Message(eventMessage) : null;
+
+                if (eventId == 1074)
+                {
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-1074] GetUserFromSystem1074Message returned: '{username ?? "(null)"}'",
+                        EventLogEntryType.Information, 2003);
+                }
 
                 if (eventId == 1074 && !string.IsNullOrEmpty(username))
                 {
                     string shutdownType = ParseShutdownType(eventMessage);
                     StoreLast1074State(username, eventTime, shutdownType);
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-1074] Stored state: Username={username} ShutdownType={shutdownType} Time={eventTime:O}",
+                        EventLogEntryType.Information, 2004);
                 }
 
                 if (eventId == 6006)
-                    username = TryResolveUsernameFor6006(eventTime) ?? username;
-
-                if (string.IsNullOrEmpty(username))
                 {
-                    lock (userLock)
-                        username = lastActiveUser;
+                    string? resolved = TryResolveUsernameFor6006(eventTime);
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-6006] at {eventTime:O} | TryResolveUsernameFor6006 returned: '{resolved ?? "(null)"}'",
+                        EventLogEntryType.Information, 2005);
+                    username = resolved ?? username;
                 }
 
                 if (string.IsNullOrEmpty(username))
                 {
-                    username = GetMostRecentUser(eventTime);
+                    string? fromLock;
+                    lock (userLock)
+                        fromLock = lastActiveUser;
+
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-{eventId}] username null after event parse, lastActiveUser='{fromLock ?? "(empty)"}'",
+                        EventLogEntryType.Information, 2006);
+
+                    username = fromLock;
+                }
+
+                if (string.IsNullOrEmpty(username))
+                {
+                    string? fromLog = GetMostRecentUser(eventTime);
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-{eventId}] username still null, GetMostRecentUser returned: '{fromLog ?? "(null)"}'",
+                        EventLogEntryType.Information, 2007);
+
+                    username = fromLog;
                     if (string.IsNullOrEmpty(username))
+                    {
+                        EventLog.WriteEntry("Application",
+                            $"[DBG-{eventId}] DROPPING event at {eventTime:O} — no username could be resolved.",
+                            EventLogEntryType.Warning, 2008);
                         return;
+                    }
                 }
 
                 if (eventId == 42)
@@ -881,27 +1071,54 @@ namespace EventLogOutEmployeeService
 
             try
             {
+                // Pattern 1 (English): "on behalf of user DOMAIN\User for the following reason"
                 var match = Regex.Match(message, @"on behalf of user\s+([^\r\n]+)", RegexOptions.IgnoreCase);
+
+                // Pattern 2 (non-English locale): "DOMAIN\Username for the following reason"
+                // e.g. Indonesian Windows: "atas nama pengguna DOMAIN\User untuk alasan berikut"
                 if (!match.Success)
-                    return null;
+                    match = Regex.Match(message, @"\\([^\\\s]+)\s+for the following reason", RegexOptions.IgnoreCase);
 
-                string candidate = match.Groups[1].Value.Trim();
-                int reasonIndex = candidate.IndexOf(" for the following reason", StringComparison.OrdinalIgnoreCase);
-                if (reasonIndex > 0)
-                    candidate = candidate.Substring(0, reasonIndex).Trim();
+                if (match.Success)
+                {
+                    string candidate = match.Groups[1].Value.Trim();
+                    int reasonIndex = candidate.IndexOf(" for the following reason", StringComparison.OrdinalIgnoreCase);
+                    if (reasonIndex > 0)
+                        candidate = candidate.Substring(0, reasonIndex).Trim();
 
-                if (candidate.Contains("\\"))
-                    candidate = candidate.Substring(candidate.LastIndexOf('\\') + 1).Trim();
+                    if (candidate.Contains("\\"))
+                        candidate = candidate.Substring(candidate.LastIndexOf('\\') + 1).Trim();
 
-                if (candidate.Contains("@"))
-                    candidate = candidate.Split('@')[0].Trim();
+                    if (candidate.Contains("@"))
+                        candidate = candidate.Split('@')[0].Trim();
 
-                return IsValidUsername(candidate) ? candidate : null;
+                    if (IsValidUsername(candidate))
+                        return candidate;
+                }
+
+                // Pattern 3 (broad fallback): any "DOMAIN\Username" occurrence in the message.
+                // Last resort for unknown locale formats.
+                var domainMatch = Regex.Match(message, @"[A-Za-z0-9_\-]+\\([A-Za-z0-9_\.\-]+)", RegexOptions.IgnoreCase);
+                if (domainMatch.Success)
+                {
+                    string candidate = domainMatch.Groups[1].Value.Trim();
+                    if (IsValidUsername(candidate))
+                    {
+                        EventLog.WriteEntry("Application",
+                            $"[DBG-1074] GetUserFromSystem1074Message: patterns 1+2 missed, broad fallback matched '{candidate}'",
+                            EventLogEntryType.Information, 2020);
+                        return candidate;
+                    }
+                }
             }
-            catch
+            catch (Exception ex)
             {
-                return null;
+                EventLog.WriteEntry("Application",
+                    $"[DBG-1074] GetUserFromSystem1074Message exception: {ex.Message}",
+                    EventLogEntryType.Warning, 2021);
             }
+
+            return null;
         }
 
         private void StoreLast1074State(string username, DateTime eventTime, string shutdownType)
@@ -922,13 +1139,29 @@ namespace EventLogOutEmployeeService
             lock (last1074Lock)
             {
                 if (string.IsNullOrWhiteSpace(last1074Username))
+                {
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-6006] TryResolve: last1074Username is empty.",
+                        EventLogEntryType.Information, 2010);
                     return null;
+                }
 
-                // 6006 typically follows 1074 within a few seconds.
-                if (Math.Abs((eventTime - last1074EventTime).TotalSeconds) > 10)
+                double diffSeconds = Math.Abs((eventTime - last1074EventTime).TotalSeconds);
+                // Windows shutdown: 6006 is usually within a few seconds of 1074,
+                // but slow shutdowns (pending app close, etc.) can take up to 60s.
+                if (diffSeconds > 60)
+                {
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-6006] TryResolve: diff={diffSeconds:F0}s exceeds 60s window. " +
+                        $"last1074Time={last1074EventTime:O} 6006Time={eventTime:O}",
+                        EventLogEntryType.Information, 2011);
                     return null;
+                }
 
-                // Keep shutdown type in state for diagnostics/future behavior tuning.
+                EventLog.WriteEntry("Application",
+                    $"[DBG-6006] TryResolve: matched username='{last1074Username}' diff={diffSeconds:F1}s",
+                    EventLogEntryType.Information, 2012);
+
                 _ = last1074ShutdownType;
                 return last1074Username;
             }
