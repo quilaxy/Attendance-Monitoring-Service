@@ -53,6 +53,12 @@ namespace EventLogOutEmployeeService
             // Without this, ServiceBase never invokes OnShutdown() and the checkpoint is lost.
             CanShutdown = true;
 
+            // FIX [CRASH]: Tangkap unhandled exception sebelum process mati.
+            // Tanpa ini, crash 0xe0434352 tidak ter-log sama sekali dan
+            // event-stop.checkpoint tidak tersimpan sehingga window replay
+            // berikutnya bisa salah (root cause event 4624 annafi hilang).
+            AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+
             try
             {
                 if (Environment.OSVersion.Platform == PlatformID.Win32NT)
@@ -128,6 +134,24 @@ namespace EventLogOutEmployeeService
                     cancellationTokenSource = new CancellationTokenSource();
                     cancellationToken = cancellationTokenSource.Token;
 
+                    // FIX [GAP]: Aktifkan listener SEBELUM replay dimulai.
+                    //
+                    // Masalah sebelumnya:
+                    //   replayTo = DateTime.Now (di-capture sebelum listener aktif)
+                    //   Replay jalan ~8 detik → listener baru aktif di MonitorEvents()
+                    //   Event yang terjadi antara replayTo dan listener-aktif = HILANG
+                    //   Inilah yang menyebabkan 4624 annafi (10:25:15) tidak masuk.
+                    //
+                    // Solusi:
+                    //   EnableRaisingEvents = true SEBELUM ReplayMissedEventsFromCheckpoint().
+                    //   Event yang masuk saat replay berlangsung akan di-dedup secara otomatis
+                    //   oleh PersistentEventQueue.EnqueueIfNotDuplicateAsync() — tidak ada
+                    //   risiko duplikasi.
+                    if (securityEventLog != null)
+                        securityEventLog.EnableRaisingEvents = true;
+                    if (systemEventLog != null)
+                        systemEventLog.EnableRaisingEvents = true;
+
                     // Replay any events missed while service was down
                     ReplayMissedEventsFromCheckpoint();
 
@@ -157,6 +181,52 @@ namespace EventLogOutEmployeeService
                     "Service started successfully.",
                     EventLogEntryType.Information, 0);
             }
+        }
+
+        // ─── Crash handler ───────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Dipanggil saat ada unhandled exception yang akan mematikan process.
+        /// Tiga tujuan:
+        ///   1. Log exception lengkap ke Application EventLog dan crash.log
+        ///   2. Simpan event-stop.checkpoint agar replay window berikutnya benar
+        ///   3. Tidak throw — handler ini tidak boleh crash sendiri
+        /// </summary>
+        private void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            try
+            {
+                string message = e.ExceptionObject?.ToString() ?? "(exception object null)";
+
+                // 1. Tulis ke Application EventLog — terbaca di Event Viewer
+                try
+                {
+                    EventLog.WriteEntry("Application",
+                        $"[CRASH] Unhandled exception (isTerminating={e.IsTerminating}):\n{message}",
+                        EventLogEntryType.Error, 9999);
+                }
+                catch { /* EventLog mungkin sudah shutdown saat system restart */ }
+
+                // 2. Append ke crash.log — terbaca tanpa akses Event Viewer
+                try
+                {
+                    Directory.CreateDirectory(DataDirectory);
+                    string crashLogPath = Path.Combine(DataDirectory, "crash.log");
+                    string content = $"[{DateTime.Now:O}] isTerminating={e.IsTerminating}\n{message}\n\n";
+                    File.AppendAllText(crashLogPath, content);
+                }
+                catch { /* DataDirectory mungkin belum tersedia */ }
+
+                // 3. Simpan stop checkpoint agar replay window berikutnya benar.
+                //    Tanpa ini, service restart berikutnya fallback ke replayCheckpoint-5min
+                //    sehingga replayTo bisa terlambat dan event login bisa hilang lagi.
+                try
+                {
+                    SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                }
+                catch { /* last resort */ }
+            }
+            catch { /* absolute last resort — jangan sampai throw dari handler ini */ }
         }
 
         // ─── Replay missed events ────────────────────────────────────────────────
@@ -552,11 +622,9 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                if (securityEventLog != null)
-                    securityEventLog.EnableRaisingEvents = true;
-
-                if (systemEventLog != null)
-                    systemEventLog.EnableRaisingEvents = true;
+                // FIX [GAP]: EnableRaisingEvents sudah diaktifkan di OnStart() sebelum replay
+                // dimulai. Tidak perlu diaktifkan lagi di sini untuk menghindari double-enable.
+                // HandleServiceStopping() masih meng-disable dengan benar saat service berhenti.
 
                 Task.Run(() => CleanupOldRecordsTask(cancellationToken), cancellationToken);
                 Task.Run(() => ProcessQueuedEventsTask(cancellationToken), cancellationToken);
@@ -975,18 +1043,18 @@ namespace EventLogOutEmployeeService
 
                 var queuedEvent = new QueuedAttendanceEvent
                 {
-                    QueueId       = Guid.NewGuid().ToString("N"),
-                    EventId       = eventId,
-                    Username      = username,
-                    EventTime     = eventTime,
-                    ComputerName  = computerName,
-                    EventType     = eventType,
-                    LogonType     = logonType,
-                    LoginTime     = loginTime,
+                    QueueId         = Guid.NewGuid().ToString("N"),
+                    EventId         = eventId,
+                    Username        = username,
+                    EventTime       = eventTime,
+                    ComputerName    = computerName,
+                    EventType       = eventType,
+                    LogonType       = logonType,
+                    LoginTime       = loginTime,
                     ExpectedTimeOut = expectedTimeOut,
-                    ShutdownTime  = shutdownTime,
-                    ShutdownType  = shutdownType,
-                    WriteRawRecord = writeRawRecord
+                    ShutdownTime    = shutdownTime,
+                    ShutdownType    = shutdownType,
+                    WriteRawRecord  = writeRawRecord
                 };
 
                 bool enqueued = await eventQueue.EnqueueIfNotDuplicateAsync(queuedEvent);
