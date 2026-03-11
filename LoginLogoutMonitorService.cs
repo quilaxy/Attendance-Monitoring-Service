@@ -318,7 +318,17 @@ namespace EventLogOutEmployeeService
             {
                 // Save checkpoint first with a safety buffer to guarantee replay coverage
                 // for events written right around shutdown/startup transitions.
-                SaveStopCheckpoint(DateTime.Now.AddMinutes(-2));
+                DateTime stopCheckpoint = DateTime.Now.AddMinutes(-5);
+
+                EventLog.WriteEntry("Application",
+                    $"OnStop: saving checkpoint {stopCheckpoint:O} to {stopCheckpointPath}",
+                    EventLogEntryType.Information, 1018);
+
+                SaveStopCheckpoint(stopCheckpoint);
+
+                EventLog.WriteEntry("Application",
+                    $"OnStop: checkpoint saved, FileExists={File.Exists(stopCheckpointPath)}",
+                    EventLogEntryType.Information, 1019);
 
                 if (securityEventLog != null)
                 {
