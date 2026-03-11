@@ -166,7 +166,7 @@ namespace EventLogOutEmployeeService
 
                 EventLog.WriteEntry("Application",
                     $"ReplayMissedEvents: replayFrom={replayFrom?.ToString("O") ?? "(none)"} replayTo={replayTo:O}",
-                    EventLogEntryType.Information, 1028);
+                    EventLogEntryType.Information, 1034);
 
                 if (replayFrom.HasValue)
                 {
@@ -601,10 +601,21 @@ namespace EventLogOutEmployeeService
                 var sharePoint = sharePointIntegration.Value;
                 string? accessToken = await sharePoint.GetAccessTokenAsync(item.EventTime, item.EventId);
                 if (string.IsNullOrEmpty(accessToken))
+                {
+                    EventLog.WriteEntry("Application",
+                        $"[DISPATCH] Token null — skipping queueId={item.QueueId} eventId={item.EventId} user={item.Username}",
+                        EventLogEntryType.Warning, 4001);
                     return false;
+                }
 
-                bool needsRaw = item.WriteRawRecord && !item.RawRecordDispatched;
+                bool needsRaw     = item.WriteRawRecord && !item.RawRecordDispatched;
                 bool needsSummary = ShouldProcessSummary(item) && !item.SummaryDispatched;
+
+                EventLog.WriteEntry("Application",
+                    $"[DISPATCH] queueId={item.QueueId} eventId={item.EventId} user={item.Username} " +
+                    $"time={item.EventTime:O} needsRaw={needsRaw} needsSummary={needsSummary} " +
+                    $"eventType='{item.EventType}' shutdownType='{item.ShutdownType ?? "(null)"}'",
+                    EventLogEntryType.Information, 4002);
 
                 if (needsRaw)
                 {
@@ -614,18 +625,32 @@ namespace EventLogOutEmployeeService
 
                     await eventQueue.UpdateDispatchStateAsync(item.QueueId, rawRecordDispatched: true);
                     item.RawRecordDispatched = true;
+                    EventLog.WriteEntry("Application",
+                        $"[DISPATCH] Raw record sent: queueId={item.QueueId} eventId={item.EventId} user={item.Username}",
+                        EventLogEntryType.Information, 4003);
                 }
 
                 if (needsSummary)
                 {
                     if (item.EventId == 4624)
                     {
+                        EventLog.WriteEntry("Application",
+                            $"[DISPATCH] Sending summary login: user={item.Username} computer={item.ComputerName} " +
+                            $"loginTime={item.LoginTime?.ToString("O") ?? item.EventTime.ToString("O")}",
+                            EventLogEntryType.Information, 4004);
+
                         await sharePoint.UpsertDailySummaryLoginAsync(
                             accessToken, item.Username, item.ComputerName,
                             item.LoginTime ?? item.EventTime);
                     }
                     else
                     {
+                        EventLog.WriteEntry("Application",
+                            $"[DISPATCH] Sending summary shutdown: user={item.Username} computer={item.ComputerName} " +
+                            $"shutdownTime={item.ShutdownTime?.ToString("O") ?? item.EventTime.ToString("O")} " +
+                            $"eventId={item.EventId} eventType='{item.EventType}'",
+                            EventLogEntryType.Information, 4005);
+
                         await sharePoint.TryUpdateDailySummaryShutdownAsync(
                             accessToken, item.Username, item.ComputerName,
                             item.ShutdownTime ?? item.EventTime,
@@ -634,10 +659,18 @@ namespace EventLogOutEmployeeService
 
                     await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
                     item.SummaryDispatched = true;
+                    EventLog.WriteEntry("Application",
+                        $"[DISPATCH] Summary dispatched: queueId={item.QueueId} eventId={item.EventId} user={item.Username}",
+                        EventLogEntryType.Information, 4006);
                 }
 
-                bool doneRaw = !item.WriteRawRecord || item.RawRecordDispatched;
+                bool doneRaw     = !item.WriteRawRecord || item.RawRecordDispatched;
                 bool doneSummary = !ShouldProcessSummary(item) || item.SummaryDispatched;
+
+                EventLog.WriteEntry("Application",
+                    $"[DISPATCH] Done: queueId={item.QueueId} doneRaw={doneRaw} doneSummary={doneSummary}",
+                    EventLogEntryType.Information, 4007);
+
                 return doneRaw && doneSummary;
             }
             catch (Exception ex)
@@ -645,7 +678,7 @@ namespace EventLogOutEmployeeService
                 EventLog.WriteEntry("Application",
                     $"Dispatch failed: queueId={item.QueueId} eventId={item.EventId} user={item.Username} " +
                     $"time={item.EventTime:O} error={ex.GetType().Name}: {ex.Message}",
-                    EventLogEntryType.Warning, 1027);
+                    EventLogEntryType.Warning, 1028);
                 return false;
             }
         }
