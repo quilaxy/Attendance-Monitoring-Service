@@ -1064,7 +1064,10 @@ namespace EventLogOutEmployeeService
         /// for some channels (e.g. Security log), causing unchecked casts to return wrong values.
         /// EventLogEntry.EventID always returns the low 16-bit identifier.
         /// </summary>
-        private static int GetNormalizedEventId(EventLogEntry entry) => entry.EventID;
+        private static int GetNormalizedEventId(EventLogEntry entry)
+        {
+            return unchecked((int)(entry.InstanceId & 0xFFFF));
+        }
 
         private string FormatLogonType(int logonType)
         {
