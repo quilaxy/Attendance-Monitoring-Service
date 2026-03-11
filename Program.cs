@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.ServiceProcess;
 using System.Threading;
@@ -7,8 +8,14 @@ namespace EventLogOutEmployeeService;
 
 public class Program
 {
+    private static readonly string DataDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "Attendance-Monitoring-Service");
+
     private static void Main(string[] args)
     {
+        AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+
         if (!Environment.UserInteractive)
         {
             ServiceBase.Run(new ServiceBase[]
@@ -46,5 +53,18 @@ public class Program
 
         stopEvent.WaitOne();
         service.StopForConsole();
+    }
+
+    private static void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        try
+        {
+            Directory.CreateDirectory(DataDirectory);
+            string crashLogPath = Path.Combine(DataDirectory, "crash.log");
+            string content = $"[{DateTime.Now:O}] [Program.cs] isTerminating={e.IsTerminating}\n" +
+                             $"{e.ExceptionObject}\n\n";
+            File.AppendAllText(crashLogPath, content);
+        }
+        catch 
     }
 }
