@@ -49,6 +49,10 @@ namespace EventLogOutEmployeeService
 
         public LoginLogoutMonitorService()
         {
+            // Allow OnShutdown() to be called during system shutdown/restart.
+            // Without this, ServiceBase never invokes OnShutdown() and the checkpoint is lost.
+            CanShutdown = true;
+
             try
             {
                 if (Environment.OSVersion.Platform == PlatformID.Win32NT)
@@ -323,6 +327,16 @@ namespace EventLogOutEmployeeService
             if (securityEventLog == null)
                 return;
 
+            // GUARD: fromTime null means no checkpoint exists — do NOT replay.
+            // Without a lower bound we would re-import the entire Security log history.
+            if (!fromTime.HasValue)
+            {
+                EventLog.WriteEntry("Application",
+                    "ReplaySecurityEvents: fromTime is null — skipping to avoid full log flood.",
+                    EventLogEntryType.Warning, 1035);
+                return;
+            }
+
             // Collect and sort ascending (oldest-first) for consistent ordering.
             var entries = new List<(DateTime Time, EventLogEntry Entry, int EventId)>();
 
@@ -331,13 +345,13 @@ namespace EventLogOutEmployeeService
                 EventLogEntry entry = securityEventLog.Entries[i];
                 DateTime eventTime = entry.TimeGenerated;
 
-                if (fromTime.HasValue && eventTime <= fromTime.Value)
+                if (eventTime <= fromTime.Value)  // fromTime non-null guaranteed by guard above
                     continue;
 
                 if (eventTime > toTime)
                     continue;
 
-                int eventId = unchecked((int)entry.InstanceId);
+                int eventId = GetNormalizedEventId(entry);
                 if (eventId != 4624 && eventId != 4647)
                     continue;
 
@@ -373,10 +387,18 @@ namespace EventLogOutEmployeeService
             if (systemEventLog == null)
                 return;
 
-            // ── Collect matching entries first, then sort ASCENDING (oldest first).
-            // This is CRITICAL: 1074 must be processed before 6006 so that
-            // TryResolveUsernameFor6006() can find the username set by StoreLast1074State().
-            // Walking backwards and calling GetAwaiter().GetResult() inline breaks this pairing.
+            // GUARD: fromTime null means no checkpoint — skip to avoid full log flood.
+            if (!fromTime.HasValue)
+            {
+                EventLog.WriteEntry("Application",
+                    "ReplaySystemEvents: fromTime is null — skipping to avoid full log flood.",
+                    EventLogEntryType.Warning, 1036);
+                return;
+            }
+
+            // Collect matching entries first, then sort ASCENDING (oldest first).
+            // CRITICAL: 1074 must be processed before 6006 so TryResolve1074StateFor6006
+            // can find the username set by StoreLast1074State().
             var entries = new List<(DateTime Time, EventLogEntry Entry, int EventId)>();
 
             for (int i = systemEventLog.Entries.Count - 1; i >= 0; i--)
@@ -384,13 +406,13 @@ namespace EventLogOutEmployeeService
                 EventLogEntry entry = systemEventLog.Entries[i];
                 DateTime eventTime = entry.TimeGenerated;
 
-                if (fromTime.HasValue && eventTime <= fromTime.Value)
+                if (eventTime <= fromTime.Value)  // fromTime non-null guaranteed by guard above
                     continue;
 
                 if (eventTime > toTime)
                     continue;
 
-                int eventId = unchecked((int)entry.InstanceId);
+                int eventId = GetNormalizedEventId(entry);
                 if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     continue;
 
@@ -454,7 +476,15 @@ namespace EventLogOutEmployeeService
 
         // ─── Lifecycle ───────────────────────────────────────────────────────────
 
-        protected override void OnStop()
+        protected override void OnStop() => HandleServiceStopping("OnStop");
+
+        /// <summary>
+        /// Called by SCM during Windows system shutdown/restart (requires CanShutdown = true).
+        /// OnStop() is NOT guaranteed to be called in that scenario.
+        /// </summary>
+        protected override void OnShutdown() => HandleServiceStopping("OnShutdown");
+
+        private void HandleServiceStopping(string caller)
         {
             try
             {
@@ -468,13 +498,13 @@ namespace EventLogOutEmployeeService
                 DateTime stopCheckpoint = DateTime.Now.AddMinutes(-5);
 
                 EventLog.WriteEntry("Application",
-                    $"OnStop: saving checkpoint {stopCheckpoint:O} to {stopCheckpointPath}",
+                    $"{caller}: saving checkpoint {stopCheckpoint:O} to {stopCheckpointPath}",
                     EventLogEntryType.Information, 1018);
 
                 SaveStopCheckpoint(stopCheckpoint);
 
                 EventLog.WriteEntry("Application",
-                    $"OnStop: checkpoint saved.",
+                    $"{caller}: checkpoint saved.",
                     EventLogEntryType.Information, 1019);
 
                 // ── Step 3: Stop listening for new events
@@ -493,7 +523,7 @@ namespace EventLogOutEmployeeService
                 cancellationTokenSource?.Cancel();
 
                 // ── Step 4: Brief wait for any in-flight dispatch to finish.
-                // Keep this short (≤5s total) — we already saved the checkpoint so
+                // Keep this short (≤5s total) — checkpoint is already saved so
                 // any un-sent events will be replayed on next start anyway.
                 int waited = 0;
                 while (waited < 4000)
@@ -505,13 +535,13 @@ namespace EventLogOutEmployeeService
                 }
 
                 EventLog.WriteEntry("Attendance-Service",
-                    "Service has been successfully shut down.",
+                    $"Service has been successfully shut down ({caller}).",
                     EventLogEntryType.Information, 0);
             }
             catch (Exception ex)
             {
                 EventLog.WriteEntry("Application",
-                    $"Error in OnStop: {ex.Message}",
+                    $"Error in {caller}: {ex.Message}",
                     EventLogEntryType.Warning, 1006);
             }
         }
@@ -738,7 +768,7 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                int eventId = unchecked((int)log.InstanceId);
+                int eventId = GetNormalizedEventId(log);
                 if (eventId != 4624 && eventId != 4647) return;
 
                 DateTime eventTime = log.TimeGenerated;
@@ -784,7 +814,7 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                int eventId = unchecked((int)log.InstanceId);
+                int eventId = GetNormalizedEventId(log);
                 if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     return;
 
@@ -991,13 +1021,12 @@ namespace EventLogOutEmployeeService
                     checkCount++;
                     EventLogEntry entry = secLog.Entries[i];
 
-                    if ((unchecked((int)entry.InstanceId) == 4624 ||
-                         unchecked((int)entry.InstanceId) == 4647) &&
+                    int secEventId = GetNormalizedEventId(entry);
+                    if ((secEventId == 4624 || secEventId == 4647) &&
                         entry.TimeGenerated >= lookbackTime &&
                         entry.TimeGenerated <= beforeTime &&
                         entry.Message != null)
                     {
-                        int secEventId = unchecked((int)entry.InstanceId);
                         if (secEventId == 4624)
                         {
                             int lt = ParseLogonType(entry.Message);
@@ -1028,6 +1057,14 @@ namespace EventLogOutEmployeeService
             catch { /* silent fail */ }
             return 0;
         }
+
+        /// <summary>
+        /// Returns the normalized 16-bit Event ID as shown in Event Viewer.
+        /// EventLogEntry.InstanceId can include qualifier/facility bits in the high 16 bits
+        /// for some channels (e.g. Security log), causing unchecked casts to return wrong values.
+        /// EventLogEntry.EventID always returns the low 16-bit identifier.
+        /// </summary>
+        private static int GetNormalizedEventId(EventLogEntry entry) => entry.EventID;
 
         private string FormatLogonType(int logonType)
         {
