@@ -155,12 +155,14 @@ namespace EventLogOutEmployeeService
                 {
                     if (isShutdownEvent || inShutdownWindow)
                     {
-                        // Shutdown/logoff events must NOT wait — network is going down
                         _hasWaitedForNetwork = true;
                     }
                     else
                     {
-                        Thread.Sleep(30000); // wait 30 s for network on fresh boot
+                        EventLog.WriteEntry("Application",
+                            "[TOKEN] Waiting 30s for network on fresh boot...",
+                            EventLogEntryType.Information, 4010);
+                        Thread.Sleep(30000);
                         _hasWaitedForNetwork = true;
                     }
                 }
@@ -187,16 +189,27 @@ namespace EventLogOutEmployeeService
                         return token?.access_token;
                     }
 
+                    string errorBody = await response.Content.ReadAsStringAsync();
+                    EventLog.WriteEntry("Application",
+                        $"[TOKEN] Attempt {attempt}/{maxRetries} failed: HTTP {(int)response.StatusCode} — {errorBody}",
+                        EventLogEntryType.Warning, 4011);
+
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs *= 2; }
-                    else throw new Exception($"Failed to get access token after {maxRetries} attempts");
+                    else throw new Exception($"Failed to get access token after {maxRetries} attempts. Last status: {(int)response.StatusCode}");
                 }
                 catch (HttpRequestException ex) when (ex.InnerException is SocketException)
                 {
+                    EventLog.WriteEntry("Application",
+                        $"[TOKEN] Attempt {attempt}/{maxRetries} network error: {ex.Message}",
+                        EventLogEntryType.Warning, 4012);
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs *= 2; }
                     else throw;
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    EventLog.WriteEntry("Application",
+                        $"[TOKEN] Attempt {attempt}/{maxRetries} exception: {ex.GetType().Name}: {ex.Message}",
+                        EventLogEntryType.Warning, 4013);
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs *= 2; }
                     else throw;
                 }
@@ -225,6 +238,10 @@ namespace EventLogOutEmployeeService
             string title        = $"{computerName}\\{eventId}\\{username}";
             Exception? lastException = null;
 
+            EventLog.WriteEntry("Application",
+                $"[RAW] Inserting: title='{title}' eventTime={eventTimeStr} eventType='{eventType}'",
+                EventLogEntryType.Information, 4020);
+
             for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
                 try
@@ -233,7 +250,12 @@ namespace EventLogOutEmployeeService
 
                     // ── Idempotency check ──────────────────────────────────────
                     if (await RawRecordAlreadyExistsAsync(client, title, eventTime))
+                    {
+                        EventLog.WriteEntry("Application",
+                            $"[RAW] Idempotency: record already exists for title='{title}' at {eventTimeStr} — skipping insert.",
+                            EventLogEntryType.Information, 4021);
                         return;
+                    }
 
                     // ── Insert ────────────────────────────────────────────────
                     var postData = new
@@ -253,16 +275,30 @@ namespace EventLogOutEmployeeService
                     var response = await client.PostAsync(
                         $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items", content);
 
-                    if (response.IsSuccessStatusCode) return;
+                    if (response.IsSuccessStatusCode)
+                    {
+                        EventLog.WriteEntry("Application",
+                            $"[RAW] Insert success: title='{title}' at {eventTimeStr}",
+                            EventLogEntryType.Information, 4022);
+                        return;
+                    }
 
+                    string responseBody = await response.Content.ReadAsStringAsync();
                     lastException = new InvalidOperationException(
-                        $"Raw list insert failed ({(int)response.StatusCode}) for {title} at {eventTimeStr}.");
+                        $"Raw list insert failed HTTP {(int)response.StatusCode} for {title} at {eventTimeStr}: {responseBody}");
+
+                    EventLog.WriteEntry("Application",
+                        $"[RAW] Insert attempt {attempt}/{maxRetries} failed: HTTP {(int)response.StatusCode} — {responseBody}",
+                        EventLogEntryType.Warning, 4023);
 
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs = Math.Min(delayMs * 2, 10000); }
                 }
                 catch (Exception ex)
                 {
                     lastException = ex;
+                    EventLog.WriteEntry("Application",
+                        $"[RAW] Insert attempt {attempt}/{maxRetries} exception: {ex.GetType().Name}: {ex.Message}",
+                        EventLogEntryType.Warning, 4024);
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs = Math.Min(delayMs * 2, 10000); }
                 }
             }
@@ -400,39 +436,79 @@ namespace EventLogOutEmployeeService
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
+            EventLog.WriteEntry("Application",
+                $"[DBG-Summary] TryUpdateShutdown: user={username} computer={computerName} " +
+                $"shutdownTime={shutdownTime:O} eventId={eventId} eventType='{eventType}'",
+                EventLogEntryType.Information, 3010);
+
             using var client = CreateGraphClient(accessToken, 30);
             var summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime);
             if (summaryItem == null)
-                return; // no compatible login row yet — skip
+            {
+                EventLog.WriteEntry("Application",
+                    $"[DBG-Summary] TryUpdateShutdown: SKIP — no matching summary row for user={username} " +
+                    $"computer={computerName} shutdownTime={shutdownTime:O}",
+                    EventLogEntryType.Information, 3011);
+                return;
+            }
 
             string? itemId  = summaryItem?["id"]?.ToString();
             if (string.IsNullOrWhiteSpace(itemId)) return;
 
-            var fields          = summaryItem?["fields"] as JObject;
-            DateTime? loginTime = ParseFieldDateTime(fields, "LoginTime");
+            var fields            = summaryItem?["fields"] as JObject;
+            DateTime? loginTime   = ParseFieldDateTime(fields, "LoginTime");
             DateTime? expectedTimeOut = ParseFieldDateTime(fields, "ExpectedTimeOut");
             DateTime? currentShutdown = ParseFieldDateTime(fields, "ShutdownTime");
             string? currentShutdownType = fields?["ShutdownType"]?.ToString();
 
-            // ── Priority check ────────────────────────────────────────────────────
+            EventLog.WriteEntry("Application",
+                $"[DBG-Summary] TryUpdateShutdown: found row itemId={itemId} " +
+                $"loginTime={loginTime?.ToString("O") ?? "(null)"} " +
+                $"expectedTimeOut={expectedTimeOut?.ToString("O") ?? "(null)"} " +
+                $"currentShutdown={currentShutdown?.ToString("O") ?? "(null)"} " +
+                $"currentType='{currentShutdownType ?? "(empty)"}'",
+                EventLogEntryType.Information, 3012);
+
             if (!IsValidShutdownCandidate(eventId, eventType, shutdownTime, loginTime, expectedTimeOut))
+            {
+                EventLog.WriteEntry("Application",
+                    $"[DBG-Summary] TryUpdateShutdown: SKIP — IsValidShutdownCandidate=false " +
+                    $"eventId={eventId} eventType='{eventType}' shutdownTime={shutdownTime:O} " +
+                    $"loginTime={loginTime?.ToString("O") ?? "(null)"} expectedTimeOut={expectedTimeOut?.ToString("O") ?? "(null)"}",
+                    EventLogEntryType.Information, 3013);
                 return;
+            }
 
             int newPriority     = GetShutdownPriority(eventId, eventType);
             int currentPriority = GetPriorityFromShutdownType(currentShutdownType);
 
             if (newPriority < currentPriority)
-                return; // existing record has higher priority — don't overwrite
+            {
+                EventLog.WriteEntry("Application",
+                    $"[DBG-Summary] TryUpdateShutdown: SKIP — priority too low: new={newPriority} current={currentPriority} " +
+                    $"(existing='{currentShutdownType}')",
+                    EventLogEntryType.Information, 3014);
+                return;
+            }
 
             if (newPriority == currentPriority)
             {
-                // Same priority: keep the latest shutdown timestamp
                 if (currentShutdown.HasValue && currentShutdown.Value >= shutdownTime)
+                {
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-Summary] TryUpdateShutdown: SKIP — same priority, existing time is later: " +
+                        $"existing={currentShutdown.Value:O} incoming={shutdownTime:O}",
+                        EventLogEntryType.Information, 3015);
                     return;
+                }
             }
 
-            // ── Patch ─────────────────────────────────────────────────────────────
             string shutdownTypeStr = BuildShutdownType(eventId, eventType);
+            EventLog.WriteEntry("Application",
+                $"[DBG-Summary] TryUpdateShutdown: PATCHING itemId={itemId} " +
+                $"shutdownTime={shutdownTime:O} shutdownType='{shutdownTypeStr}' priority={newPriority}",
+                EventLogEntryType.Information, 3016);
+
             var updateData = new
             {
                 fields = new
@@ -449,9 +525,15 @@ namespace EventLogOutEmployeeService
             var patchResult = await client.SendAsync(patchRequest);
             if (!patchResult.IsSuccessStatusCode)
             {
+                string body = await patchResult.Content.ReadAsStringAsync();
                 throw new InvalidOperationException(
-                    $"Failed to update summary shutdown for item {itemId} ({eventId}).");
+                    $"Failed to update summary shutdown for item {itemId} ({eventId}). " +
+                    $"Status={patchResult.StatusCode} Body={body}");
             }
+
+            EventLog.WriteEntry("Application",
+                $"[DBG-Summary] TryUpdateShutdown: PATCH success itemId={itemId}",
+                EventLogEntryType.Information, 3017);
         }
 
         // ── Cleanup ───────────────────────────────────────────────────────────────
