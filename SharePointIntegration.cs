@@ -292,6 +292,11 @@ namespace EventLogOutEmployeeService
             string summaryKey  = BuildSummaryKey(computerName, username, workDate);
             DateTime expectedTimeOut = loginTime.AddHours(9);
 
+            EventLog.WriteEntry("Application",
+                $"[DBG-Summary] UpsertLogin: user={username} computer={computerName} " +
+                $"loginTime={loginTime:O} workDate={workDate} summaryKey={summaryKey}",
+                EventLogEntryType.Information, 3001);
+
             using var client = CreateGraphClient(accessToken, 30);
             var existingItems = await FindSummaryItemAsync(client, summaryKey);
 
@@ -304,8 +309,16 @@ namespace EventLogOutEmployeeService
                 var fields = existing?["fields"] as JObject;
                 DateTime? storedLogin = ParseFieldDateTime(fields, "LoginTime");
 
+                EventLog.WriteEntry("Application",
+                    $"[DBG-Summary] UpsertLogin: row exists itemId={itemId} storedLogin={storedLogin?.ToString("O") ?? "(null)"} incoming={loginTime:O}",
+                    EventLogEntryType.Information, 3002);
+
                 if (storedLogin.HasValue && loginTime < storedLogin.Value && !string.IsNullOrWhiteSpace(itemId))
                 {
+                    EventLog.WriteEntry("Application",
+                        $"[DBG-Summary] UpsertLogin: updating to earlier loginTime={loginTime:O}",
+                        EventLogEntryType.Information, 3003);
+
                     // Replace with earlier login
                     var updateData = new
                     {
@@ -322,8 +335,9 @@ namespace EventLogOutEmployeeService
                     var patchResponse = await client.SendAsync(patchRequest);
                     if (!patchResponse.IsSuccessStatusCode)
                     {
+                        string body = await patchResponse.Content.ReadAsStringAsync();
                         throw new InvalidOperationException(
-                            $"Failed to update earlier LoginTime for summary key '{summaryKey}' (item {itemId}).");
+                            $"Failed to update earlier LoginTime for summary key '{summaryKey}' (item {itemId}). Status={patchResponse.StatusCode} Body={body}");
                     }
                 }
 
@@ -331,6 +345,10 @@ namespace EventLogOutEmployeeService
             }
 
             // ── Create new summary row ────────────────────────────────────────────
+            EventLog.WriteEntry("Application",
+                $"[DBG-Summary] UpsertLogin: creating new row for summaryKey={summaryKey}",
+                EventLogEntryType.Information, 3004);
+
             var postData = new
             {
                 fields = new
@@ -351,9 +369,14 @@ namespace EventLogOutEmployeeService
                 createContent);
             if (!createResponse.IsSuccessStatusCode)
             {
+                string body = await createResponse.Content.ReadAsStringAsync();
                 throw new InvalidOperationException(
-                    $"Failed to create summary login row for key '{summaryKey}'.");
+                    $"Failed to create summary login row for key '{summaryKey}'. Status={createResponse.StatusCode} Body={body}");
             }
+
+            EventLog.WriteEntry("Application",
+                $"[DBG-Summary] UpsertLogin: successfully created row for summaryKey={summaryKey}",
+                EventLogEntryType.Information, 3005);
         }
 
         // ── Summary list — Shutdown ───────────────────────────────────────────────
