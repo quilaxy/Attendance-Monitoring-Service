@@ -1,121 +1,100 @@
-RESTART PERTAMA SETELAH SERVICE START
-event queue 
-[]
+aku melakukan restart setelah service pertama kali berjalan, lalu setelah itu aku shutdown
 
-event-replay.checkpoint
-2026-03-10T04:38:15.4742218Z
+ProgramData
+event-queue.json kosong []
+hanya ada event-replay.checkpoint dan tidak ada event-stop.checkpoint, padahal di application log ada ini
+Information	10/03/2026 15:50:45	Application	1018	None
+OnStop: saving checkpoint 2026-03-10T15:45:45.6157979+07:00 to C:\ProgramData\Attendance-Monitoring-Service\event-stop.checkpoint
+Information	10/03/2026 15:50:45	Application	1019	None
+OnStop: checkpoint saved, FileExists=True
 
-Application Log
-Information	10/03/2026 11:36:53	Attendance-Service	0	None Service started successfully.
-Information	10/03/2026 11:36:53	Attendance-Service	0	None Service started successfully.
-Information	10/03/2026 11:37:32	Attendance-Service	0	None Service has been successfully shut down.
-Information	10/03/2026 11:38:40	Attendance-Service	0	None Service started successfully.
-Information	10/03/2026 11:38:40	Attendance-Service	0	None Service started successfully. 
+Information	10/03/2026 15:50:24	Attendance-Service	0	None Service started successfully.
+Information	10/03/2026 15:50:24	Attendance-Service	0	None Service started successfully.
+Information	10/03/2026 15:50:45	Attendance-Service	0	None Service has been successfully shut down.
+Information	10/03/2026 15:50:45	Attendance-Service	0	None Service stopped successfully. 
+Information	10/03/2026 15:51:21	Attendance-Service	0	None Service started successfully. 
+Information	10/03/2026 15:51:21	Attendance-Service	0	None Service started successfully. 
+Information	10/03/2026 15:53:16	Attendance-Service	0	None Service started successfully. 
+Information	10/03/2026 15:53:16	Attendance-Service	0	None Service started successfully.
+Information	11/03/2026 07:17:04	Attendance-Service	0	None Service started successfully.
+Information	11/03/2026 07:17:04	Attendance-Service	0	None Service started successfully.
 
 System Log
-Information	10/03/2026 11:37:29	User32	1074	None 
+Information	10/03/2026 15:52:30	User32	1074	None
 The process C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe (ON-083) has initiated the restart of computer ON-083 on behalf of user KDDI-ID\annafi for the following reason: Other (Unplanned)
  Reason Code: 0x0
  Shut-down Type: restart
-Information	10/03/2026 11:37:32	EventLog	6006	None
+Information	10/03/2026 15:52:32	EventLog	6006	None The Event log service was stopped.
+Information	10/03/2026 15:55:52	User32	1074	None 
+The process C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe (ON-083) has initiated the power off of computer ON-083 on behalf of user KDDI-ID\annafi for the following reason: Other (Unplanned)
+ Reason Code: 0x0
+ Shut-down Type: power off
+Information	10/03/2026 15:55:54	EventLog	6006	None
 The Event log service was stopped.
 
 Security Log
-Audit Success	10/03/2026 11:37:31	Microsoft Windows security auditing.	4647	Logoff
-Audit Success	10/03/2026 11:38:22	Microsoft Windows security auditing.	4624	Logon
+Audit Success	10/03/2026 15:52:31	Microsoft Windows security auditing.	4647	Logoff
+Audit Success	10/03/2026 15:55:53	Microsoft Windows security auditing.	4647	Logoff
+Audit Success	10/03/2026 15:53:15	Microsoft Windows security auditing.	4624	Logon
 Logon Information:
 	Logon Type:		11
 New Logon:
 	Security ID:		KDDI-ID\annafi
 	Account Name:		annafi@kddi.co.id
-Audit Success	10/03/2026 11:38:25	Microsoft Windows security auditing.	4624	Logon
+Audit Success	10/03/2026 15:53:15	Microsoft Windows security auditing.	4624	Logon
 Logon Information:
 	Logon Type:		7
 New Logon:
 	Security ID:		KDDI-ID\annafi
 	Account Name:		annafi@kddi.co.id
-Audit Success	10/03/2026 11:40:41	Microsoft Windows security auditing.	4624	Logon
-Logon Information:
-	Logon Type:		2
-New Logon:
-	Security ID:		ON-083\kidannafi
-	Account Name:		kidannafi
-Audit Success	10/03/2026 11:40:41	Microsoft Windows security auditing.	4624	Logon
-Logon Information:
-	Logon Type:		2
-New Logon:
-	Security ID:		ON-083\kidannafi
-	Account Name:		kidannafi
-
-SharePoint SummaryListId Kosong
-
-SharePoint ListId
-Title	Username	Event ID	Event Time	Event Type	PC Name
-ON-083\4624\kidannafi	kidannafi	4624	3/10/2026 11:40	"User Login
-Logon Type: 2 - Interactive"	ON-083
-ON-083\4647\annafi	annafi	4647	3/10/2026 11:37	User Logout	ON-083
-
-RESTART KEDUA
-Event-queue
-[]
-
-event-replay.checkpoint
-2026-03-10T04:51:23.7421860Z
-
-Application Log
-Information	10/03/2026 11:50:40	Attendance-Service	0	None Service has been successfully shut down.
-Information	10/03/2026 11:51:55	Attendance-Service	0	None Service started successfully.
-Information	10/03/2026 11:51:55	Attendance-Service	0	None Service started successfully.
-
-System Log
-Information	10/03/2026 11:50:37	User32	1074	None
-The process C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe (ON-083) has initiated the restart of computer ON-083 on behalf of user KDDI-ID\annafi for the following reason: Other (Unplanned)
- Reason Code: 0x0
- Shut-down Type: restart
-Information	10/03/2026 11:50:40	EventLog	6006	None
-The Event log service was stopped.
-
-Security Log
-Audit Success	10/03/2026 11:50:38	Microsoft Windows security auditing.	4647	Logoff
-Audit Success	10/03/2026 11:51:20	Microsoft Windows security auditing.	4624	Logon
+Audit Success	11/03/2026 07:17:37	Microsoft Windows security auditing.	4624	Logon
 Logon Information:
 	Logon Type:		11
 New Logon:
 	Security ID:		KDDI-ID\annafi
 	Account Name:		annafi@kddi.co.id
-Audit Success	10/03/2026 11:51:20	Microsoft Windows security auditing.	4624	Logon
+Audit Success	11/03/2026 07:17:39	Microsoft Windows security auditing.	4624	Logon
 Logon Information:
 	Logon Type:		7
 New Logon:
 	Security ID:		KDDI-ID\annafi
 	Account Name:		annafi@kddi.co.id
-Audit Success	10/03/2026 11:53:06	Microsoft Windows security auditing.	4624	Logon
+Audit Success	11/03/2026 07:21:16	Microsoft Windows security auditing.	4624	Logon
 Logon Information:
 	Logon Type:		2
 New Logon:
 	Security ID:		ON-083\kidannafi
 	Account Name:		kidannafi
-Audit Success	10/03/2026 11:53:06	Microsoft Windows security auditing.	4624	Logon
+  [ SystemTime]  2026-03-11T00:21:16.4271420Z 
+Audit Success	11/03/2026 07:21:16	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+ [ SystemTime]  2026-03-11T00:21:16.4271573Z 
+Audit Success	11/03/2026 07:21:53	Microsoft Windows security auditing.	4624	Logon
+Logon Information:
+	Logon Type:		2
+New Logon:
+	Security ID:		ON-083\kidannafi
+	Account Name:		kidannafi
+Audit Success	11/03/2026 07:21:53	Microsoft Windows security auditing.	4624	Logon
 Logon Information:
 	Logon Type:		2
 New Logon:
 	Security ID:		ON-083\kidannafi
 	Account Name:		kidannafi
 
-
-SharePoint SumaryListId kosong
-
-SharePoint ListId
+ini Data Yang ke record di SharePoint List Id
 Title	Username	Event ID	Event Time	Event Type	PC Name
-ON-083\4624\kidannafi	kidannafi	4624	3/10/2026 11:53	"User Login
+ON-083\4624\kidannafi	kidannafi	4624	3/11/2026 7:21	"User Login
 Logon Type: 2 - Interactive"	ON-083
-ON-083\4624\annafi	annafi	4624	3/10/2026 11:51	"User Login
+ON-083\4624\kidannafi	kidannafi	4624	3/11/2026 7:21	"User Login
+Logon Type: 2 - Interactive"	ON-083
+ON-083\4624\annafi	annafi	4624	3/11/2026 7:17	"User Login
 Logon Type: 11 - CachedInteractive"	ON-083
-ON-083\4647\annafi	annafi	4647	3/10/2026 11:50	User Logout	ON-083
-ON-083\4624\kidannafi	kidannafi	4624	3/10/2026 11:40	"User Login
-Logon Type: 2 - Interactive"	ON-083
-ON-083\4624\kidannafi	kidannafi	4624	3/10/2026 11:40	"User Login
-Logon Type: 2 - Interactive"	ON-083
-ON-083\4624\annafi	annafi	4624	3/10/2026 11:38	"User Login
-Logon Type: 11 - CachedInteractive"	ON-083
-ON-083\4647\annafi	annafi	4647	3/10/2026 11:37	User Logout	ON-083
+ON-083\4647\annafi	annafi	4647	3/10/2026 15:55	User Logout	ON-083
+ON-083\4647\annafi	annafi	4647	3/10/2026 15:52	User Logout	ON-083
+
+udah ganti hari, tapi Summary List Id tetap kosong.
