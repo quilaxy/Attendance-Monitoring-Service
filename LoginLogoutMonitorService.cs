@@ -362,13 +362,16 @@ namespace EventLogOutEmployeeService
                     return derived;
                 }
 
-                // Level 4 – First-start / fresh install seed: replay from 00:00 today only.
-                // This avoids importing weeks of historical Security/System log entries on a
-                // clean deployment while still capturing any events that happened earlier today.
+                // Level 4 – Fresh install seed.
+                // Tidak ada checkpoint sama sekali (primary, backup, replay) — ini fresh install
+                // atau DataDirectory baru dibersihkan. Replay dari 00:00 hari ini agar event
+                // login pagi (sebelum service pertama kali distart) ikut masuk.
+                // Tidak replay lebih jauh agar tidak flood Security log historical.
                 DateTime todayMidnight = now.Date;
                 SafeWriteEventLog("Application",
-                    $"LoadStopCheckpoint: no checkpoint found (primary, backup, or replay) — " +
-                    $"seeding replayFrom to today midnight {todayMidnight:O}.",
+                    $"LoadStopCheckpoint: FRESH INSTALL — no checkpoint found anywhere. " +
+                    $"Seeding replayFrom to today midnight {todayMidnight:O} " +
+                    $"so events from 00:00 today are captured.",
                     EventLogEntryType.Warning, 1023);
                 return todayMidnight;
             }
@@ -400,19 +403,15 @@ namespace EventLogOutEmployeeService
         {
             try
             {
+                // Hanya pastikan direktori ada — tidak seed checkpoint file.
+                // LoadStopCheckpoint() adalah single source of truth untuk semua fallback,
+                // termasuk fresh install (Level 4 → today 00:00).
+                // Dulu Bootstrap meng-seed Now-1menit sehingga Level 4 tidak pernah tercapai
+                // dan event login sebelum service start (misal 07:21) ikut terlewat.
                 Directory.CreateDirectory(DataDirectory);
 
-                bool hasPrimary = File.Exists(stopCheckpointPath);
-                bool hasBackup = File.Exists(stopCheckpointBackupPath);
-
-                if (hasPrimary || hasBackup)
-                    return;
-
-                DateTime seed = DateTime.Now.AddMinutes(-1);
-                SaveStopCheckpoint(seed);
-
                 SafeWriteEventLog("Application",
-                    $"EnsureCheckpointBootstrap: seeded missing stop checkpoint at {seed:O}",
+                    $"EnsureCheckpointBootstrap: DataDirectory ensured at '{DataDirectory}'",
                     EventLogEntryType.Information, 1025);
             }
             catch (Exception ex)
