@@ -893,7 +893,7 @@ namespace EventLogOutEmployeeService
                         await sharePoint.TryUpdateDailySummaryShutdownAsync(
                             accessToken, item.Username, item.ComputerName,
                             item.ShutdownTime ?? item.EventTime,
-                            item.EventId, item.EventType);
+                            item.EventId, item.EventType, summaryCache);
                     }
 
                     await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
