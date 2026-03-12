@@ -39,13 +39,6 @@ namespace EventLogOutEmployeeService
         /// Untuk semua event lain: selalu true (shutdown/logout selalu eligible).
         /// </summary>
         public bool IsSummaryEligible { get; set; } = true;
-
-        /// <summary>
-        /// Jumlah kali summary dispatch gagal. Kalau >= 5, summary di-skip agar queue tidak stuck.
-        /// Field ini tidak perlu dipersist ke JSON — reset ke 0 saat service restart sudah cukup.
-        /// </summary>
-        [Newtonsoft.Json.JsonIgnore]
-        public int? SummaryRetryCount { get; set; } = 0;
     }
 
     public class PersistentEventQueue
