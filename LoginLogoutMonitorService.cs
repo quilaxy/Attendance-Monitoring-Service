@@ -51,6 +51,9 @@ namespace EventLogOutEmployeeService
         private readonly PersistentEventQueue eventQueue =
             new PersistentEventQueue(Path.Combine(DataDirectory, "event-queue.json"));
 
+        private readonly SummaryCache summaryCache =
+            new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
+
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
 
         public LoginLogoutMonitorService()
@@ -537,7 +540,7 @@ namespace EventLogOutEmployeeService
                 EventLogEntry entry = securityEventLog.Entries[i];
                 DateTime eventTime = entry.TimeGenerated;
 
-                if (eventTime <= fromTime.Value)  // fromTime non-null guaranteed by guard above
+                if (eventTime < fromTime.Value)
                     continue;
 
                 if (eventTime > toTime)
@@ -598,7 +601,7 @@ namespace EventLogOutEmployeeService
                 EventLogEntry entry = systemEventLog.Entries[i];
                 DateTime eventTime = entry.TimeGenerated;
 
-                if (eventTime <= fromTime.Value)  // fromTime non-null guaranteed by guard above
+                if (eventTime < fromTime.Value)  // fromTime non-null guaranteed by guard above
                     continue;
 
                 if (eventTime > toTime)
@@ -877,7 +880,7 @@ namespace EventLogOutEmployeeService
 
                         await sharePoint.UpsertDailySummaryLoginAsync(
                             accessToken, item.Username, item.ComputerName,
-                            item.LoginTime ?? item.EventTime);
+                            item.LoginTime ?? item.EventTime, summaryCache);
                     }
                     else
                     {
@@ -942,6 +945,7 @@ namespace EventLogOutEmployeeService
                         int randomDelay = new Random(Environment.MachineName.GetHashCode()).Next(0, 300000);
                         await Task.Delay(randomDelay, cancellationToken);
                         await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
+                        await summaryCache.CleanupOldEntriesAsync(cancellationToken);
                     }
 
                     await Task.Delay(nextRun - DateTime.Now, cancellationToken);
@@ -949,6 +953,7 @@ namespace EventLogOutEmployeeService
                     int scheduledDelay = new Random(Environment.MachineName.GetHashCode()).Next(0, 300000);
                     await Task.Delay(scheduledDelay, cancellationToken);
                     await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
+                    await summaryCache.CleanupOldEntriesAsync(cancellationToken);
                 }
                 catch (TaskCanceledException) { break; }
                 catch (Exception ex)
@@ -990,27 +995,31 @@ namespace EventLogOutEmployeeService
 
         private bool ShouldSkipLiveEntry(DateTime eventTime)
         {
-            // FIX [STALE-LIVE-EVENTS]: Windows EventLog kadang mem-fire event lama saat
-            // EnableRaisingEvents pertama kali di-set true (tidak ada internal bookmark
-            // untuk service baru). Filter event yang timestampnya sebelum service start —
-            // event tersebut sudah di-cover oleh ReplayMissedEventsFromCheckpoint().
-            if (eventTime < serviceStartTime)
+            // replayUpperBound di-capture tepat sebelum EnableRaisingEvents=true dan
+            // sebelum replay jalan. Semua event sampai dengan replayUpperBound sudah
+            // di-cover oleh ReplaySecurityEvents/ReplaySystemEvents.
+            //
+            // Filter ini berlaku PERMANEN (bukan hanya saat replay) karena Windows
+            // kadang mem-fire event lama setelah EnableRaisingEvents=true — baik saat
+            // replay masih jalan maupun sesudahnya.
+            //
+            // Exception: event yang terjadi saat service mati dan baru ditulis ke log
+            // setelah boot (misal 6006 shutdown) memiliki eventTime < replayUpperBound
+            // dan sudah masuk via replay — jadi di-skip di sini aman.
+            if (eventTime <= replayUpperBound)
             {
-                SafeWriteEventLog("Application",
-                    $"Live event skipped — older than serviceStartTime: " +
-                    $"eventTime={eventTime:O} serviceStartTime={serviceStartTime:O}",
-                    EventLogEntryType.Information, 1038);
-                return true;
-            }
-
-            // Selama replay berlangsung, skip live event yang timestampnya masuk
-            // dalam window replay (sudah di-handle oleh ReplaySecurityEvents/ReplaySystemEvents).
-            // Event setelah replayUpperBound tetap diproses — tidak ada gap.
-            if (replayInProgress && eventTime <= replayUpperBound)
-            {
-                SafeWriteEventLog("Application",
-                    $"Live event skipped during replay overlap: eventTime={eventTime:O} replayUpperBound={replayUpperBound:O}",
-                    EventLogEntryType.Information, 1037);
+                if (replayInProgress)
+                {
+                    SafeWriteEventLog("Application",
+                        $"Live event skipped during replay overlap: eventTime={eventTime:O} replayUpperBound={replayUpperBound:O}",
+                        EventLogEntryType.Information, 1037);
+                }
+                else
+                {
+                    SafeWriteEventLog("Application",
+                        $"Live event skipped — older than replayUpperBound: eventTime={eventTime:O} replayUpperBound={replayUpperBound:O}",
+                        EventLogEntryType.Information, 1038);
+                }
                 return true;
             }
 
