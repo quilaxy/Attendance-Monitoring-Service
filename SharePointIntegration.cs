@@ -518,7 +518,8 @@ namespace EventLogOutEmployeeService
                 $"loginTime={loginTime?.ToString("O") ?? "(null)"} " +
                 $"expectedTimeOut={expectedTimeOut?.ToString("O") ?? "(null)"} " +
                 $"currentShutdown={currentShutdown?.ToString("O") ?? "(null)"} " +
-                $"currentType='{currentShutdownType ?? "(empty)"}'",
+                $"currentType='{currentShutdownType ?? "(empty)"}' " +
+                $"allFields={fields?.ToString(Newtonsoft.Json.Formatting.None) ?? "(null)"}",
                 EventLogEntryType.Information, 3012);
 
             if (!IsValidShutdownCandidate(eventId, eventType, shutdownTime, loginTime, expectedTimeOut))
@@ -857,7 +858,9 @@ namespace EventLogOutEmployeeService
             string findUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items" +
                 $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=5";
 
-            var findResponse = await client.GetAsync(findUrl);
+            var request = new HttpRequestMessage(HttpMethod.Get, findUrl);
+            request.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
+            var findResponse = await client.SendAsync(request);
             if (!findResponse.IsSuccessStatusCode)
             {
                 string errBody = await findResponse.Content.ReadAsStringAsync();
