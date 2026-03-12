@@ -3,8 +3,25 @@
 Dokumentasi ini mencakup **Event ID**, **checkpoint & replay system**, **deduplication**, **shutdown priority**, dan **cleanup task** untuk Attendance Monitoring Service.
 
 ---
+## 0. Publish & Deploy Service
+Run as administrator
 
-# 0. Shutdown Priority
+### 0.1 Publish
+dotnet publish Attendance-Monitoring-Service.csproj -c Release -o ".\Attendance-Monitoring-Service" -p:DebugType=None
+
+### 0.2 Install Service
+sc create Attendance-Service binPath= "C:\Program Files\Attendance-Monitoring-Service\Attendance-Monitoring-Service.exe" start= auto
+
+### 0.3 Start/Stop Service
+sc start Attendance-Service
+sc stop Attendance-Service
+
+### 0.4 Remove Service
+sc delete Attendance-Service
+
+---
+
+# 1. Shutdown Priority
 
 | Priority | Event ID | Condition                                    | Label                                 |
 | -------- | -------- | -------------------------------------------- | ------------------------------------ |
@@ -21,16 +38,16 @@ Dokumentasi ini mencakup **Event ID**, **checkpoint & replay system**, **dedupli
 
 ---
 
-# 1. Windows Event Log IDs
+# 2. Windows Event Log IDs
 
-## 1.1 Security Log
+## 2.1 Security Log
 
 | Event ID | Description        |
 | -------- | ----------------- |
 | 4624     | User login         |
 | 4647     | User logout        |
 
-## 1.2 System Log
+## 2.2 System Log
 
 | Event ID | Description                 |
 | -------- | --------------------------- |
@@ -42,7 +59,7 @@ Dokumentasi ini mencakup **Event ID**, **checkpoint & replay system**, **dedupli
 
 ---
 
-# 2. Application Log Event IDs
+# 3. Application Log Event IDs
 
 | Event ID | Level   | Source       | Description                                           |
 | -------- | ------- | ------------ | ----------------------------------------------------- |
@@ -128,9 +145,9 @@ Dokumentasi ini mencakup **Event ID**, **checkpoint & replay system**, **dedupli
 
 ---
 
-# 3. Checkpoint System
+# 4. Checkpoint System
 
-## 3.1 Checkpoint Files
+## 4.1 Checkpoint Files
 
 | File                        | Location                                       | Content                                                 | Written When                                                                                  |
 | --------------------------- | ---------------------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
@@ -140,7 +157,7 @@ Dokumentasi ini mencakup **Event ID**, **checkpoint & replay system**, **dedupli
 
 ---
 
-## 3.2 Atomic Write
+## 4.2 Atomic Write
 Primary write:
 1. Write → event-stop.checkpoint.tmp
 2. File.Move(tmp → event-stop.checkpoint, overwrite:true)
@@ -153,7 +170,7 @@ Backup write:
 
 ---
 
-## 3.3 Writers
+## 4.3 Writers
 
 | Layer                                       | Trigger                                      | Value Written               | Purpose                              |
 | ------------------------------------------- | -------------------------------------------- | ---------------------------- | ------------------------------------ |
@@ -166,9 +183,9 @@ Backup write:
 
 ---
 
-# 4. Replay System
+# 5. Replay System
 
-## 4.1 LoadStopCheckpoint Fallback
+## 5.1 LoadStopCheckpoint Fallback
 
 | Level                  | Condition                                       | `replayFrom` Value           | Event ID |
 | ---------------------- | ----------------------------------------------- | ---------------------------- | -------- |
@@ -180,7 +197,7 @@ Backup write:
 
 ---
 
-## 4.2 Replay Flow
+## 5.2 Replay Flow
 OnStart()
 → EnableRaisingEvents = true
 → ReplayMissedEventsFromCheckpoint()
@@ -208,7 +225,7 @@ OnStart()
 
 ---
 
-## 4.3 Replay Order Reasoning
+## 5.3 Replay Order Reasoning
 
 | Reason                               | Explanation                                                     |
 | ------------------------------------ | --------------------------------------------------------------- |
@@ -219,7 +236,7 @@ OnStart()
 
 ---
 
-# 5. Deduplication
+# 6. Deduplication
 
 | Mechanism                                           | Description                                                                    |
 | --------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -230,9 +247,9 @@ Special for 4624: incoming lebih awal → replace existing.
 
 ---
 
-# 6. Login & Username Filtering
+# 7. Login & Username Filtering
 
-## 6.1 LogonType
+## 7.1 LogonType
 
 | LogonType | Name                    | Processed |
 | --------- | ----------------------- | --------- |
@@ -245,7 +262,7 @@ Special for 4624: incoming lebih awal → replace existing.
 | 5         | Service                 | ❌         |
 | Others    | —                       | ❌         |
 
-## 6.2 Username Filtering
+## 7.2 Username Filtering
 
 | Condition                                                     | Result             |
 | ------------------------------------------------------------- | ------------------ |
@@ -256,7 +273,7 @@ Special for 4624: incoming lebih awal → replace existing.
 | Prefix DWM-, UMFD-, NT Service                                 | ❌ system account  |
 | Valid                                                         | ✅ processed       |
 
-## 6.3 Username Resolution (System Events)
+## 7.3 Username Resolution (System Events)
 
 | Order | Source                         | Condition                           |
 | ----- | ------------------------------ | ----------------------------------- |
@@ -268,7 +285,7 @@ Special for 4624: incoming lebih awal → replace existing.
 
 ---
 
-# 7. Shutdown Event Pairing
+# 8. Shutdown Event Pairing
 
 | Parameter              | Value    | Description                                  |
 | ---------------------- | -------- | -------------------------------------------- |
@@ -277,7 +294,7 @@ Special for 4624: incoming lebih awal → replace existing.
 
 ---
 
-# 8. Cleanup Task
+# 9. Cleanup Task
 
 | Parameter      | Value                                                         |
 | -------------- | ------------------------------------------------------------- |
@@ -290,7 +307,7 @@ Special for 4624: incoming lebih awal → replace existing.
 
 ---
 
-# 9. Event ID Ranges
+# 10. Event ID Ranges
 
 | Range       | Purpose                                     |
 | ----------- | ------------------------------------------- |
