@@ -493,7 +493,7 @@ namespace EventLogOutEmployeeService
             {
                 SafeWriteEventLog("Application",
                     $"[DBG-Summary] TryUpdateShutdown: NEW SESSION detected — " +
-                    $"incoming shutdownTime ({shutdownTime:O}) > existing ({currentShutdown.Value:O}). " +
+                    $"incoming shutdownTime ({shutdownTime:O}) > existing ({currentShutdown!.Value:O}). " +
                     $"Resetting priority comparison. new={newPriority} old={currentPriority}",
                     EventLogEntryType.Information, 3018);
 
