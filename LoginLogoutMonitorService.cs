@@ -969,7 +969,7 @@ namespace EventLogOutEmployeeService
             if (e?.Entry == null) return;
 
             EventLogEntry entry = e.Entry;
-            if (ShouldSkipLiveEntryDuringReplay(entry.TimeGenerated))
+            if (ShouldSkipLiveEntry(entry.TimeGenerated))
                 return;
 
             _ = Task.Run(async () =>
@@ -988,12 +988,25 @@ namespace EventLogOutEmployeeService
             });
         }
 
-        private bool ShouldSkipLiveEntryDuringReplay(DateTime eventTime)
+        private bool ShouldSkipLiveEntry(DateTime eventTime)
         {
-            if (!replayInProgress)
-                return false;
+            // FIX [STALE-LIVE-EVENTS]: Windows EventLog kadang mem-fire event lama saat
+            // EnableRaisingEvents pertama kali di-set true (tidak ada internal bookmark
+            // untuk service baru). Filter event yang timestampnya sebelum service start —
+            // event tersebut sudah di-cover oleh ReplayMissedEventsFromCheckpoint().
+            if (eventTime < serviceStartTime)
+            {
+                SafeWriteEventLog("Application",
+                    $"Live event skipped — older than serviceStartTime: " +
+                    $"eventTime={eventTime:O} serviceStartTime={serviceStartTime:O}",
+                    EventLogEntryType.Information, 1038);
+                return true;
+            }
 
-            if (eventTime <= replayUpperBound)
+            // Selama replay berlangsung, skip live event yang timestampnya masuk
+            // dalam window replay (sudah di-handle oleh ReplaySecurityEvents/ReplaySystemEvents).
+            // Event setelah replayUpperBound tetap diproses — tidak ada gap.
+            if (replayInProgress && eventTime <= replayUpperBound)
             {
                 SafeWriteEventLog("Application",
                     $"Live event skipped during replay overlap: eventTime={eventTime:O} replayUpperBound={replayUpperBound:O}",
@@ -1049,7 +1062,7 @@ namespace EventLogOutEmployeeService
             if (e?.Entry == null) return;
 
             EventLogEntry entry = e.Entry;
-            if (ShouldSkipLiveEntryDuringReplay(entry.TimeGenerated))
+            if (ShouldSkipLiveEntry(entry.TimeGenerated))
                 return;
 
             _ = Task.Run(async () =>
@@ -1260,8 +1273,15 @@ namespace EventLogOutEmployeeService
                     // FIX [CRASH-0xe0434352]: Checkpoint per-event — tulis setiap kali event
                     // berhasil masuk queue. eventTime - 1 detik agar event ini ikut di-replay
                     // kalau service restart sebelum dispatch selesai.
-                    // Heartbeat 1 menit sebagai safety net saat idle (tidak ada event masuk).
-                    SaveStopCheckpoint(eventTime.AddSeconds(-1));
+                    //
+                    // PENTING: hanya maju, tidak pernah mundur.
+                    // Tanpa guard ini, replay event lama (misal dari 2 Maret) akan overwrite
+                    // checkpoint hari ini (12 Maret) → restart berikutnya replay dari 2 Maret
+                    // → semua data lama masuk lagi.
+                    DateTime candidate = eventTime.AddSeconds(-1);
+                    DateTime? existingCheckpoint = TryLoadCheckpoint(stopCheckpointPath);
+                    if (!existingCheckpoint.HasValue || candidate > existingCheckpoint.Value)
+                        SaveStopCheckpoint(candidate);
                 }
             }
             catch (Exception ex)
