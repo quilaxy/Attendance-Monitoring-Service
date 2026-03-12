@@ -483,7 +483,8 @@ namespace EventLogOutEmployeeService
         /// </summary>
         public async Task TryUpdateDailySummaryShutdownAsync(
             string accessToken, string username, string computerName,
-            DateTime shutdownTime, int eventId, string eventType)
+            DateTime shutdownTime, int eventId, string eventType,
+            SummaryCache? summaryCache = null)
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
@@ -492,8 +493,8 @@ namespace EventLogOutEmployeeService
                 $"shutdownTime={shutdownTime:O} eventId={eventId} eventType='{eventType}'",
                 EventLogEntryType.Information, 3010);
 
-            using var client = CreateGraphClient(accessToken, 30);
-            var summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime);
+            using var client = CreateGraphClient(accessToken, 90); // 90s — retry bisa butuh ~21s
+            var summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime, summaryCache);
             if (summaryItem == null)
             {
                 SafeWriteEventLog("Application",
@@ -779,18 +780,43 @@ namespace EventLogOutEmployeeService
         }
 
         private async Task<JToken?> FindSummaryItemForShutdownAsync(
-            HttpClient client, string computerName, string username, DateTime shutdownTime)
+            HttpClient client, string computerName, string username, DateTime shutdownTime,
+            SummaryCache? summaryCache = null)
         {
             // Prefer same-day summary row. Pakai retry karena shutdown bisa di-dispatch
             // sebelum login row ter-index di SharePoint (eventual consistency).
             string todayKey = BuildSummaryKey(computerName, username, shutdownTime.ToString("yyyy-MM-dd"));
-            var todayItems = await FindSummaryItemWithRetryAsync(client, todayKey);
+
+            // Kalau key ada di cache, row pasti ada — tapi tetap fetch untuk ambil itemId dan fields.
+            // Pakai retry penuh kalau tidak di cache, retry lebih agresif kalau di cache
+            // (kemungkinan besar langsung ketemu).
+            bool inCache = summaryCache != null && await summaryCache.ContainsAsync(todayKey);
+            var todayItems = inCache
+                ? await FindSummaryItemAsync(client, todayKey)          // cache hint: cukup 1 attempt
+                : await FindSummaryItemWithRetryAsync(client, todayKey); // tidak di cache: retry penuh
+
+            // Kalau 1 attempt gagal tapi cache bilang ada, coba retry juga
+            if (inCache && (todayItems == null || todayItems.Count == 0))
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] FindSummaryItemForShutdown: cache hit but not found on first attempt, retrying key={todayKey}",
+                    EventLogEntryType.Warning, 3019);
+                todayItems = await FindSummaryItemWithRetryAsync(client, todayKey);
+            }
+
             if (todayItems != null && todayItems.Count > 0)
                 return todayItems[0];
 
             // Fallback: previous-day row for overnight sessions.
             string yesterdayKey = BuildSummaryKey(computerName, username, shutdownTime.AddDays(-1).ToString("yyyy-MM-dd"));
-            var yesterdayItems = await FindSummaryItemWithRetryAsync(client, yesterdayKey);
+            bool yesterdayInCache = summaryCache != null && await summaryCache.ContainsAsync(yesterdayKey);
+            var yesterdayItems = yesterdayInCache
+                ? await FindSummaryItemAsync(client, yesterdayKey)
+                : await FindSummaryItemWithRetryAsync(client, yesterdayKey);
+
+            if (yesterdayInCache && (yesterdayItems == null || yesterdayItems.Count == 0))
+                yesterdayItems = await FindSummaryItemWithRetryAsync(client, yesterdayKey);
+
             if (yesterdayItems == null || yesterdayItems.Count == 0)
                 return null;
 
@@ -838,10 +864,18 @@ namespace EventLogOutEmployeeService
                     return result;
 
                 if (attempt < delaysMs.Length)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] FindSummaryItemWithRetry: attempt={attempt + 1} not found for key={summaryKey}, retrying in {delaysMs[attempt]}ms",
+                        EventLogEntryType.Information, 3008);
                     await Task.Delay(delaysMs[attempt]);
+                }
             }
 
-            return null; // benar-benar tidak ada
+            SafeWriteEventLog("Application",
+                $"[DBG-Summary] FindSummaryItemWithRetry: all attempts exhausted for key={summaryKey}",
+                EventLogEntryType.Warning, 3009);
+            return null;
         }
 
         private async Task<bool> RawRecordAlreadyExistsAsync(HttpClient client, string title, DateTime eventTime)
