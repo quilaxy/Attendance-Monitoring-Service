@@ -47,27 +47,84 @@ Dokumentasi ini mencakup **Event ID**, **checkpoint & replay system**, **dedupli
 | Event ID | Level   | Source       | Description                                           |
 | -------- | ------- | ------------ | ----------------------------------------------------- |
 | 0        | Info    | Attendance-Service | Service start/stop                                   |
-| 1001-1043 | Info/Warning/Error | Application | Service infrastructure, checkpoint, replay, errors |
-| 2001-2021 | Info/Warning | Application | Debug system events (1074/6006 processing)         |
-| 3001-3018 | Info    | Application | SharePoint summary updates                            |
-| 4001-4025 | Info/Warning | Application | Dispatch & Raw SharePoint                             |
-| 5001-5005 | Info/Warning | Application | Cleanup task                                         |
-| 9996-9999 | Error   | Application | Crash & unhandled exceptions                          |
-
-### Cleanup Event IDs
-
-| Event ID | Level   | Source       | Description                                          |
-| -------- | ------- | ------------ | --------------------------------------------------- |
-| 5001     | Info    | Application | Cleanup started — cutoffDate, retentionMonths, listId, summaryListId |
-| 5001     | Info    | Application | Per-list: total items fetched, scanning info       |
-| 5001     | Warning | Application | Token null — skip cleanup                            |
-| 5002     | Info    | Application | Raw ListId cleanup completed — N items deleted     |
-| 5002     | Info    | Application | Raw list empty — nothing to delete                 |
-| 5003     | Info    | Application | SummaryListId cleanup completed — N items deleted  |
-| 5004     | Warning | Application | Failed fetch items — HTTP status                    |
-| 5005     | Warning | Application | Failed delete per item — itemId + HTTP status      |
-| 5005     | Warning | Application | Exception during delete per item                    |
-| 1013     | Warning | Application | Exception in CleanupOldRecordsAsync (existing)     |
+| 1001     | Error   | Application | Constructor error — gagal inisialisasi EventLog      |
+| 1002     | Error   | Application | Gagal start setelah max retries                       |
+| 1004     | Error   | Application | Failed to decrypt configuration                       |
+| 1015     | Warning | Application | Error in ProcessQueuedEventsTask                      |
+| 1016     | Info    | Application | Duplicate event skipped                                |
+| 1017     | Warning | Application | Failed to save stop checkpoint                         |
+| 1018     | Info    | Application | Saving checkpoint (OnStop/OnShutdown)                 |
+| 1019     | Info    | Application | Checkpoint saved (OnStop/OnShutdown)                  |
+| 1020     | Info    | Application | SaveStopCheckpoint: dir + path info                   |
+| 1021     | Info    | Application | SaveStopCheckpoint: created directory                 |
+| 1022     | Info    | Application | SaveStopCheckpoint: written to primary + backup       |
+| 1023     | Warning | Application | LoadStopCheckpoint: fallback / exception             |
+| 1024     | Info    | Application | LoadStopCheckpoint: loaded from primary               |
+| 1025     | Info    | Application | EnsureCheckpointBootstrap: seeded missing checkpoint |
+| 1026     | Warning | Application | EnsureCheckpointBootstrap failed                       |
+| 1027     | Warning | Application | LoadStopCheckpoint: exception                          |
+| 1029     | Info    | Application | ReplayMissedEvents: no checkpoint found, skipping     |
+| 1030     | Info    | Application | ReplaySystemEvents: found N events                    |
+| 1031     | Info    | Application | ReplaySystemEvents: processing EventId=X             |
+| 1032     | Info    | Application | ReplaySecurityEvents: found N events                  |
+| 1033     | Info    | Application | ReplaySecurityEvents: processing EventId=X           |
+| 1034     | Info    | Application | ReplayMissedEvents: replayFrom + replayTo            |
+| 1035     | Warning | Application | ReplaySecurityEvents: fromTime null — skipping       |
+| 1036     | Warning | Application | ReplaySystemEvents: fromTime null — skipping         |
+| 1037     | Info    | Application | Live event skipped during replay overlap             |
+| 1040     | Warning | Application | Queue: recovered from backup after JsonException     |
+| 1041     | Warning | Application | Queue: backup recovery failed                         |
+| 1042     | Warning | Application | Queue: JSON corrupted, resetting queue               |
+| 1043     | Warning | Application | LoadStopCheckpoint: replay checkpoint stale          |
+| 2001     | Warning | Application | DBG-1074: NULL message — skipping                     |
+| 2002     | Info    | Application | DBG-1074: message preview                              |
+| 2003     | Info    | Application | DBG-1074: GetUserFromSystem1074Message result        |
+| 2004     | Info    | Application | DBG-1074: Stored state username + shutdownType       |
+| 2005     | Info    | Application | DBG-6006: resolved username + confirmed shutdownType|
+| 2006     | Info    | Application | DBG-eventId: username null, fallback lastActiveUser |
+| 2007     | Info    | Application | DBG-eventId: GetMostRecentUser result                |
+| 2008     | Warning | Application | DBG-eventId: DROPPING event — no username resolved  |
+| 2010     | Info    | Application | DBG-6006: TryResolve — no prior 1074 state in memory|
+| 2011     | Info    | Application | DBG-6006: TryResolve — diff >60s                     |
+| 2012     | Info    | Application | DBG-6006: TryResolve — matched username + diff      |
+| 2020     | Info    | Application | DBG-1074: broad fallback matched candidate          |
+| 2021     | Warning | Application | DBG-1074: GetUserFromSystem1074Message exception   |
+| 3001     | Info    | Application | UpsertLogin: user, computer, loginTime, workDate, summaryKey |
+| 3002     | Info    | Application | UpsertLogin: row exists, storedLogin vs incoming    |
+| 3003     | Info    | Application | UpsertLogin: updating to earlier loginTime          |
+| 3004     | Info    | Application | UpsertLogin: creating new row                        |
+| 3005     | Info    | Application | UpsertLogin: successfully created row               |
+| 3010     | Info    | Application | TryUpdateShutdown: user, computer, shutdownTime, eventId |
+| 3011     | Info    | Application | TryUpdateShutdown: SKIP — no matching summary row  |
+| 3012     | Info    | Application | TryUpdateShutdown: found row — loginTime, expectedTimeOut, currentShutdown |
+| 3013     | Info    | Application | TryUpdateShutdown: SKIP — IsValidShutdownCandidate=false |
+| 3014     | Info    | Application | TryUpdateShutdown: SKIP — priority too low          |
+| 3015     | Info    | Application | TryUpdateShutdown: SKIP — same priority, existing later |
+| 3016     | Info    | Application | TryUpdateShutdown: PATCHING — detail priority + isNewSession |
+| 3017     | Info    | Application | TryUpdateShutdown: PATCH success                    |
+| 3018     | Info    | Application | TryUpdateShutdown: NEW SESSION detected — reset priority |
+| 4001     | Warning | Application | Token null — skipping dispatch                       |
+| 4002     | Info    | Application | DISPATCH: detail queueId, eventId, needsRaw, needsSummary |
+| 4003     | Info    | Application | DISPATCH: Raw record sent                             |
+| 4004     | Info    | Application | DISPATCH-SUMMARY→ListId: sending/OK login          |
+| 4005     | Info    | Application | DISPATCH-SUMMARY→ListId: sending/OK shutdown       |
+| 4006     | Info    | Application | DISPATCH: Summary dispatched                        |
+| 4007     | Info    | Application | DISPATCH: Done — doneRaw + doneSummary              |
+| 4010     | Info    | Application | Waiting 30s for network on fresh boot               |
+| 4011     | Warning | Application | Token attempt failed: HTTP status                   |
+| 4012     | Warning | Application | Token attempt network error (SocketException)       |
+| 4013     | Warning | Application | Token attempt exception                              |
+| 4020     | Info    | Application | RAW: Inserting — title, eventTime, eventType        |
+| 4021     | Info    | Application | RAW: Idempotency — record exists, skipping         |
+| 4022     | Info    | Application | RAW: Insert success                                 |
+| 4023     | Warning | Application | RAW: Insert attempt failed — HTTP status           |
+| 4024     | Warning | Application | RAW: Insert attempt exception                        |
+| 4025     | Info    | Application | RAW: Idempotency hit detail — diff seconds         |
+| 5001-5005 | Info/Warning | Application | Cleanup events                                      |
+| 9996     | Error   | Application | Unhandled exception in OnSystemEventWritten        |
+| 9997     | Error   | Application | Unhandled exception in OnSecurityEventWritten      |
+| 9998     | Error   | Application | Unobserved task exception                           |
+| 9999     | Error   | Application | Unhandled exception (crash handler)                |
 
 ---
 
