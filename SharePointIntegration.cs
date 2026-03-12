@@ -833,27 +833,26 @@ namespace EventLogOutEmployeeService
         /// <summary>
         /// Determines whether this shutdown event qualifies to be written into the Summary.
         ///
-        /// Exclusion rules:
+        /// Rules:
         ///   • 1074 Restart → never written to Summary (not a real end-of-day).
-        ///   • 6006 unconfirmed (no paired 1074 shutdown) → treated like 4647, only accepted
-        ///     within ±5h of expectedTimeOut, because we can't tell if it was a restart.
-        ///   • 6006 confirmed shutdown (paired 1074 was power-off/shutdown) → always accepted.
-        ///   • 4647 (User Logout) → only accepted if within ±5h of expectedTimeOut.
-        ///   • 6008/41 (Unexpected Shutdown/Crash) → only accepted at or after expectedTimeOut.
+        ///   • Semua shutdown lain (4647, 6006, 6008, 41, 1074 non-restart) diterima
+        ///     selama masuk dalam session guardrail:
+        ///     - shutdownTime >= loginTime  (tidak boleh sebelum login)
+        ///     - shutdownTime <= loginTime + 20 jam  (batas sesi wajar)
+        ///   • Tidak ada batasan ±5 jam dari ExpectedTimeOut — shutdown jam 09:00
+        ///     tetap diterima. Kalau nanti ada shutdown yang lebih baru (jam 17:00),
+        ///     new session logic di TryUpdateDailySummaryShutdownAsync akan overwrite.
         /// </summary>
         private static bool IsValidShutdownCandidate(
             int eventId, string eventType,
             DateTime shutdownTime,
             DateTime? loginTime, DateTime? expectedTimeOut)
         {
-            // 1074 Restart is never a final shutdown
+            // 1074 Restart bukan final shutdown — skip
             if (eventId == 1074 && IsRestartEventType(eventType))
                 return false;
 
-            DateTime refExpected = expectedTimeOut
-                ?? (loginTime?.AddHours(9) ?? shutdownTime.AddHours(-1));
-
-            // Guardrail: shutdown must belong to the same work session window.
+            // Session guardrail: shutdown harus terjadi setelah login dan dalam 20 jam
             if (loginTime.HasValue)
             {
                 if (shutdownTime < loginTime.Value)
@@ -863,22 +862,6 @@ namespace EventLogOutEmployeeService
                     return false;
             }
 
-            // Unexpected shutdown/crash: only count if it happened at or after expected time out
-            if (eventId == 6008 || eventId == 41)
-                return shutdownTime >= refExpected;
-
-            // User logout: accept if within ±5h of expectedTimeOut (allow early leave/overtime)
-            if (eventId == 4647)
-                return shutdownTime >= refExpected.AddHours(-5) &&
-                       shutdownTime <= refExpected.AddHours(5);
-
-            // 6006 unconfirmed (eventType contains "unconfirmed"): apply same time window as 4647
-            // because we don't know if this was a restart or shutdown.
-            if (eventId == 6006 && IsUnconfirmed6006(eventType))
-                return shutdownTime >= refExpected.AddHours(-5) &&
-                       shutdownTime <= refExpected.AddHours(5);
-
-            // 6006 confirmed shutdown, and 1074 non-restart: valid within session guardrail above.
             return true;
         }
 
