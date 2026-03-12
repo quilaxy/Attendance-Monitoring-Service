@@ -1,0 +1,174 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+
+namespace EventLogOutEmployeeService
+{
+    /// <summary>
+    /// Cache lokal persisten untuk summary keys yang sudah berhasil dikirim ke SharePoint.
+    ///
+    /// Tujuan: mencegah duplikat row di SummaryListId lintas service restart.
+    /// Setelah service restart, queue kosong sehingga IsSummaryEligible tidak bisa
+    /// mendeteksi bahwa row untuk user+computer+workDate hari ini sudah ada.
+    /// Cache ini menjawab pertanyaan itu secara lokal tanpa perlu query SharePoint.
+    ///
+    /// Format file (summary-cache.json):
+    /// {
+    ///   "keys": [
+    ///     "ON-083\\annafi\\2026-03-12",
+    ///     "ON-083\\kidannafi\\2026-03-12"
+    ///   ]
+    /// }
+    ///
+    /// Cleanup: entry lebih dari 7 hari otomatis dihapus. WorkDate di-parse dari
+    /// key format "ComputerName\\Username\\yyyy-MM-dd".
+    /// </summary>
+    public class SummaryCache
+    {
+        private readonly string filePath;
+        private readonly SemaphoreSlim fileLock = new SemaphoreSlim(1, 1);
+
+        /// <summary>Entry lebih dari ini otomatis dihapus saat cleanup.</summary>
+        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(7);
+
+        public SummaryCache(string filePath)
+        {
+            this.filePath = filePath;
+            EnsureFile();
+        }
+
+        /// <summary>
+        /// Cek apakah summaryKey sudah ada di cache.
+        /// Format key: "ComputerName\\Username\\yyyy-MM-dd"
+        /// </summary>
+        public async Task<bool> ContainsAsync(string summaryKey, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                var keys = await ReadAllInternalAsync();
+                return keys.Contains(summaryKey, StringComparer.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Tambahkan summaryKey ke cache. Idempotent — tidak masalah kalau dipanggil
+        /// berkali-kali untuk key yang sama.
+        /// </summary>
+        public async Task AddAsync(string summaryKey, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                var keys = await ReadAllInternalAsync();
+                if (!keys.Contains(summaryKey, StringComparer.OrdinalIgnoreCase))
+                {
+                    keys.Add(summaryKey);
+                    await WriteAllInternalAsync(keys);
+                }
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Hapus entry yang workDate-nya lebih dari RetentionWindow (7 hari).
+        /// Dipanggil dari CleanupOldRecordsTask bersamaan dengan cleanup SharePoint.
+        /// </summary>
+        public async Task CleanupOldEntriesAsync(CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                var keys = await ReadAllInternalAsync();
+                DateTime cutoff = DateTime.Today.Subtract(RetentionWindow);
+                int before = keys.Count;
+
+                keys.RemoveAll(key =>
+                {
+                    // Key format: "ComputerName\\Username\\yyyy-MM-dd"
+                    // WorkDate adalah segmen terakhir
+                    int lastSlash = key.LastIndexOf('\\');
+                    if (lastSlash < 0) return false;
+                    string datePart = key.Substring(lastSlash + 1);
+                    return DateTime.TryParse(datePart, out DateTime d) && d.Date < cutoff;
+                });
+
+                if (keys.Count != before)
+                {
+                    await WriteAllInternalAsync(keys);
+                    SafeLog($"[SummaryCache] Cleanup: removed {before - keys.Count} old entries. Remaining={keys.Count}",
+                        EventLogEntryType.Information, 5006);
+                }
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        // ── Internal helpers ─────────────────────────────────────────────────────
+
+        private void EnsureFile()
+        {
+            string? dir = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            if (!File.Exists(filePath))
+                File.WriteAllText(filePath, JsonConvert.SerializeObject(new CacheData()));
+        }
+
+        private async Task<List<string>> ReadAllInternalAsync()
+        {
+            EnsureFile();
+            try
+            {
+                string content = await File.ReadAllTextAsync(filePath);
+                var data = JsonConvert.DeserializeObject<CacheData>(content);
+                return data?.Keys ?? new List<string>();
+            }
+            catch
+            {
+                return new List<string>();
+            }
+        }
+
+        private async Task WriteAllInternalAsync(List<string> keys)
+        {
+            var data = new CacheData { Keys = keys };
+            string content = JsonConvert.SerializeObject(data, Formatting.Indented);
+
+            string tempPath = filePath + ".tmp";
+            await File.WriteAllTextAsync(tempPath, content);
+
+            if (File.Exists(filePath))
+                File.Replace(tempPath, filePath, filePath + ".bak", ignoreMetadataErrors: true);
+            else
+                File.Move(tempPath, filePath);
+        }
+
+        private static void SafeLog(string message, EventLogEntryType type, int eventId)
+        {
+            try { EventLog.WriteEntry("Application", message, type, eventId); }
+            catch { }
+        }
+
+        private class CacheData
+        {
+            [JsonProperty("keys")]
+            public List<string> Keys { get; set; } = new List<string>();
+        }
+    }
+}
