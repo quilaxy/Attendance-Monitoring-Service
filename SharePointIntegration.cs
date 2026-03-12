@@ -566,42 +566,81 @@ namespace EventLogOutEmployeeService
             try
             {
                 string? accessToken = await GetAccessTokenAsync(DateTime.Now, 0);
-                if (string.IsNullOrEmpty(accessToken)) return;
+                if (string.IsNullOrEmpty(accessToken))
+                {
+                    SafeWriteEventLog("Application",
+                        $"[CLEANUP] Skipped — could not obtain access token.",
+                        EventLogEntryType.Warning, 5001);
+                    return;
+                }
 
                 DateTime cutoffDate = DateTime.Now.AddMonths(-retentionMonths);
+
+                SafeWriteEventLog("Application",
+                    $"[CLEANUP] Started — cutoffDate={cutoffDate:yyyy-MM-dd} retentionMonths={retentionMonths} " +
+                    $"listId='{_listId}' summaryListId='{_summaryListId ?? "(none)"}'",
+                    EventLogEntryType.Information, 5001);
 
                 using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
                 client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
                 client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
                 client.DefaultRequestHeaders.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
 
-                await CleanupListByDateFieldAsync(client, _listId, "EventTime", cutoffDate);
+                int rawDeleted = await CleanupListByDateFieldAsync(client, _listId, "EventTime", cutoffDate);
+                SafeWriteEventLog("Application",
+                    $"[CLEANUP] ListId (raw) done — {rawDeleted} items deleted. cutoffDate={cutoffDate:yyyy-MM-dd}",
+                    EventLogEntryType.Information, 5002);
 
                 if (!string.IsNullOrWhiteSpace(_summaryListId))
-                    await CleanupListByDateFieldAsync(client, _summaryListId, "WorkDate", cutoffDate);
+                {
+                    int summaryDeleted = await CleanupListByDateFieldAsync(client, _summaryListId, "WorkDate", cutoffDate);
+                    SafeWriteEventLog("Application",
+                        $"[CLEANUP] SummaryListId done — {summaryDeleted} items deleted. cutoffDate={cutoffDate:yyyy-MM-dd}",
+                        EventLogEntryType.Information, 5003);
+                }
             }
             catch (Exception ex)
             {
                 SafeWriteEventLog("Application",
-                    $"Error in cleanup task: {ex.Message}",
+                    $"[CLEANUP] Error in cleanup task: {ex.Message}",
                     EventLogEntryType.Warning, 1013);
             }
         }
 
         // ── Private helpers ───────────────────────────────────────────────────────
 
-        private async Task CleanupListByDateFieldAsync(
+        private async Task<int> CleanupListByDateFieldAsync(
             HttpClient client, string listId, string dateField, DateTime cutoffDate)
         {
+            int deletedCount = 0;
+
             string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items" +
                          $"?$expand=fields&$select=id,fields&$top=5000";
 
             var response = await client.GetAsync(url);
-            if (!response.IsSuccessStatusCode) return;
+            if (!response.IsSuccessStatusCode)
+            {
+                SafeWriteEventLog("Application",
+                    $"[CLEANUP] Failed to fetch items from listId='{listId}' — " +
+                    $"HTTP {(int)response.StatusCode}",
+                    EventLogEntryType.Warning, 5004);
+                return 0;
+            }
 
             var result = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
             var items = result?["value"] as JArray;
-            if (items == null || items.Count == 0) return;
+            if (items == null || items.Count == 0)
+            {
+                SafeWriteEventLog("Application",
+                    $"[CLEANUP] listId='{listId}' — no items found, nothing to delete.",
+                    EventLogEntryType.Information, 5002);
+                return 0;
+            }
+
+            SafeWriteEventLog("Application",
+                $"[CLEANUP] listId='{listId}' — {items.Count} total items fetched, " +
+                $"scanning for {dateField} < {cutoffDate:yyyy-MM-dd}",
+                EventLogEntryType.Information, 5001);
 
             foreach (JToken item in items)
             {
@@ -622,14 +661,35 @@ namespace EventLogOutEmployeeService
                     if (string.IsNullOrWhiteSpace(itemId))
                         continue;
 
-                    await client.DeleteAsync($"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items/{itemId}");
+                    var deleteResponse = await client.DeleteAsync(
+                        $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items/{itemId}");
+
+                    if (deleteResponse.IsSuccessStatusCode)
+                    {
+                        deletedCount++;
+                    }
+                    else
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[CLEANUP] Failed to delete itemId='{itemId}' from listId='{listId}' — " +
+                            $"HTTP {(int)deleteResponse.StatusCode}",
+                            EventLogEntryType.Warning, 5005);
+                    }
+
                     await Task.Delay(200);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    string? itemId = item["id"]?.ToString() ?? "(unknown)";
+                    SafeWriteEventLog("Application",
+                        $"[CLEANUP] Exception deleting itemId='{itemId}' from listId='{listId}': " +
+                        $"{ex.GetType().Name}: {ex.Message}",
+                        EventLogEntryType.Warning, 5005);
                     // continue deleting remaining items
                 }
             }
+
+            return deletedCount;
         }
 
         private HttpClient CreateGraphClient(string accessToken, int timeoutSeconds)
