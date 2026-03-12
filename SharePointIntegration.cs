@@ -835,16 +835,47 @@ namespace EventLogOutEmployeeService
 
         private async Task<JArray?> FindSummaryItemAsync(HttpClient client, string summaryKey)
         {
+            // summaryKey format: "ComputerName\Username\yyyy-MM-dd"
+            // Tidak bisa filter by Title langsung karena backslash (\) di OData filter
+            // menyebabkan HTTP 400. Ganti ke filter Username + ComputerName + WorkDate.
+            string[] parts = summaryKey.Split('\\');
+            if (parts.Length < 3)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] FindSummaryItemAsync: invalid summaryKey format: {summaryKey}",
+                    EventLogEntryType.Warning, 3020);
+                return null;
+            }
+            string computerName = parts[0];
+            string username     = parts[1];
+            string workDate     = parts[2];
+
+            string filter = $"fields/Username eq '{EscapeODataLiteral(username)}' and " +
+                            $"fields/ComputerName eq '{EscapeODataLiteral(computerName)}' and " +
+                            $"fields/WorkDate eq '{EscapeODataLiteral(workDate)}'";
+
             string findUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items" +
-                $"?$expand=fields&$filter=fields/Title eq '{EscapeODataLiteral(summaryKey)}'&$top=5";
+                $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=5";
 
             var findResponse = await client.GetAsync(findUrl);
-            if (!findResponse.IsSuccessStatusCode) return null;
+            if (!findResponse.IsSuccessStatusCode)
+            {
+                string errBody = await findResponse.Content.ReadAsStringAsync();
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] FindSummaryItemAsync: HTTP {(int)findResponse.StatusCode} for key={summaryKey} body={errBody}",
+                    EventLogEntryType.Warning, 3020);
+                return null;
+            }
 
-            var findObject = JsonConvert.DeserializeObject<JObject>(
-                await findResponse.Content.ReadAsStringAsync());
+            string body = await findResponse.Content.ReadAsStringAsync();
+            var findObject = JsonConvert.DeserializeObject<JObject>(body);
+            var result = findObject?["value"] as JArray;
 
-            return findObject?["value"] as JArray;
+            SafeWriteEventLog("Application",
+                $"[DBG-Summary] FindSummaryItemAsync: key={summaryKey} count={result?.Count ?? 0}",
+                EventLogEntryType.Information, 3021);
+
+            return result;
         }
 
         /// <summary>
@@ -986,7 +1017,7 @@ namespace EventLogOutEmployeeService
         private static int GetShutdownPriority(int eventId, string eventType)
         {
             if (eventId == 6006)
-                return IsUnconfirmed6006(eventType) ? 3 : 5;
+                return IsUnconfirmed6006(eventType) ? 0 : 5;  // unconfirmed = restart = skip
 
             if (eventId == 1074 && !IsRestartEventType(eventType)) return 4;
             if (eventId == 4647) return 2;
