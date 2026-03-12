@@ -19,9 +19,13 @@ namespace EventLogOutEmployeeService
         private string lastActiveUser = string.Empty;
         private CancellationTokenSource? cancellationTokenSource;
         private CancellationToken? cancellationToken;
+        private Timer? checkpointHeartbeatTimer;
         private readonly object userLock = new object();
+        private readonly object checkpointWriteLock = new object();
         private int activeDispatchCount = 0;
         private DateTime serviceStartTime;
+        private volatile bool replayInProgress = false;
+        private DateTime replayUpperBound = DateTime.MinValue;
         private readonly Lazy<SharePointIntegration> sharePointIntegration =
             new Lazy<SharePointIntegration>(() => new SharePointIntegration());
 
@@ -47,6 +51,8 @@ namespace EventLogOutEmployeeService
         private readonly PersistentEventQueue eventQueue =
             new PersistentEventQueue(Path.Combine(DataDirectory, "event-queue.json"));
 
+        private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
+
         public LoginLogoutMonitorService()
         {
             // Allow OnShutdown() to be called during system shutdown/restart.
@@ -58,6 +64,9 @@ namespace EventLogOutEmployeeService
             // event-stop.checkpoint tidak tersimpan sehingga window replay
             // berikutnya bisa salah (root cause event 4624 annafi hilang).
             AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+            TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+
+            EnsureCheckpointBootstrap();
 
             try
             {
@@ -95,7 +104,7 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"EmployeeLoginLogoutService constructor error: {ex.Message}",
                     EventLogEntryType.Error, 1001);
                 throw;
@@ -134,6 +143,9 @@ namespace EventLogOutEmployeeService
                     cancellationTokenSource = new CancellationTokenSource();
                     cancellationToken = cancellationTokenSource.Token;
 
+                    // Make sure ProgramData checkpoint files exist even after abrupt previous crash.
+                    EnsureCheckpointBootstrap();
+
                     // FIX [GAP]: Aktifkan listener SEBELUM replay dimulai.
                     //
                     // Masalah sebelumnya:
@@ -155,6 +167,8 @@ namespace EventLogOutEmployeeService
                     // Replay any events missed while service was down
                     ReplayMissedEventsFromCheckpoint();
 
+                    StartCheckpointHeartbeat();
+
                     Thread monitoringThread = new Thread(() => MonitorEvents(cancellationToken.Value));
                     monitoringThread.IsBackground = true;
                     monitoringThread.Start();
@@ -166,7 +180,7 @@ namespace EventLogOutEmployeeService
                 {
                     if (currentRetry >= maxRetries)
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             $"EmployeeLoginLogoutService failed to start after {maxRetries} attempts: {ex.Message}",
                             EventLogEntryType.Error, 1002);
                         return;
@@ -177,7 +191,7 @@ namespace EventLogOutEmployeeService
 
             if (started)
             {
-                EventLog.WriteEntry("Attendance-Service",
+                SafeWriteEventLog("Attendance-Service",
                     "Service started successfully.",
                     EventLogEntryType.Information, 0);
             }
@@ -201,7 +215,7 @@ namespace EventLogOutEmployeeService
                 // 1. Tulis ke Application EventLog — terbaca di Event Viewer
                 try
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[CRASH] Unhandled exception (isTerminating={e.IsTerminating}):\n{message}",
                         EventLogEntryType.Error, 9999);
                 }
@@ -229,16 +243,35 @@ namespace EventLogOutEmployeeService
             catch { /* absolute last resort — jangan sampai throw dari handler ini */ }
         }
 
+        private void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+        {
+            try
+            {
+                SafeWriteEventLog("Application",
+                    $"[CRASH] Unobserved task exception: {e.Exception}",
+                    EventLogEntryType.Error, 9998);
+                SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                e.SetObserved();
+            }
+            catch
+            {
+                // Never throw from global exception hooks.
+            }
+        }
+
         // ─── Replay missed events ────────────────────────────────────────────────
 
         private void ReplayMissedEventsFromCheckpoint()
         {
+            DateTime replayTo = DateTime.Now;
+            replayUpperBound = replayTo;
+            replayInProgress = true;
+
             try
             {
-                DateTime replayTo = DateTime.Now;
                 DateTime? replayFrom = LoadStopCheckpoint();
 
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"ReplayMissedEvents: replayFrom={replayFrom?.ToString("O") ?? "(none)"} replayTo={replayTo:O}",
                     EventLogEntryType.Information, 1034);
 
@@ -250,7 +283,7 @@ namespace EventLogOutEmployeeService
                 }
                 else
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         "ReplayMissedEvents: no checkpoint found, skipping replay.",
                         EventLogEntryType.Information, 1029);
                 }
@@ -259,9 +292,13 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Error while replaying startup events: {ex.Message}",
                     EventLogEntryType.Warning, 1014);
+            }
+            finally
+            {
+                replayInProgress = false;
             }
         }
 
@@ -269,50 +306,75 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                // Primary checkpoint
+                // Level 1 – Primary checkpoint
                 DateTime? checkpoint = TryLoadCheckpoint(stopCheckpointPath);
                 if (checkpoint.HasValue)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"LoadStopCheckpoint: loaded from primary '{stopCheckpointPath}' → {checkpoint.Value:O}",
                         EventLogEntryType.Information, 1024);
                     return checkpoint;
                 }
 
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"LoadStopCheckpoint: primary not found at '{stopCheckpointPath}', trying backup.",
                     EventLogEntryType.Warning, 1023);
 
-                // Backup checkpoint (in case primary write was interrupted mid-shutdown)
+                // Level 2 – Backup checkpoint (in case primary write was interrupted mid-shutdown)
                 checkpoint = TryLoadCheckpoint(stopCheckpointBackupPath);
                 if (checkpoint.HasValue)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"LoadStopCheckpoint: loaded from backup '{stopCheckpointBackupPath}' → {checkpoint.Value:O}",
                         EventLogEntryType.Warning, 1023);
                     return checkpoint;
                 }
 
-                // Last-resort: derive from replay checkpoint -5 min so we don't miss events
-                // written right before the previous service start
+                // Level 3 – Derive from replay checkpoint -5 min so we don't miss events
+                // written right before the previous service start.
+                // If derived timestamp is older than MaxReplayLookback (7 days), clamp to
+                // exactly 7 days back — never fall back to an arbitrary short window so that
+                // long weekends, public holidays, and extended leave are always covered.
+                DateTime now = DateTime.Now;
                 DateTime? replayCheckpoint = TryLoadCheckpoint(replayCheckpointPath);
                 if (replayCheckpoint.HasValue)
                 {
                     DateTime derived = replayCheckpoint.Value.AddMinutes(-5);
-                    EventLog.WriteEntry("Application",
+                    DateTime maxLookback = now - MaxReplayLookback;
+
+                    if (derived < maxLookback)
+                    {
+                        // Replay checkpoint is stale (e.g. leftover from a reinstall).
+                        // Clamp to MaxReplayLookback so we still cover up to 7 days,
+                        // rather than collapsing to a tiny 10-minute window.
+                        SafeWriteEventLog("Application",
+                            $"LoadStopCheckpoint: replay checkpoint stale ({replayCheckpoint.Value:O}); " +
+                            $"clamping replayFrom to MaxReplayLookback boundary {maxLookback:O} " +
+                            $"instead of derived {derived:O}",
+                            EventLogEntryType.Warning, 1043);
+                        return maxLookback;
+                    }
+
+                    SafeWriteEventLog("Application",
                         $"LoadStopCheckpoint: both stop checkpoints missing — deriving from replay checkpoint " +
                         $"({replayCheckpoint.Value:O}) -5min → {derived:O}",
                         EventLogEntryType.Warning, 1023);
                     return derived;
                 }
 
-                EventLog.WriteEntry("Application",
-                    "LoadStopCheckpoint: no checkpoint found (primary, backup, or replay) — replay skipped.",
+                // Level 4 – First-start / fresh install seed: replay from 00:00 today only.
+                // This avoids importing weeks of historical Security/System log entries on a
+                // clean deployment while still capturing any events that happened earlier today.
+                DateTime todayMidnight = now.Date;
+                SafeWriteEventLog("Application",
+                    $"LoadStopCheckpoint: no checkpoint found (primary, backup, or replay) — " +
+                    $"seeding replayFrom to today midnight {todayMidnight:O}.",
                     EventLogEntryType.Warning, 1023);
+                return todayMidnight;
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"LoadStopCheckpoint: exception {ex.GetType().Name}: {ex.Message}",
                     EventLogEntryType.Warning, 1027);
             }
@@ -334,47 +396,105 @@ namespace EventLogOutEmployeeService
             return parsed.ToLocalTime();
         }
 
+        private void EnsureCheckpointBootstrap()
+        {
+            try
+            {
+                Directory.CreateDirectory(DataDirectory);
+
+                bool hasPrimary = File.Exists(stopCheckpointPath);
+                bool hasBackup = File.Exists(stopCheckpointBackupPath);
+
+                if (hasPrimary || hasBackup)
+                    return;
+
+                DateTime seed = DateTime.Now.AddMinutes(-1);
+                SaveStopCheckpoint(seed);
+
+                SafeWriteEventLog("Application",
+                    $"EnsureCheckpointBootstrap: seeded missing stop checkpoint at {seed:O}",
+                    EventLogEntryType.Information, 1025);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"EnsureCheckpointBootstrap failed: {ex.GetType().Name}: {ex.Message}",
+                    EventLogEntryType.Warning, 1026);
+            }
+        }
+
         private void SaveStopCheckpoint(DateTime checkpoint)
         {
             try
             {
-                string? dir = Path.GetDirectoryName(stopCheckpointPath);
-
-                EventLog.WriteEntry("Application",
-                    $"SaveStopCheckpoint: dir='{dir}' path='{stopCheckpointPath}'",
-                    EventLogEntryType.Information, 1020);
-
-                if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                lock (checkpointWriteLock)
                 {
-                    Directory.CreateDirectory(dir);
-                    EventLog.WriteEntry("Application",
-                        $"SaveStopCheckpoint: created directory '{dir}'",
-                        EventLogEntryType.Information, 1021);
+                    string? dir = Path.GetDirectoryName(stopCheckpointPath);
+
+                    SafeWriteEventLog("Application",
+                        $"SaveStopCheckpoint: dir='{dir}' path='{stopCheckpointPath}'",
+                        EventLogEntryType.Information, 1020);
+
+                    if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                        SafeWriteEventLog("Application",
+                            $"SaveStopCheckpoint: created directory '{dir}'",
+                            EventLogEntryType.Information, 1021);
+                    }
+
+                    string content = checkpoint.ToUniversalTime().ToString("O");
+
+                    // Write atomically via temp+rename so the file is never half-written
+                    // if Windows kills the process mid-write during system shutdown.
+                    // Primary path:
+                    string tempPrimary = stopCheckpointPath + ".tmp";
+                    File.WriteAllText(tempPrimary, content);
+                    File.Move(tempPrimary, stopCheckpointPath, overwrite: true);
+
+                    // Backup path (same trick):
+                    string tempBackup = stopCheckpointBackupPath + ".tmp";
+                    File.WriteAllText(tempBackup, content);
+                    File.Move(tempBackup, stopCheckpointBackupPath, overwrite: true);
+
+                    SafeWriteEventLog("Application",
+                        $"SaveStopCheckpoint: written '{content}' to primary + backup.",
+                        EventLogEntryType.Information, 1022);
                 }
-
-                string content = checkpoint.ToUniversalTime().ToString("O");
-
-                // Write atomically via temp+rename so the file is never half-written
-                // if Windows kills the process mid-write during system shutdown.
-                // Primary path:
-                string tempPrimary = stopCheckpointPath + ".tmp";
-                File.WriteAllText(tempPrimary, content);
-                File.Move(tempPrimary, stopCheckpointPath, overwrite: true);
-
-                // Backup path (same trick):
-                string tempBackup = stopCheckpointBackupPath + ".tmp";
-                File.WriteAllText(tempBackup, content);
-                File.Move(tempBackup, stopCheckpointBackupPath, overwrite: true);
-
-                EventLog.WriteEntry("Application",
-                    $"SaveStopCheckpoint: written '{content}' to primary + backup.",
-                    EventLogEntryType.Information, 1022);
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Failed to save stop checkpoint: {ex.GetType().Name}: {ex.Message} | Path='{stopCheckpointPath}'",
                     EventLogEntryType.Warning, 1017);
+            }
+        }
+
+        private void StartCheckpointHeartbeat()
+        {
+            checkpointHeartbeatTimer?.Dispose();
+            checkpointHeartbeatTimer = new Timer(_ =>
+            {
+                try
+                {
+                    SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                }
+                catch
+                {
+                    // Heartbeat must never crash service.
+                }
+            }, null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+        }
+
+        private static void SafeWriteEventLog(string source, string message, EventLogEntryType type, int eventId)
+        {
+            try
+            {
+                EventLog.WriteEntry(source, message, type, eventId);
+            }
+            catch
+            {
+                // Ignore EventLog failures during shutdown windows.
             }
         }
 
@@ -401,7 +521,7 @@ namespace EventLogOutEmployeeService
             // Without a lower bound we would re-import the entire Security log history.
             if (!fromTime.HasValue)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     "ReplaySecurityEvents: fromTime is null — skipping to avoid full log flood.",
                     EventLogEntryType.Warning, 1035);
                 return;
@@ -436,7 +556,7 @@ namespace EventLogOutEmployeeService
                 entries.Add((eventTime, entry, eventId));
             }
 
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"ReplaySecurityEvents: found {entries.Count} security events between {fromTime:O} and {toTime:O}.",
                 EventLogEntryType.Information, 1032);
 
@@ -444,7 +564,7 @@ namespace EventLogOutEmployeeService
 
             foreach (var (time, entry, eventId) in entries)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"ReplaySecurityEvents: processing EventId={eventId} at {time:O}",
                     EventLogEntryType.Information, 1033);
 
@@ -460,7 +580,7 @@ namespace EventLogOutEmployeeService
             // GUARD: fromTime null means no checkpoint — skip to avoid full log flood.
             if (!fromTime.HasValue)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     "ReplaySystemEvents: fromTime is null — skipping to avoid full log flood.",
                     EventLogEntryType.Warning, 1036);
                 return;
@@ -489,7 +609,7 @@ namespace EventLogOutEmployeeService
                 entries.Add((eventTime, entry, eventId));
             }
 
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"ReplaySystemEvents: found {entries.Count} system events between {fromTime:O} and {toTime:O}.",
                 EventLogEntryType.Information, 1030);
 
@@ -498,7 +618,7 @@ namespace EventLogOutEmployeeService
 
             foreach (var (time, entry, eventId) in entries)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"ReplaySystemEvents: processing EventId={eventId} at {time:O} Source={entry.Source}",
                     EventLogEntryType.Information, 1031);
 
@@ -537,7 +657,7 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Failed to decrypt configuration: {ex.Message}",
                     EventLogEntryType.Error, 1004);
                 throw;
@@ -567,13 +687,13 @@ namespace EventLogOutEmployeeService
                 // If Windows kills us after this line, replay will still cover missed events.
                 DateTime stopCheckpoint = DateTime.Now.AddMinutes(-5);
 
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"{caller}: saving checkpoint {stopCheckpoint:O} to {stopCheckpointPath}",
                     EventLogEntryType.Information, 1018);
 
                 SaveStopCheckpoint(stopCheckpoint);
 
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"{caller}: checkpoint saved.",
                     EventLogEntryType.Information, 1019);
 
@@ -592,6 +712,9 @@ namespace EventLogOutEmployeeService
 
                 cancellationTokenSource?.Cancel();
 
+                checkpointHeartbeatTimer?.Dispose();
+                checkpointHeartbeatTimer = null;
+
                 // ── Step 4: Brief wait for any in-flight dispatch to finish.
                 // Keep this short (≤5s total) — checkpoint is already saved so
                 // any un-sent events will be replayed on next start anyway.
@@ -604,13 +727,13 @@ namespace EventLogOutEmployeeService
                     waited += 200;
                 }
 
-                EventLog.WriteEntry("Attendance-Service",
+                SafeWriteEventLog("Attendance-Service",
                     $"Service has been successfully shut down ({caller}).",
                     EventLogEntryType.Information, 0);
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Error in {caller}: {ex.Message}",
                     EventLogEntryType.Warning, 1006);
             }
@@ -634,7 +757,7 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Error in MonitorEvents: {ex.Message}",
                     EventLogEntryType.Error, 1007);
             }
@@ -677,7 +800,7 @@ namespace EventLogOutEmployeeService
                 catch (TaskCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"Error in ProcessQueuedEventsTask: {ex.Message}",
                         EventLogEntryType.Warning, 1015);
                     try { await Task.Delay(TimeSpan.FromSeconds(15), cancellationToken); }
@@ -700,7 +823,7 @@ namespace EventLogOutEmployeeService
                 string? accessToken = await sharePoint.GetAccessTokenAsync(item.EventTime, item.EventId);
                 if (string.IsNullOrEmpty(accessToken))
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DISPATCH] Token null — skipping queueId={item.QueueId} eventId={item.EventId} user={item.Username}",
                         EventLogEntryType.Warning, 4001);
                     return false;
@@ -709,7 +832,7 @@ namespace EventLogOutEmployeeService
                 bool needsRaw     = item.WriteRawRecord && !item.RawRecordDispatched;
                 bool needsSummary = ShouldProcessSummary(item) && !item.SummaryDispatched;
 
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"[DISPATCH] queueId={item.QueueId} eventId={item.EventId} user={item.Username} " +
                     $"time={item.EventTime:O} needsRaw={needsRaw} needsSummary={needsSummary} " +
                     $"eventType='{item.EventType}' shutdownType='{item.ShutdownType ?? "(null)"}'",
@@ -723,7 +846,7 @@ namespace EventLogOutEmployeeService
 
                     await eventQueue.UpdateDispatchStateAsync(item.QueueId, rawRecordDispatched: true);
                     item.RawRecordDispatched = true;
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DISPATCH] Raw record sent: queueId={item.QueueId} eventId={item.EventId} user={item.Username}",
                         EventLogEntryType.Information, 4003);
                 }
@@ -732,7 +855,7 @@ namespace EventLogOutEmployeeService
                 {
                     if (item.EventId == 4624)
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             $"[DISPATCH] Sending summary login: user={item.Username} computer={item.ComputerName} " +
                             $"loginTime={item.LoginTime?.ToString("O") ?? item.EventTime.ToString("O")}",
                             EventLogEntryType.Information, 4004);
@@ -743,7 +866,7 @@ namespace EventLogOutEmployeeService
                     }
                     else
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             $"[DISPATCH] Sending summary shutdown: user={item.Username} computer={item.ComputerName} " +
                             $"shutdownTime={item.ShutdownTime?.ToString("O") ?? item.EventTime.ToString("O")} " +
                             $"eventId={item.EventId} eventType='{item.EventType}'",
@@ -757,7 +880,7 @@ namespace EventLogOutEmployeeService
 
                     await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
                     item.SummaryDispatched = true;
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DISPATCH] Summary dispatched: queueId={item.QueueId} eventId={item.EventId} user={item.Username}",
                         EventLogEntryType.Information, 4006);
                 }
@@ -765,7 +888,7 @@ namespace EventLogOutEmployeeService
                 bool doneRaw     = !item.WriteRawRecord || item.RawRecordDispatched;
                 bool doneSummary = !ShouldProcessSummary(item) || item.SummaryDispatched;
 
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"[DISPATCH] Done: queueId={item.QueueId} doneRaw={doneRaw} doneSummary={doneSummary}",
                     EventLogEntryType.Information, 4007);
 
@@ -773,7 +896,7 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Dispatch failed: queueId={item.QueueId} eventId={item.EventId} user={item.Username} " +
                     $"time={item.EventTime:O} error={ex.GetType().Name}: {ex.Message}",
                     EventLogEntryType.Warning, 1028);
@@ -815,7 +938,7 @@ namespace EventLogOutEmployeeService
                 catch (TaskCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"Error in CleanupOldRecordsTask: {ex.Message}",
                         EventLogEntryType.Warning, 1008);
                     try { await Task.Delay(TimeSpan.FromHours(1), cancellationToken); }
@@ -826,10 +949,44 @@ namespace EventLogOutEmployeeService
 
         // ─── Event handlers ──────────────────────────────────────────────────────
 
-        private async void OnSecurityEventWritten(object sender, EntryWrittenEventArgs e)
+        private void OnSecurityEventWritten(object sender, EntryWrittenEventArgs e)
         {
             if (e?.Entry == null) return;
-            await ProcessSecurityEntryAsync(e.Entry, writeRawRecord: true);
+
+            EventLogEntry entry = e.Entry;
+            if (ShouldSkipLiveEntryDuringReplay(entry.TimeGenerated))
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await ProcessSecurityEntryAsync(entry, writeRawRecord: true);
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"Unhandled exception in OnSecurityEventWritten: {ex}",
+                        EventLogEntryType.Error, 9997);
+                    SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                }
+            });
+        }
+
+        private bool ShouldSkipLiveEntryDuringReplay(DateTime eventTime)
+        {
+            if (!replayInProgress)
+                return false;
+
+            if (eventTime <= replayUpperBound)
+            {
+                SafeWriteEventLog("Application",
+                    $"Live event skipped during replay overlap: eventTime={eventTime:O} replayUpperBound={replayUpperBound:O}",
+                    EventLogEntryType.Information, 1037);
+                return true;
+            }
+
+            return false;
         }
 
         private async Task ProcessSecurityEntryAsync(EventLogEntry log, bool writeRawRecord)
@@ -866,16 +1023,34 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Error in ProcessSecurityEntryAsync: {ex.Message}",
                     EventLogEntryType.Warning, 1009);
             }
         }
 
-        private async void OnSystemEventWritten(object sender, EntryWrittenEventArgs e)
+        private void OnSystemEventWritten(object sender, EntryWrittenEventArgs e)
         {
             if (e?.Entry == null) return;
-            await ProcessSystemEntryAsync(e.Entry, writeRawRecord: true);
+
+            EventLogEntry entry = e.Entry;
+            if (ShouldSkipLiveEntryDuringReplay(entry.TimeGenerated))
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await ProcessSystemEntryAsync(entry, writeRawRecord: true);
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"Unhandled exception in OnSystemEventWritten: {ex}",
+                        EventLogEntryType.Error, 9996);
+                    SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                }
+            });
         }
 
         private async Task ProcessSystemEntryAsync(EventLogEntry log, bool writeRawRecord)
@@ -894,7 +1069,7 @@ namespace EventLogOutEmployeeService
                 {
                     if (log.Message == null)
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             $"[DBG-1074] EventId=1074 at {eventTime:O} has NULL message — skipping.",
                             EventLogEntryType.Warning, 2001);
                         return;
@@ -902,7 +1077,7 @@ namespace EventLogOutEmployeeService
 
                     // Log first 300 chars of message so we can verify regex match
                     string preview = log.Message.Length > 300 ? log.Message.Substring(0, 300) : log.Message;
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-1074] at {eventTime:O} | MessagePreview: {preview}",
                         EventLogEntryType.Information, 2002);
                 }
@@ -912,7 +1087,7 @@ namespace EventLogOutEmployeeService
 
                 if (eventId == 1074)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-1074] GetUserFromSystem1074Message returned: '{username ?? "(null)"}'",
                         EventLogEntryType.Information, 2003);
                 }
@@ -921,7 +1096,7 @@ namespace EventLogOutEmployeeService
                 {
                     string shutdownType = ParseShutdownType(eventMessage);
                     StoreLast1074State(username, eventTime, shutdownType);
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-1074] Stored state: Username={username} ShutdownType={shutdownType} Time={eventTime:O}",
                         EventLogEntryType.Information, 2004);
                 }
@@ -929,7 +1104,7 @@ namespace EventLogOutEmployeeService
                 if (eventId == 6006)
                 {
                     var (resolved, confirmed1074ShutdownType) = TryResolve1074StateFor6006(eventTime);
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-6006] at {eventTime:O} | resolved='{resolved ?? "(null)"}' " +
                         $"confirmed1074ShutdownType='{confirmed1074ShutdownType ?? "(unconfirmed)"}'",
                         EventLogEntryType.Information, 2005);
@@ -945,7 +1120,7 @@ namespace EventLogOutEmployeeService
                     lock (userLock)
                         fromLock = lastActiveUser;
 
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-{eventId}] username null after event parse, lastActiveUser='{fromLock ?? "(empty)"}'",
                         EventLogEntryType.Information, 2006);
 
@@ -955,14 +1130,14 @@ namespace EventLogOutEmployeeService
                 if (string.IsNullOrEmpty(username))
                 {
                     string? fromLog = GetMostRecentUser(eventTime);
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-{eventId}] username still null, GetMostRecentUser returned: '{fromLog ?? "(null)"}'",
                         EventLogEntryType.Information, 2007);
 
                     username = fromLog;
                     if (string.IsNullOrEmpty(username))
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             $"[DBG-{eventId}] DROPPING event at {eventTime:O} — no username could be resolved.",
                             EventLogEntryType.Warning, 2008);
                         return;
@@ -977,7 +1152,7 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Error in ProcessSystemEntryAsync: {ex.Message}",
                     EventLogEntryType.Warning, 1010);
             }
@@ -1061,14 +1236,14 @@ namespace EventLogOutEmployeeService
 
                 if (!enqueued)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"Duplicate event skipped: EventId={eventId} User={username} Time={eventTime:HH:mm:ss}",
                         EventLogEntryType.Information, 1016);
                 }
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Error in ProcessEvent: {ex.Message}",
                     EventLogEntryType.Warning, 1011);
             }
@@ -1263,7 +1438,7 @@ namespace EventLogOutEmployeeService
                     string candidate = domainMatch.Groups[1].Value.Trim();
                     if (IsValidUsername(candidate))
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             $"[DBG-1074] GetUserFromSystem1074Message: patterns 1+2 missed, broad fallback matched '{candidate}'",
                             EventLogEntryType.Information, 2020);
                         return candidate;
@@ -1272,7 +1447,7 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"[DBG-1074] GetUserFromSystem1074Message exception: {ex.Message}",
                     EventLogEntryType.Warning, 2021);
             }
@@ -1304,7 +1479,7 @@ namespace EventLogOutEmployeeService
             {
                 if (string.IsNullOrWhiteSpace(last1074Username))
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-6006] TryResolve: no prior 1074 state in memory.",
                         EventLogEntryType.Information, 2010);
                     return (null, null);
@@ -1315,7 +1490,7 @@ namespace EventLogOutEmployeeService
                 // but slow shutdowns (pending app close, etc.) can take up to 60s.
                 if (diffSeconds > 60)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-6006] TryResolve: diff={diffSeconds:F0}s exceeds 60s window. " +
                         $"last1074Time={last1074EventTime:O} 6006Time={eventTime:O}",
                         EventLogEntryType.Information, 2011);
@@ -1327,7 +1502,7 @@ namespace EventLogOutEmployeeService
                 bool isRestart = IsRestartShutdownType(last1074ShutdownType);
                 string? confirmedShutdownType = isRestart ? null : last1074ShutdownType;
 
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"[DBG-6006] TryResolve: matched username='{last1074Username}' diff={diffSeconds:F1}s " +
                     $"1074Type='{last1074ShutdownType}' isRestart={isRestart}",
                     EventLogEntryType.Information, 2012);
