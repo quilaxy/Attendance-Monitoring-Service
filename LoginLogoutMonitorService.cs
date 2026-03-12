@@ -824,10 +824,19 @@ namespace EventLogOutEmployeeService
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
         {
             // 4624: hanya proses summary kalau ini first login of day (IsSummaryEligible).
-            // 4624 berikutnya di hari yang sama tetap masuk raw list tapi skip summary
-            // agar tidak bikin duplikat row di SummaryListId.
             if (item.EventId == 4624)
                 return item.IsSummaryEligible;
+
+            // 1074 Restart: skip — bukan shutdown, tidak perlu tulis ShutdownTime.
+            if (item.EventId == 1074 &&
+                (item.EventType.Contains("Restart", StringComparison.OrdinalIgnoreCase) ||
+                 item.EventType.Contains("Reboot", StringComparison.OrdinalIgnoreCase)))
+                return false;
+
+            // 6006 Unconfirmed: tidak ada paired 1074 shutdown → kemungkinan restart → skip.
+            if (item.EventId == 6006 &&
+                item.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))
+                return false;
 
             return item.EventId == 1074 || item.EventId == 6006 ||
                    item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41;
