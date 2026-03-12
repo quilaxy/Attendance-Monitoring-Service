@@ -779,6 +779,8 @@ namespace EventLogOutEmployeeService
 
         private async Task ProcessQueuedEventsTask(CancellationToken cancellationToken)
         {
+            var retryCount = new Dictionary<string, int>();
+
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
@@ -803,21 +805,25 @@ namespace EventLogOutEmployeeService
 
                     if (sent)
                     {
+                        retryCount.Remove(next.QueueId);
                         await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
                         continue;
                     }
 
-                    // Kalau raw record sudah berhasil tapi summary gagal, increment retry counter.
-                    // Setelah 5x gagal, mark summary sebagai dispatched (skip) agar queue tidak stuck.
-                    next.SummaryRetryCount = (next.SummaryRetryCount ?? 0) + 1;
-                    if (next.SummaryRetryCount >= 5 &&
+                    // Kalau gagal, increment retry counter in-memory.
+                    // Setelah 5x gagal, skip summary agar queue tidak stuck.
+                    retryCount.TryGetValue(next.QueueId, out int count);
+                    retryCount[next.QueueId] = ++count;
+
+                    if (count >= 5 &&
                         (!next.WriteRawRecord || next.RawRecordDispatched) &&
                         ShouldProcessSummary(next) && !next.SummaryDispatched)
                     {
                         SafeWriteEventLog("Application",
-                            $"[DISPATCH] Summary permanently failed after {next.SummaryRetryCount} attempts — " +
+                            $"[DISPATCH] Summary permanently failed after {count} attempts — " +
                             $"skipping summary for queueId={next.QueueId} eventId={next.EventId} user={next.Username}",
                             EventLogEntryType.Warning, 1029);
+                        retryCount.Remove(next.QueueId);
                         await eventQueue.UpdateDispatchStateAsync(next.QueueId, summaryDispatched: true);
                         await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
                         continue;
