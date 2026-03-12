@@ -234,7 +234,7 @@ namespace EventLogOutEmployeeService
             int timeoutSeconds = isShutdown ? 10 : 30;
             int delayMs        = isShutdown ? 1000 : 3000;
 
-            string eventTimeStr = eventTime.ToString("yyyy-MM-ddTHH:mm:ss");
+            string eventTimeStr = ToUtcString(eventTime);
             string title        = $"{computerName}\\{eventId}\\{username}";
             Exception? lastException = null;
 
@@ -360,8 +360,8 @@ namespace EventLogOutEmployeeService
                     {
                         fields = new
                         {
-                            LoginTime       = loginTime.ToString("yyyy-MM-ddTHH:mm:ss"),
-                            ExpectedTimeOut = loginTime.AddHours(9).ToString("yyyy-MM-ddTHH:mm:ss")
+                            LoginTime       = ToUtcString(loginTime),
+                            ExpectedTimeOut = ToUtcString(loginTime.AddHours(9))
                         }
                     };
                     var patchContent = new StringContent(JsonConvert.SerializeObject(updateData), Encoding.UTF8, "application/json");
@@ -393,8 +393,8 @@ namespace EventLogOutEmployeeService
                     Username        = username,
                     ComputerName    = computerName,
                     WorkDate        = workDate,
-                    LoginTime       = loginTime.ToString("yyyy-MM-ddTHH:mm:ss"),
-                    ExpectedTimeOut = expectedTimeOut.ToString("yyyy-MM-ddTHH:mm:ss"),
+                    LoginTime       = ToUtcString(loginTime),
+                    ExpectedTimeOut = ToUtcString(expectedTimeOut),
                     ShutdownType    = string.Empty
                 }
             };
@@ -536,7 +536,7 @@ namespace EventLogOutEmployeeService
             {
                 fields = new
                 {
-                    ShutdownTime = shutdownTime.ToString("yyyy-MM-ddTHH:mm:ss"),
+                    ShutdownTime = ToUtcString(shutdownTime),
                     ShutdownType = shutdownTypeStr
                 }
             };
@@ -691,6 +691,14 @@ namespace EventLogOutEmployeeService
 
             return deletedCount;
         }
+
+        /// <summary>
+        /// Converts a local DateTime to UTC and formats as ISO 8601 with Z suffix.
+        /// SharePoint Graph API accepts this format and auto-converts for display
+        /// based on the site's Regional Settings timezone (e.g. UTC+7).
+        /// </summary>
+        private static string ToUtcString(DateTime dt)
+            => dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
 
         private HttpClient CreateGraphClient(string accessToken, int timeoutSeconds)
         {
