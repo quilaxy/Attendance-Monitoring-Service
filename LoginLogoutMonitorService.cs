@@ -1045,6 +1045,15 @@ namespace EventLogOutEmployeeService
                 if (eventId == 4624 && !IsRelevantLogonType(logonType))
                     return;
 
+                // Skip admin (UAC split token) logins.
+                // Windows membuat 2 event 4624 untuk admin login:
+                //   - Elevated Token: Yes  (high integrity token)
+                //   - Elevated Token: No   (filtered standard token)
+                // Keduanya punya Linked Logon ID non-zero yang saling pointing.
+                // Kalau Linked Logon ID != 0x0 → ini bagian dari admin split token → skip.
+                if (eventId == 4624 && IsAdminSplitTokenLogin(eventMessage))
+                    return;
+
                 string? username = GetUsernameFromEvent(eventMessage, eventId);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
                     return;
@@ -1351,6 +1360,33 @@ namespace EventLogOutEmployeeService
             }
             catch { /* silent fail */ }
             return 0;
+        }
+
+        /// <summary>
+        /// Deteksi admin login via UAC split token.
+        /// Windows membuat 2 event 4624 untuk admin login — satu dengan Elevated Token: Yes
+        /// (high integrity) dan satu dengan Elevated Token: No (filtered standard token).
+        /// Keduanya punya Linked Logon ID non-zero yang saling pointing satu sama lain.
+        ///
+        /// Kalau Linked Logon ID != 0x0000000000000000 → ini bagian dari split token pair
+        /// → skip kedua event, karena login admin tidak perlu di-record sebagai attendance.
+        /// </summary>
+        private static bool IsAdminSplitTokenLogin(string? message)
+        {
+            if (string.IsNullOrEmpty(message)) return false;
+            try
+            {
+                var match = Regex.Match(message,
+                    @"Linked Logon ID:\s*(0x[0-9A-Fa-f]+)",
+                    RegexOptions.IgnoreCase);
+                if (!match.Success) return false;
+
+                string linkedId = match.Groups[1].Value.Trim();
+                // 0x0 atau 0x0000000000000000 = tidak ada linked logon = bukan split token
+                long parsed = Convert.ToInt64(linkedId, 16);
+                return parsed != 0;
+            }
+            catch { return false; }
         }
 
         /// <summary>
