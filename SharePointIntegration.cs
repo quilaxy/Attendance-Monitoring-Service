@@ -320,7 +320,8 @@ namespace EventLogOutEmployeeService
         ///   • If the row does not exist, create it now.
         /// </summary>
         public async Task UpsertDailySummaryLoginAsync(
-            string accessToken, string username, string computerName, DateTime loginTime)
+            string accessToken, string username, string computerName, DateTime loginTime,
+            SummaryCache? summaryCache = null)
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
@@ -333,29 +334,71 @@ namespace EventLogOutEmployeeService
                 $"loginTime={loginTime:O} workDate={workDate} summaryKey={summaryKey}",
                 EventLogEntryType.Information, 3001);
 
-            using var client = CreateGraphClient(accessToken, 30);
-            var existingItems = await FindSummaryItemAsync(client, summaryKey);
+            // ── Cache check: kalau summaryKey sudah ada di cache lokal, row pasti
+            // sudah ada di SharePoint — skip query sama sekali.
+            if (summaryCache != null && await summaryCache.ContainsAsync(summaryKey))
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] UpsertLogin: cache hit — row already exists for summaryKey={summaryKey}, skipping",
+                    EventLogEntryType.Information, 3007);
+                return;
+            }
+
+            using var client = CreateGraphClient(accessToken, 60);
+            var existingItems = await FindSummaryItemWithRetryAsync(client, summaryKey);
 
             if (existingItems != null && existingItems.Count > 0)
             {
-                // Row already exists — check if stored LoginTime is later than this event.
-                // If so, update it to the earlier time (handles replay ordering edge-cases).
-                var existing = existingItems[0];
-                string? itemId = existing?["id"]?.ToString();
-                var fields = existing?["fields"] as JObject;
+                // Pilih row dengan LoginTime paling awal sebagai row canonical.
+                // Kalau ada duplikat (dari bug lama), hapus yang lain.
+                JToken? canonical = null;
+                DateTime? canonicalLogin = null;
+
+                foreach (var candidate in existingItems)
+                {
+                    var cFields = candidate["fields"] as JObject;
+                    DateTime? cLogin = ParseFieldDateTime(cFields, "LoginTime");
+                    if (canonical == null || (cLogin.HasValue && (!canonicalLogin.HasValue || cLogin.Value < canonicalLogin.Value)))
+                    {
+                        canonical = candidate;
+                        canonicalLogin = cLogin;
+                    }
+                }
+
+                // Hapus duplikat (kalau ada lebih dari 1 row)
+                if (existingItems.Count > 1)
+                {
+                    foreach (var dup in existingItems)
+                    {
+                        string? dupId = dup["id"]?.ToString();
+                        if (dupId == canonical?["id"]?.ToString() || string.IsNullOrWhiteSpace(dupId))
+                            continue;
+
+                        SafeWriteEventLog("Application",
+                            $"[DBG-Summary] UpsertLogin: deleting duplicate row itemId={dupId} summaryKey={summaryKey}",
+                            EventLogEntryType.Warning, 3006);
+
+                        using var delRequest = new HttpRequestMessage(HttpMethod.Delete,
+                            $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{dupId}");
+                        await client.SendAsync(delRequest); // best-effort, ignore failure
+                    }
+                }
+
+                string? itemId = canonical?["id"]?.ToString();
+                var fields = canonical?["fields"] as JObject;
                 DateTime? storedLogin = ParseFieldDateTime(fields, "LoginTime");
 
                 SafeWriteEventLog("Application",
-                    $"[DBG-Summary] UpsertLogin: row exists itemId={itemId} storedLogin={storedLogin?.ToString("O") ?? "(null)"} incoming={loginTime:O}",
+                    $"[DBG-Summary] UpsertLogin: row exists itemId={itemId} storedLogin={storedLogin?.ToString("O") ?? "(null)"} incoming={loginTime:O} totalFound={existingItems.Count}",
                     EventLogEntryType.Information, 3002);
 
+                // Update ke loginTime yang lebih awal kalau perlu
                 if (storedLogin.HasValue && loginTime < storedLogin.Value && !string.IsNullOrWhiteSpace(itemId))
                 {
                     SafeWriteEventLog("Application",
                         $"[DBG-Summary] UpsertLogin: updating to earlier loginTime={loginTime:O}",
                         EventLogEntryType.Information, 3003);
 
-                    // Replace with earlier login
                     var updateData = new
                     {
                         fields = new
@@ -376,6 +419,10 @@ namespace EventLogOutEmployeeService
                             $"Failed to update earlier LoginTime for summary key '{summaryKey}' (item {itemId}). Status={patchResponse.StatusCode} Body={body}");
                     }
                 }
+
+                // Tulis ke cache: row sudah confirmed ada di SharePoint
+                if (summaryCache != null)
+                    await summaryCache.AddAsync(summaryKey);
 
                 return; // row exists — nothing more to do
             }
@@ -413,6 +460,10 @@ namespace EventLogOutEmployeeService
             SafeWriteEventLog("Application",
                 $"[DBG-Summary] UpsertLogin: successfully created row for summaryKey={summaryKey}",
                 EventLogEntryType.Information, 3005);
+
+            // Tulis ke cache setelah row berhasil di-create di SharePoint
+            if (summaryCache != null)
+                await summaryCache.AddAsync(summaryKey);
         }
 
         // ── Summary list — Shutdown ───────────────────────────────────────────────
@@ -730,15 +781,16 @@ namespace EventLogOutEmployeeService
         private async Task<JToken?> FindSummaryItemForShutdownAsync(
             HttpClient client, string computerName, string username, DateTime shutdownTime)
         {
-            // Prefer same-day summary row.
+            // Prefer same-day summary row. Pakai retry karena shutdown bisa di-dispatch
+            // sebelum login row ter-index di SharePoint (eventual consistency).
             string todayKey = BuildSummaryKey(computerName, username, shutdownTime.ToString("yyyy-MM-dd"));
-            var todayItems = await FindSummaryItemAsync(client, todayKey);
+            var todayItems = await FindSummaryItemWithRetryAsync(client, todayKey);
             if (todayItems != null && todayItems.Count > 0)
                 return todayItems[0];
 
             // Fallback: previous-day row for overnight sessions.
             string yesterdayKey = BuildSummaryKey(computerName, username, shutdownTime.AddDays(-1).ToString("yyyy-MM-dd"));
-            var yesterdayItems = await FindSummaryItemAsync(client, yesterdayKey);
+            var yesterdayItems = await FindSummaryItemWithRetryAsync(client, yesterdayKey);
             if (yesterdayItems == null || yesterdayItems.Count == 0)
                 return null;
 
@@ -758,7 +810,7 @@ namespace EventLogOutEmployeeService
         private async Task<JArray?> FindSummaryItemAsync(HttpClient client, string summaryKey)
         {
             string findUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items" +
-                $"?$expand=fields&$filter=fields/Title eq '{EscapeODataLiteral(summaryKey)}'&$top=1";
+                $"?$expand=fields&$filter=fields/Title eq '{EscapeODataLiteral(summaryKey)}'&$top=5";
 
             var findResponse = await client.GetAsync(findUrl);
             if (!findResponse.IsSuccessStatusCode) return null;
@@ -767,6 +819,29 @@ namespace EventLogOutEmployeeService
                 await findResponse.Content.ReadAsStringAsync());
 
             return findObject?["value"] as JArray;
+        }
+
+        /// <summary>
+        /// FindSummaryItemAsync dengan retry — untuk UpsertDailySummaryLoginAsync yang butuh
+        /// kepastian row tidak ada sebelum create baru. Graph API eventual consistency bisa
+        /// menyebabkan row yang baru di-insert belum muncul di query berikutnya.
+        /// Retry 3x dengan delay 3s, 6s, 12s (total max ~21 detik).
+        /// </summary>
+        private async Task<JArray?> FindSummaryItemWithRetryAsync(HttpClient client, string summaryKey)
+        {
+            int[] delaysMs = { 3000, 6000, 12000 };
+
+            for (int attempt = 0; attempt <= delaysMs.Length; attempt++)
+            {
+                var result = await FindSummaryItemAsync(client, summaryKey);
+                if (result != null && result.Count > 0)
+                    return result;
+
+                if (attempt < delaysMs.Length)
+                    await Task.Delay(delaysMs[attempt]);
+            }
+
+            return null; // benar-benar tidak ada
         }
 
         private async Task<bool> RawRecordAlreadyExistsAsync(HttpClient client, string title, DateTime eventTime)
