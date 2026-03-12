@@ -80,7 +80,7 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Error loading SharePoint configuration: {ex.Message}",
                     EventLogEntryType.Error, 1012);
                 throw;
@@ -159,7 +159,7 @@ namespace EventLogOutEmployeeService
                     }
                     else
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             "[TOKEN] Waiting 30s for network on fresh boot...",
                             EventLogEntryType.Information, 4010);
                         Thread.Sleep(30000);
@@ -190,7 +190,7 @@ namespace EventLogOutEmployeeService
                     }
 
                     string errorBody = await response.Content.ReadAsStringAsync();
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[TOKEN] Attempt {attempt}/{maxRetries} failed: HTTP {(int)response.StatusCode} — {errorBody}",
                         EventLogEntryType.Warning, 4011);
 
@@ -199,7 +199,7 @@ namespace EventLogOutEmployeeService
                 }
                 catch (HttpRequestException ex) when (ex.InnerException is SocketException)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[TOKEN] Attempt {attempt}/{maxRetries} network error: {ex.Message}",
                         EventLogEntryType.Warning, 4012);
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs *= 2; }
@@ -207,7 +207,7 @@ namespace EventLogOutEmployeeService
                 }
                 catch (Exception ex)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[TOKEN] Attempt {attempt}/{maxRetries} exception: {ex.GetType().Name}: {ex.Message}",
                         EventLogEntryType.Warning, 4013);
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs *= 2; }
@@ -238,7 +238,7 @@ namespace EventLogOutEmployeeService
             string title        = $"{computerName}\\{eventId}\\{username}";
             Exception? lastException = null;
 
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"[RAW] Inserting: title='{title}' eventTime={eventTimeStr} eventType='{eventType}'",
                 EventLogEntryType.Information, 4020);
 
@@ -251,7 +251,7 @@ namespace EventLogOutEmployeeService
                     // ── Idempotency check ──────────────────────────────────────
                     if (await RawRecordAlreadyExistsAsync(client, title, eventTime))
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             $"[RAW] Idempotency: record already exists for title='{title}' at {eventTimeStr} — skipping insert.",
                             EventLogEntryType.Information, 4021);
                         return;
@@ -277,7 +277,7 @@ namespace EventLogOutEmployeeService
 
                     if (response.IsSuccessStatusCode)
                     {
-                        EventLog.WriteEntry("Application",
+                        SafeWriteEventLog("Application",
                             $"[RAW] Insert success: title='{title}' at {eventTimeStr}",
                             EventLogEntryType.Information, 4022);
                         return;
@@ -287,7 +287,7 @@ namespace EventLogOutEmployeeService
                     lastException = new InvalidOperationException(
                         $"Raw list insert failed HTTP {(int)response.StatusCode} for {title} at {eventTimeStr}: {responseBody}");
 
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[RAW] Insert attempt {attempt}/{maxRetries} failed: HTTP {(int)response.StatusCode} — {responseBody}",
                         EventLogEntryType.Warning, 4023);
 
@@ -296,7 +296,7 @@ namespace EventLogOutEmployeeService
                 catch (Exception ex)
                 {
                     lastException = ex;
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[RAW] Insert attempt {attempt}/{maxRetries} exception: {ex.GetType().Name}: {ex.Message}",
                         EventLogEntryType.Warning, 4024);
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs = Math.Min(delayMs * 2, 10000); }
@@ -328,7 +328,7 @@ namespace EventLogOutEmployeeService
             string summaryKey  = BuildSummaryKey(computerName, username, workDate);
             DateTime expectedTimeOut = loginTime.AddHours(9);
 
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"[DBG-Summary] UpsertLogin: user={username} computer={computerName} " +
                 $"loginTime={loginTime:O} workDate={workDate} summaryKey={summaryKey}",
                 EventLogEntryType.Information, 3001);
@@ -345,13 +345,13 @@ namespace EventLogOutEmployeeService
                 var fields = existing?["fields"] as JObject;
                 DateTime? storedLogin = ParseFieldDateTime(fields, "LoginTime");
 
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"[DBG-Summary] UpsertLogin: row exists itemId={itemId} storedLogin={storedLogin?.ToString("O") ?? "(null)"} incoming={loginTime:O}",
                     EventLogEntryType.Information, 3002);
 
                 if (storedLogin.HasValue && loginTime < storedLogin.Value && !string.IsNullOrWhiteSpace(itemId))
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[DBG-Summary] UpsertLogin: updating to earlier loginTime={loginTime:O}",
                         EventLogEntryType.Information, 3003);
 
@@ -381,7 +381,7 @@ namespace EventLogOutEmployeeService
             }
 
             // ── Create new summary row ────────────────────────────────────────────
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"[DBG-Summary] UpsertLogin: creating new row for summaryKey={summaryKey}",
                 EventLogEntryType.Information, 3004);
 
@@ -410,7 +410,7 @@ namespace EventLogOutEmployeeService
                     $"Failed to create summary login row for key '{summaryKey}'. Status={createResponse.StatusCode} Body={body}");
             }
 
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"[DBG-Summary] UpsertLogin: successfully created row for summaryKey={summaryKey}",
                 EventLogEntryType.Information, 3005);
         }
@@ -436,7 +436,7 @@ namespace EventLogOutEmployeeService
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"[DBG-Summary] TryUpdateShutdown: user={username} computer={computerName} " +
                 $"shutdownTime={shutdownTime:O} eventId={eventId} eventType='{eventType}'",
                 EventLogEntryType.Information, 3010);
@@ -445,7 +445,7 @@ namespace EventLogOutEmployeeService
             var summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime);
             if (summaryItem == null)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"[DBG-Summary] TryUpdateShutdown: SKIP — no matching summary row for user={username} " +
                     $"computer={computerName} shutdownTime={shutdownTime:O}",
                     EventLogEntryType.Information, 3011);
@@ -461,7 +461,7 @@ namespace EventLogOutEmployeeService
             DateTime? currentShutdown = ParseFieldDateTime(fields, "ShutdownTime");
             string? currentShutdownType = fields?["ShutdownType"]?.ToString();
 
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"[DBG-Summary] TryUpdateShutdown: found row itemId={itemId} " +
                 $"loginTime={loginTime?.ToString("O") ?? "(null)"} " +
                 $"expectedTimeOut={expectedTimeOut?.ToString("O") ?? "(null)"} " +
@@ -471,7 +471,7 @@ namespace EventLogOutEmployeeService
 
             if (!IsValidShutdownCandidate(eventId, eventType, shutdownTime, loginTime, expectedTimeOut))
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"[DBG-Summary] TryUpdateShutdown: SKIP — IsValidShutdownCandidate=false " +
                     $"eventId={eventId} eventType='{eventType}' shutdownTime={shutdownTime:O} " +
                     $"loginTime={loginTime?.ToString("O") ?? "(null)"} expectedTimeOut={expectedTimeOut?.ToString("O") ?? "(null)"}",
@@ -482,31 +482,54 @@ namespace EventLogOutEmployeeService
             int newPriority     = GetShutdownPriority(eventId, eventType);
             int currentPriority = GetPriorityFromShutdownType(currentShutdownType);
 
-            if (newPriority < currentPriority)
+            // FIX [NEW-SESSION]: Kalau shutdown baru terjadi SETELAH shutdown yang tersimpan,
+            // artinya user sudah login lagi (sesi baru) lalu shutdown lagi.
+            // Dalam kasus ini, abaikan priority lama — shutdown terbaru selalu lebih relevan.
+            // Contoh: 6006 jam 09:00 (priority 5) lalu login jam 13:00 lalu 4647 jam 17:00 (priority 2)
+            // → tanpa fix: 4647 di-skip karena priority lebih rendah, ShutdownTime tetap 09:00 ❌
+            // → dengan fix: 4647 jam 17:00 > 6006 jam 09:00 → reset priority, tulis 17:00 ✅
+            bool isNewSession = currentShutdown.HasValue && shutdownTime > currentShutdown.Value;
+            if (isNewSession)
             {
-                EventLog.WriteEntry("Application",
-                    $"[DBG-Summary] TryUpdateShutdown: SKIP — priority too low: new={newPriority} current={currentPriority} " +
-                    $"(existing='{currentShutdownType}')",
-                    EventLogEntryType.Information, 3014);
-                return;
-            }
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] TryUpdateShutdown: NEW SESSION detected — " +
+                    $"incoming shutdownTime ({shutdownTime:O}) > existing ({currentShutdown.Value:O}). " +
+                    $"Resetting priority comparison. new={newPriority} old={currentPriority}",
+                    EventLogEntryType.Information, 3018);
 
-            if (newPriority == currentPriority)
+                // Sesi baru → tulis langsung tanpa cek priority lama.
+                // ShutdownTime yang lebih baru sudah pasti lebih relevan untuk absensi.
+            }
+            else
             {
-                if (currentShutdown.HasValue && currentShutdown.Value >= shutdownTime)
+                // Sesi yang sama — terapkan priority system normal.
+                if (newPriority < currentPriority)
                 {
-                    EventLog.WriteEntry("Application",
-                        $"[DBG-Summary] TryUpdateShutdown: SKIP — same priority, existing time is later: " +
-                        $"existing={currentShutdown.Value:O} incoming={shutdownTime:O}",
-                        EventLogEntryType.Information, 3015);
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown: SKIP — priority too low: new={newPriority} current={currentPriority} " +
+                        $"(existing='{currentShutdownType}')",
+                        EventLogEntryType.Information, 3014);
                     return;
+                }
+
+                if (newPriority == currentPriority)
+                {
+                    if (currentShutdown.HasValue && currentShutdown.Value >= shutdownTime)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-Summary] TryUpdateShutdown: SKIP — same priority, existing time is later: " +
+                            $"existing={currentShutdown.Value:O} incoming={shutdownTime:O}",
+                            EventLogEntryType.Information, 3015);
+                        return;
+                    }
                 }
             }
 
             string shutdownTypeStr = BuildShutdownType(eventId, eventType);
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"[DBG-Summary] TryUpdateShutdown: PATCHING itemId={itemId} " +
-                $"shutdownTime={shutdownTime:O} shutdownType='{shutdownTypeStr}' priority={newPriority}",
+                $"shutdownTime={shutdownTime:O} shutdownType='{shutdownTypeStr}' " +
+                $"priority={newPriority} isNewSession={isNewSession}",
                 EventLogEntryType.Information, 3016);
 
             var updateData = new
@@ -531,7 +554,7 @@ namespace EventLogOutEmployeeService
                     $"Status={patchResult.StatusCode} Body={body}");
             }
 
-            EventLog.WriteEntry("Application",
+            SafeWriteEventLog("Application",
                 $"[DBG-Summary] TryUpdateShutdown: PATCH success itemId={itemId}",
                 EventLogEntryType.Information, 3017);
         }
@@ -559,7 +582,7 @@ namespace EventLogOutEmployeeService
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("Application",
+                SafeWriteEventLog("Application",
                     $"Error in cleanup task: {ex.Message}",
                     EventLogEntryType.Warning, 1013);
             }
@@ -615,6 +638,25 @@ namespace EventLogOutEmployeeService
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             return client;
+        }
+
+        /// <summary>
+        /// Never throws — safe to call from any context including shutdown and crash handlers.
+        /// Mirrors the same helper in LoginLogoutMonitorService.
+        /// Direct EventLog.WriteEntry can throw SecurityException (source not registered)
+        /// or InvalidOperationException (EventLog service shutting down) — both would cause
+        /// unhandled exceptions on background threads, contributing to 0xe0434352 crashes.
+        /// </summary>
+        private static void SafeWriteEventLog(string source, string message, EventLogEntryType type, int eventId)
+        {
+            try
+            {
+                EventLog.WriteEntry(source, message, type, eventId);
+            }
+            catch
+            {
+                // Suppress all EventLog failures silently.
+            }
         }
 
         private async Task<JToken?> FindSummaryItemForShutdownAsync(
@@ -689,7 +731,7 @@ namespace EventLogOutEmployeeService
                 // A wide window is safe because title already encodes ComputerName+EventId+Username.
                 if (Math.Abs((existingUtc - eventUtc).TotalSeconds) <= 60)
                 {
-                    EventLog.WriteEntry("Application",
+                    SafeWriteEventLog("Application",
                         $"[RAW] Idempotency hit: title='{title}' existing={existingUtc:O} incoming={eventUtc:O} " +
                         $"diff={(existingUtc - eventUtc).TotalSeconds:F1}s",
                         EventLogEntryType.Information, 4025);
