@@ -807,6 +807,22 @@ namespace EventLogOutEmployeeService
                         continue;
                     }
 
+                    // Kalau raw record sudah berhasil tapi summary gagal, increment retry counter.
+                    // Setelah 5x gagal, mark summary sebagai dispatched (skip) agar queue tidak stuck.
+                    next.SummaryRetryCount = (next.SummaryRetryCount ?? 0) + 1;
+                    if (next.SummaryRetryCount >= 5 &&
+                        (!next.WriteRawRecord || next.RawRecordDispatched) &&
+                        ShouldProcessSummary(next) && !next.SummaryDispatched)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DISPATCH] Summary permanently failed after {next.SummaryRetryCount} attempts — " +
+                            $"skipping summary for queueId={next.QueueId} eventId={next.EventId} user={next.Username}",
+                            EventLogEntryType.Warning, 1029);
+                        await eventQueue.UpdateDispatchStateAsync(next.QueueId, summaryDispatched: true);
+                        await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
+                        continue;
+                    }
+
                     await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
                 }
                 catch (TaskCanceledException) { break; }
