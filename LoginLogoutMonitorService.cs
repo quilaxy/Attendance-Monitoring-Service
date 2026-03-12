@@ -477,13 +477,16 @@ namespace EventLogOutEmployeeService
             {
                 try
                 {
-                    SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                    // Heartbeat menulis Now tanpa pengurangan — per-event sudah handle
+                    // akurasi (eventTime - 1 detik). Heartbeat hanya safety net saat idle.
+                    // Interval 1 menit cukup: worst-case gap = 59 detik, di-cover replay 7 hari.
+                    SaveStopCheckpoint(DateTime.Now);
                 }
                 catch
                 {
                     // Heartbeat must never crash service.
                 }
-            }, null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+            }, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
         }
 
         private static void SafeWriteEventLog(string source, string message, EventLogEntryType type, int eventId)
@@ -684,11 +687,18 @@ namespace EventLogOutEmployeeService
                 RequestAdditionalTime(8000);
 
                 // ── Step 2: Save checkpoint FIRST, before anything else.
-                // If Windows kills us after this line, replay will still cover missed events.
-                DateTime stopCheckpoint = DateTime.Now.AddMinutes(-5);
+                // Hanya tulis kalau kandidat lebih baru dari checkpoint yang sudah ada —
+                // jangan mundurkan checkpoint yang sudah akurat dari per-event atau heartbeat.
+                // Now - 5 detik sebagai buffer kecil agar event yang sedang in-flight tidak terpotong.
+                DateTime candidate = DateTime.Now.AddSeconds(-5);
+                DateTime? existing = TryLoadCheckpoint(stopCheckpointPath);
+                DateTime stopCheckpoint = (existing.HasValue && existing.Value > candidate)
+                    ? existing.Value
+                    : candidate;
 
                 SafeWriteEventLog("Application",
-                    $"{caller}: saving checkpoint {stopCheckpoint:O} to {stopCheckpointPath}",
+                    $"{caller}: saving checkpoint {stopCheckpoint:O} " +
+                    $"(candidate={candidate:O} existing={existing?.ToString("O") ?? "(none)"})",
                     EventLogEntryType.Information, 1018);
 
                 SaveStopCheckpoint(stopCheckpoint);
@@ -1239,6 +1249,14 @@ namespace EventLogOutEmployeeService
                     SafeWriteEventLog("Application",
                         $"Duplicate event skipped: EventId={eventId} User={username} Time={eventTime:HH:mm:ss}",
                         EventLogEntryType.Information, 1016);
+                }
+                else
+                {
+                    // FIX [CRASH-0xe0434352]: Checkpoint per-event — tulis setiap kali event
+                    // berhasil masuk queue. eventTime - 1 detik agar event ini ikut di-replay
+                    // kalau service restart sebelum dispatch selesai.
+                    // Heartbeat 1 menit sebagai safety net saat idle (tidak ada event masuk).
+                    SaveStopCheckpoint(eventTime.AddSeconds(-1));
                 }
             }
             catch (Exception ex)
