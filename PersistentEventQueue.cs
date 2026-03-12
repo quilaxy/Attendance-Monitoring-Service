@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -214,12 +215,47 @@ namespace EventLogOutEmployeeService
         private async Task<List<QueuedAttendanceEvent>> ReadAllInternalAsync()
         {
             EnsureQueueFile();
+
             string content = await File.ReadAllTextAsync(filePath);
             if (string.IsNullOrWhiteSpace(content))
                 return new List<QueuedAttendanceEvent>();
 
-            return JsonConvert.DeserializeObject<List<QueuedAttendanceEvent>>(content)
-                   ?? new List<QueuedAttendanceEvent>();
+            try
+            {
+                return JsonConvert.DeserializeObject<List<QueuedAttendanceEvent>>(content)
+                       ?? new List<QueuedAttendanceEvent>();
+            }
+            catch (JsonException ex)
+            {
+                string backupPath = Path.Combine(
+                    Path.GetDirectoryName(filePath) ?? string.Empty,
+                    $"{Path.GetFileName(filePath)}.bak");
+
+                if (File.Exists(backupPath))
+                {
+                    try
+                    {
+                        string backupContent = await File.ReadAllTextAsync(backupPath);
+                        var backupItems = JsonConvert.DeserializeObject<List<QueuedAttendanceEvent>>(backupContent)
+                                          ?? new List<QueuedAttendanceEvent>();
+
+                        SafeQueueLog($"ReadAllInternalAsync recovered from backup after JsonException: {ex.Message}",
+                            EventLogEntryType.Warning, 1040);
+
+                        return backupItems;
+                    }
+                    catch (Exception backupEx)
+                    {
+                        SafeQueueLog($"ReadAllInternalAsync backup recovery failed: {backupEx.Message}",
+                            EventLogEntryType.Warning, 1041);
+                    }
+                }
+
+                SafeQueueLog($"ReadAllInternalAsync JSON corrupted; resetting queue content. Error: {ex.Message}",
+                    EventLogEntryType.Warning, 1042);
+
+                return new List<QueuedAttendanceEvent>();
+            }
         }
 
         private async Task WriteAllInternalAsync(List<QueuedAttendanceEvent> items)
@@ -241,6 +277,18 @@ namespace EventLogOutEmployeeService
             else
             {
                 File.Move(tempPath, filePath);
+            }
+        }
+
+        private static void SafeQueueLog(string message, EventLogEntryType type, int eventId)
+        {
+            try
+            {
+                EventLog.WriteEntry("Application", message, type, eventId);
+            }
+            catch
+            {
+                // Keep queue resilient even when EventLog provider is unavailable.
             }
         }
     }
