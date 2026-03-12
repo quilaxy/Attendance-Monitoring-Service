@@ -7,6 +7,7 @@ Dokumentasi ini mencakup **Event ID**, **checkpoint & replay system**, **dedupli
 Run as administrator
 
 ### 0.1 Publish
+dotnet build
 dotnet publish Attendance-Monitoring-Service.csproj -c Release -o ".\Attendance-Monitoring-Service" -p:DebugType=None
 
 ### 0.2 Install Service
