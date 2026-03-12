@@ -585,16 +585,19 @@ namespace EventLogOutEmployeeService
                 $"priority={newPriority} isNewSession={isNewSession}",
                 EventLogEntryType.Information, 3016);
 
-            var updateData = new
+            // PATCH ke /items/{id}/fields — body langsung berisi field values tanpa "fields" wrapper
+            var patchBody = new JObject
             {
-                fields = new
-                {
-                    ShutdownTime = ToUtcString(shutdownTime),
-                    ShutdownType = shutdownTypeStr
-                }
+                ["ShutdownTime"] = ToUtcString(shutdownTime),
+                ["ShutdownType"] = shutdownTypeStr
             };
 
-            var patchContent = new StringContent(JsonConvert.SerializeObject(updateData), Encoding.UTF8, "application/json");
+            string patchJson = patchBody.ToString(Newtonsoft.Json.Formatting.None);
+            SafeWriteEventLog("Application",
+                $"[DBG-Summary] TryUpdateShutdown: PATCH body={patchJson}",
+                EventLogEntryType.Information, 3022);
+
+            var patchContent = new StringContent(patchJson, Encoding.UTF8, "application/json");
             using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                 $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
             { Content = patchContent };
