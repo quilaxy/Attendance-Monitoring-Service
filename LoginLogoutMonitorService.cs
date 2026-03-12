@@ -820,7 +820,13 @@ namespace EventLogOutEmployeeService
 
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
         {
-            return item.EventId == 4624 || item.EventId == 1074 || item.EventId == 6006 ||
+            // 4624: hanya proses summary kalau ini first login of day (IsSummaryEligible).
+            // 4624 berikutnya di hari yang sama tetap masuk raw list tapi skip summary
+            // agar tidak bikin duplikat row di SummaryListId.
+            if (item.EventId == 4624)
+                return item.IsSummaryEligible;
+
+            return item.EventId == 1074 || item.EventId == 6006 ||
                    item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41;
         }
 
