@@ -328,8 +328,6 @@ Windows Event Log (Security + System)
 
 ## 4. Data Files
 
-### 3.1 Checkpoint Files
-
 Lokasi: `C:\ProgramData\Attendance-Monitoring-Service\`
 
 | File | Isi | Ditulis Kapan |
@@ -341,7 +339,7 @@ Lokasi: `C:\ProgramData\Attendance-Monitoring-Service\`
 | `summary-cache.json` | Keys summary yang sudah berhasil dikirim ke SharePoint | Setiap `UpsertDailySummaryLoginAsync` berhasil |
 | `summary-cache.json.bak` | Backup dari summary-cache sebelum write terakhir | Atomic write (File.Replace) |
 
-### 3.2 Atomic Write Pattern
+### 4.1 Atomic Write Pattern
 
 ```
 1. Tulis ke  → event-stop.checkpoint.tmp
@@ -356,14 +354,14 @@ Crash saat write → file `.tmp` rusak, file utama tetap valid.
 
 ## 5. Windows Event IDs Monitored
 
-### 4.1 Security Log
+### 5.1 Security Log
 
 | Event ID | Deskripsi |
 |----------|-----------|
 | 4624 | User login berhasil |
 | 4647 | User logout eksplisit |
 
-### 4.2 System Log
+### 5.2 System Log
 
 | Event ID | Deskripsi |
 |----------|-----------|
@@ -379,7 +377,7 @@ Crash saat write → file `.tmp` rusak, file utama tetap valid.
 
 Semua log ditulis ke **Windows Application Event Log**.
 
-### 5.1 Service Lifecycle
+### 6.1 Service Lifecycle
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -388,7 +386,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 1002 | Error | Gagal start setelah max retries |
 | 1004 | Error | Gagal decrypt konfigurasi |
 
-### 5.2 Checkpoint
+### 6.2 Checkpoint
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -405,7 +403,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 1027 | Warning | LoadStopCheckpoint: exception |
 | 1043 | Warning | LoadStopCheckpoint: replay checkpoint stale → clamp ke 7 hari |
 
-### 5.3 Replay
+### 6.3 Replay
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -420,7 +418,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 1037 | Info | Live event skipped during replay overlap |
 | 1038 | Info | Live event skipped — older than replayUpperBound (rate-limited: 1x/30 detik) |
 
-### 5.4 Queue & Dispatch
+### 6.4 Queue & Dispatch
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -439,7 +437,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 1041 | Warning | Queue: backup recovery failed |
 | 1042 | Warning | Queue: JSON corrupted, resetting queue |
 
-### 5.5 Debug System Event Parsing
+### 6.5 Debug System Event Parsing
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -457,7 +455,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 2020 | Info | DBG-1074: broad fallback matched candidate |
 | 2021 | Warning | DBG-1074: GetUserFromSystem1074Message exception |
 
-### 5.6 SharePoint Summary
+### 6.6 SharePoint Summary
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -484,7 +482,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 3021 | Info | FindSummaryItemAsync: result count |
 | 3022 | Info | TryUpdateShutdown: PATCH body |
 
-### 5.7 Dispatch & Raw List
+### 6.7 Dispatch & Raw List
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -495,6 +493,8 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 4005 | Info | DISPATCH: Sending summary shutdown |
 | 4006 | Info | DISPATCH: Summary dispatched |
 | 4007 | Info | DISPATCH: Done — doneRaw + doneSummary |
+| 4008 | Info | DISPATCH: Shutdown group hold — waiting for 6006 or timer |
+| 4009 | Info | DISPATCH: Shutdown group — 6006 already in group or higher priority exists, skipping summary |
 | 4010 | Info | Waiting 30 detik for network on fresh boot |
 | 4011 | Warning | Token attempt failed: HTTP status |
 | 4012 | Warning | Token attempt network error (SocketException) |
@@ -506,7 +506,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 4024 | Warning | RAW: Insert attempt exception |
 | 4025 | Info | RAW: Idempotency hit — title match dalam window ±60 detik |
 
-### 5.8 Cleanup
+### 6.8 Cleanup
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -517,7 +517,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 5005 | Warning | Cleanup gagal delete item — HTTP error (bukan 404) |
 | 5006 | Info | SummaryCache cleanup: removed N old entries |
 
-### 5.9 Crash & Unhandled Exceptions
+### 6.9 Crash & Unhandled Exceptions
 
 | Event ID | Level | Deskripsi |
 |----------|-------|-----------|
@@ -530,7 +530,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 
 ## 7. Login Filtering
 
-### 6.1 Logon Type
+### 7.1 Logon Type
 
 Hanya logon type berikut yang diproses:
 
@@ -545,7 +545,7 @@ Hanya logon type berikut yang diproses:
 | 5 | Service | ❌ |
 | Lainnya | — | ❌ |
 
-### 6.2 Username Filtering
+### 7.2 Username Filtering
 
 | Kondisi | Hasil |
 |---------|-------|
@@ -575,7 +575,7 @@ Keduanya memiliki field `Linked Logon ID` yang **non-zero** dan saling pointing 
 
 ## 9. Checkpoint System
 
-### 8.1 Writers
+### 9.1 Writers
 
 | Layer | Trigger | Value Ditulis | Tujuan |
 |-------|---------|---------------|--------|
@@ -586,7 +586,7 @@ Keduanya memiliki field `Linked Logon ID` yang **non-zero** dan saling pointing 
 
 **Guard:** Per-event hanya menulis jika `candidate > existingCheckpoint` — tidak pernah mundur. Tanpa ini, replay event lama bisa overwrite checkpoint hari ini.
 
-### 8.2 LoadStopCheckpoint — 4-Level Fallback
+### 9.2 LoadStopCheckpoint — 4-Level Fallback
 
 | Level | Kondisi | replayFrom | Event ID |
 |-------|---------|-----------|----------|
@@ -600,7 +600,7 @@ Keduanya memiliki field `Linked Logon ID` yang **non-zero** dan saling pointing 
 
 ## 10. Replay System
 
-### 9.1 Flow
+### 10.1 Flow
 
 ```
 OnStart()
@@ -629,13 +629,13 @@ OnStart()
 
 > **Catatan penting:** `EnableRaisingEvents = true` diaktifkan **sebelum** replay dimulai. Ini mencegah gap: event yang terjadi antara `replayTo` dan saat listener aktif akan muncul sebagai live event dan diproses dengan benar. Event yang terjadi sebelum `replayUpperBound` otomatis di-skip oleh `ShouldSkipLiveEntry`.
 
-### 9.2 Mengapa System Events Replay Dimulai 30 Detik Lebih Awal
+### 10.2 Mengapa System Events Replay Dimulai 30 Detik Lebih Awal
 
 1074 dan 6006 bisa terjadi bersamaan di detik yang sama (misalnya 15:53:04 dan 15:53:07). Checkpoint di-save sebagai `eventTime - 1 detik` sehingga 1074 di 15:53:04 menghasilkan checkpoint 15:53:03. Namun karena berbagai faktor timing, 1074 bisa jatuh 1–2 detik sebelum `replayFrom`.
 
 Dengan extend `replayFrom - 30 detik` untuk system events, 1074 selalu masuk replay dan state-nya ter-set di memory **sebelum** 6006 di-replay → pairing 1074↔6006 bekerja → 6006 jadi "Confirmed" bukan "Unconfirmed".
 
-### 9.3 Urutan Replay
+### 10.3 Urutan Replay
 
 | Alasan | Penjelasan |
 |--------|-----------|
@@ -643,7 +643,7 @@ Dengan extend `replayFrom - 30 detik` untuk system events, 1074 selalu masuk rep
 | 1074 sebelum 6006 | `TryResolve1074StateFor6006` butuh `last1074Username` di memory |
 | Sort ascending | Memastikan 1074 → 6006 diproses sesuai urutan kronologis |
 
-### 9.4 Live Event Filter
+### 10.4 Live Event Filter
 
 Filter `ShouldSkipLiveEntry` berlaku **permanen** (bukan hanya saat replay):
 
@@ -657,7 +657,7 @@ Ini menangani kasus Windows yang mem-fire event lama dari Security log saat `Ena
 
 ## 11. Deduplication
 
-### 10.1 Queue-Level Dedup
+### 11.1 Queue-Level Dedup
 
 `PersistentEventQueue.EnqueueIfNotDuplicateAsync`:
 
@@ -668,11 +668,11 @@ Ini menangani kasus Windows yang mem-fire event lama dari Security log saat `Ena
 
 Window 30 detik: cukup lebar untuk menangkap Windows yang kadang fire 2 event 4624 dalam selisih beberapa detik, tapi cukup kecil agar unlock dan login berikutnya tidak saling ter-dedup.
 
-### 10.2 Raw List Idempotency Check
+### 11.2 Raw List Idempotency Check
 
 Sebelum insert ke raw list, `RawRecordAlreadyExistsAsync` query SharePoint dengan filter `EventTime` window ±60 detik, lalu cocokkan `Title` dari hasil. Jika ada → skip insert.
 
-### 10.3 IsSummaryEligible
+### 11.3 IsSummaryEligible
 
 Field pada `QueuedAttendanceEvent` untuk event 4624:
 - `true` hanya jika belum ada 4624 lain dengan `Username+ComputerName+WorkDate` yang sama di queue
@@ -684,13 +684,49 @@ Field pada `QueuedAttendanceEvent` untuk event 4624:
 
 ## 12. Queue System
 
-### 11.1 PersistentEventQueue
+### 12.1 PersistentEventQueue
 
 File: `event-queue.json`
 
 Queue di-persist ke disk sehingga event yang belum di-dispatch ke SharePoint tidak hilang kalau service restart / crash.
 
-### 11.2 Dispatch Loop
+### 12.2 Shutdown Group
+
+Event 4647, 1074, dan 6006 yang terjadi dalam satu rangkaian shutdown dikelompokkan dalam satu **ShutdownGroup**. Tujuannya agar summary hanya di-dispatch oleh event dengan priority tertinggi di group — mencegah race condition antar event dalam rangkaian yang sama.
+
+**Group key** format: `shutdown_{ComputerName}_{Username}_{WorkDate}_{EpochMenit}`
+
+Epoch menit (bukan detik) dipakai agar event dalam window 60 detik yang sama masuk group yang sama meski ada selisih beberapa detik antar event.
+
+**Fields di `QueuedAttendanceEvent`:**
+
+| Field | Tipe | Keterangan |
+|-------|------|-----------|
+| `ShutdownGroupId` | `string?` | ID group. Null untuk event non-shutdown (4624, 6008, 41) |
+| `ShutdownGroupHoldUntil` | `DateTime?` | Batas waktu hold summary. 10 detik dari event pertama group |
+| `ShutdownGroupIsRestart` | `bool` | True jika 1074 di group adalah restart — semua member skip summary |
+
+**Hold logic saat dispatch:**
+
+```
+4647 / 1074 di queue, 6006 belum ada, timer belum habis (10 detik)
+  → raw dispatch langsung ✅
+  → summary DITAHAN (log 4008)
+
+6006 masuk queue → group lengkap
+  → 6006 dispatch summary (priority 5) ✅
+  → 4647 dan 1074 skip summary — 6006 sudah ada di group (log 4009) ✅
+
+Fast Startup (6006 tidak muncul) → timer 10 detik habis
+  → event dengan priority tertinggi yang ada dispatch summary ✅
+  → event lain skip summary (log 4009) ✅
+
+1074 Restart masuk queue
+  → ShutdownGroupIsRestart = true di-propagate ke semua member group
+  → semua member (4647, 1074, 6006) skip summary ✅
+```
+
+### 12.3 Dispatch Loop
 
 `ProcessQueuedEventsTask` berjalan sebagai background task:
 
@@ -711,7 +747,7 @@ while not cancelled:
       Delay 10 detik, retry
 ```
 
-**Anti-stuck mechanism:** Kalau summary dispatch gagal terus-menerus (misalnya row tidak ditemukan di SharePoint karena alasan permanen), setelah 5 kali gagal item di-skip dari queue. Raw list tidak terpengaruh — raw record sudah berhasil dikirim sebelum summary dicoba.
+**Anti-stuck mechanism:** Kalau summary dispatch gagal terus-menerus, setelah 5 kali gagal item di-skip dari queue. Raw list tidak terpengaruh.
 
 Retry counter disimpan in-memory `Dictionary<string, int>` — reset saat service restart (intentional: give fresh chance setelah restart).
 
@@ -719,7 +755,7 @@ Retry counter disimpan in-memory `Dictionary<string, int>` — reset saat servic
 
 ## 13. Dispatch & SharePoint Integration
 
-### 12.1 Raw List (ListId)
+### 13.1 Raw List (ListId)
 
 Setiap event yang valid dikirim ke raw list sebagai individual record:
 
@@ -734,7 +770,7 @@ Setiap event yang valid dikirim ke raw list sebagai individual record:
 
 **Index yang dibutuhkan di SharePoint:** `EventTime`
 
-### 12.2 Summary List (SummaryListId)
+### 13.2 Summary List (SummaryListId)
 
 Satu row per user per hari:
 
@@ -744,7 +780,7 @@ Satu row per user per hari:
 | Username | Username |
 | ComputerName | Nama PC |
 | WorkDate | Tanggal kerja (format: `yyyy-MM-dd`) |
-| LoginTime | UTC login pertama hari itu |
+| LoginTime | UTC login pertama hari itu — tidak pernah diupdate ke yang lebih baru |
 | ExpectedTimeOut | LoginTime + 9 jam |
 | ShutdownTime | UTC shutdown/logout terakhir yang valid |
 | ShutdownType | Format: `EventId - Label` (mis. `6006 - Shutdown Completed (Shutdown Initiated)`) |
@@ -755,7 +791,7 @@ Satu row per user per hari:
 
 ## 14. Summary List Logic
 
-### 13.1 UpsertDailySummaryLoginAsync
+### 14.1 UpsertDailySummaryLoginAsync
 
 ```
 1. Cek SummaryCache → cache hit? → return (skip query)
@@ -772,7 +808,7 @@ Satu row per user per hari:
 
 **FindSummaryItemWithRetryAsync** dibutuhkan karena Graph API eventual consistency — row yang baru di-insert mungkin belum muncul di query berikutnya dalam beberapa detik.
 
-### 13.2 TryUpdateDailySummaryShutdownAsync
+### 14.2 TryUpdateDailySummaryShutdownAsync
 
 ```
 1. FindSummaryItemForShutdownAsync
@@ -788,7 +824,7 @@ Satu row per user per hari:
 6. PATCH ShutdownTime + ShutdownType
 ```
 
-### 13.3 IsValidShutdownCandidate
+### 14.3 IsValidShutdownCandidate
 
 | Rule | Kondisi | Hasil |
 |------|---------|-------|
@@ -815,7 +851,25 @@ Priority menentukan event mana yang boleh overwrite `ShutdownTime` di Summary. H
 
 **1074 ↔ 6006 pairing window:** 60 detik. Jika dalam 60 detik setelah 1074 ada 6006, keduanya dipasangkan.
 
-**isNewSession rule:** Jika `incoming shutdownTime > existing shutdownTime`, ini dianggap sesi baru (user sudah login lagi lalu shutdown lagi). Priority lama diabaikan — shutdown terbaru selalu menang. Contoh: 6006 jam 09:00 (priority 5) lalu user login jam 13:00 lalu 4647 jam 17:00 → tanpa rule ini 4647 (priority 2) di-skip → dengan rule ini 4647 jam 17:00 > 09:00 → tulis 17:00.
+**Shutdown Group & Priority:**
+
+4647, 1074, dan 6006 selalu dalam satu rangkaian — baik saat shutdown maupun restart. Yang membedakan keduanya adalah 1074:
+
+- 1074 shutdown → `ShutdownGroupIsRestart = false` → priority system berlaku → 6006 menang (priority 5)
+- 1074 restart → `ShutdownGroupIsRestart = true` → seluruh group skip summary, termasuk 4647
+
+Ini berarti 4647 **tidak pernah berdiri sendiri** sebagai penanda shutdown/logout — nilainya hanya valid jika group-nya bukan restart.
+
+| Skenario | Hasil di Summary |
+|---------|-----------------|
+| Shutdown normal: 4647 + 1074 + 6006 | `6006 - Shutdown Completed (Shutdown Initiated)` ✅ |
+| Fast Startup: 4647 + 1074 (tanpa 6006) | `1074 - Shutdown Initiated` ✅ |
+| Restart: 4647 + 1074(restart) + 6006(unconfirmed) | ShutdownTime tidak berubah ✅ |
+| Power loss / crash: 6008 atau 41 | `6008 - Unexpected Shutdown` / `41 - System Crash` ✅ |
+
+**isNewSession rule:**
+
+Jika `incoming shutdownTime > existing shutdownTime` di SharePoint, dianggap sesi baru — priority existing diabaikan dan shutdown terbaru selalu menang. Contoh: user shutdown jam 09:00 (6006, priority 5), login lagi jam 13:00, shutdown lagi jam 17:00 (4647) → 17:00 > 09:00 → new session → 4647 jam 17:00 ditulis ✅.
 
 ---
 
@@ -823,30 +877,29 @@ Priority menentukan event mana yang boleh overwrite `ShutdownTime` di Summary. H
 
 File: `summary-cache.json`
 
-### 15.1 Tujuan
+### 16.1 Tujuan
 
 Mencegah duplikat row di SummaryListId **lintas service restart**. Setelah restart, queue kosong sehingga `IsSummaryEligible` tidak bisa mendeteksi bahwa row untuk `user+computer+workDate` hari ini sudah ada. Cache ini menjawab pertanyaan itu secara lokal tanpa query SharePoint.
 
-### 15.2 Format
+### 16.2 Format
 
 ```json
 {
   "keys": [
     "ON-083\\annafi\\2026-03-13",
-    "ON-083\\kidannafi\\2026-03-13"
   ]
 }
 ```
 
 Key format: `ComputerName\Username\yyyy-MM-dd`
 
-### 15.3 Write Policy
+### 16.3 Write Policy
 
 - Ditulis setelah `UpsertDailySummaryLoginAsync` berhasil confirm atau create row
 - Idempotent — aman dipanggil berkali-kali untuk key yang sama
 - Atomic write dengan `.bak` file
 
-### 15.4 Cleanup
+### 16.4 Cleanup
 
 Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggil bersamaan dengan cleanup SharePoint di `CleanupOldRecordsTask`.
 
@@ -863,7 +916,7 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
 | Random delay | 0–5 menit (seed: `MachineName.GetHashCode()`) |
 | Missed cleanup | Jika service start setelah jam 03:00 → cleanup langsung dijalankan |
 
-### 16.1 Behavior di 36 Device
+### 17.1 Behavior di 36 Device
 
 - Tidak ada koordinasi antar device
 - Setiap device cleanup **semua** data lama (tidak dibatasi per ComputerName)
