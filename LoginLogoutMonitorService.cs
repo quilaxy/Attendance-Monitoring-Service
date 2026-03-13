@@ -129,7 +129,7 @@ namespace EventLogOutEmployeeService
                 {
                     currentRetry++;
 
-                    serviceStartTime = DateTime.Now;
+                    serviceStartTime = DateTime.UtcNow;
 
                     // Reset static network-wait flag so it re-evaluates on each service start
                     SharePointIntegration.ResetNetworkWaitFlag();
@@ -239,7 +239,7 @@ namespace EventLogOutEmployeeService
                 //    sehingga replayTo bisa terlambat dan event login bisa hilang lagi.
                 try
                 {
-                    SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                    SaveStopCheckpoint(DateTime.UtcNow.AddMinutes(-1));
                 }
                 catch { /* last resort */ }
             }
@@ -253,7 +253,7 @@ namespace EventLogOutEmployeeService
                 SafeWriteEventLog("Application",
                     $"[CRASH] Unobserved task exception: {e.Exception}",
                     EventLogEntryType.Error, 9998);
-                SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                SaveStopCheckpoint(DateTime.UtcNow.AddMinutes(-1));
                 e.SetObserved();
             }
             catch
@@ -266,7 +266,7 @@ namespace EventLogOutEmployeeService
 
         private void ReplayMissedEventsFromCheckpoint()
         {
-            DateTime replayTo = DateTime.Now;
+            DateTime replayTo = DateTime.UtcNow;
             replayUpperBound = replayTo;
             replayInProgress = true;
 
@@ -280,9 +280,15 @@ namespace EventLogOutEmployeeService
 
                 if (replayFrom.HasValue)
                 {
-                    // Security events first so lastActiveUser is populated before system events run
+                    // Security events first so lastActiveUser is populated before system events run.
                     ReplaySecurityEvents(replayFrom, replayTo);
-                    ReplaySystemEvents(replayFrom, replayTo);
+
+                    // System events: extend replayFrom 30 detik lebih awal agar 1074 yang terjadi
+                    // tepat sebelum checkpoint window tetap ter-load ke memory sebelum 6006 di-replay.
+                    // Tanpa ini, 1074 di detik terakhir sebelum replayFrom ter-potong → 6006 unconfirmed.
+                    // DedupWindow 30 detik akan tangkap duplikat kalau 1074 sudah ada di queue.
+                    DateTime systemReplayFrom = replayFrom.Value.AddSeconds(-30);
+                    ReplaySystemEvents(systemReplayFrom, replayTo);
                 }
                 else
                 {
@@ -338,7 +344,7 @@ namespace EventLogOutEmployeeService
                 // If derived timestamp is older than MaxReplayLookback (7 days), clamp to
                 // exactly 7 days back — never fall back to an arbitrary short window so that
                 // long weekends, public holidays, and extended leave are always covered.
-                DateTime now = DateTime.Now;
+                DateTime now = DateTime.UtcNow;
                 DateTime? replayCheckpoint = TryLoadCheckpoint(replayCheckpointPath);
                 if (replayCheckpoint.HasValue)
                 {
@@ -367,16 +373,16 @@ namespace EventLogOutEmployeeService
 
                 // Level 4 – Fresh install seed.
                 // Tidak ada checkpoint sama sekali (primary, backup, replay) — ini fresh install
-                // atau DataDirectory baru dibersihkan. Replay dari 00:00 hari ini agar event
+                // atau DataDirectory baru dibersihkan. Replay dari 00:00 hari ini (UTC) agar event
                 // login pagi (sebelum service pertama kali distart) ikut masuk.
                 // Tidak replay lebih jauh agar tidak flood Security log historical.
-                DateTime todayMidnight = now.Date;
+                DateTime todayMidnightUtc = now.Date; // UTC midnight
                 SafeWriteEventLog("Application",
                     $"LoadStopCheckpoint: FRESH INSTALL — no checkpoint found anywhere. " +
-                    $"Seeding replayFrom to today midnight {todayMidnight:O} " +
+                    $"Seeding replayFrom to today midnight {todayMidnightUtc:O} " +
                     $"so events from 00:00 today are captured.",
                     EventLogEntryType.Warning, 1023);
-                return todayMidnight;
+                return todayMidnightUtc;
             }
             catch (Exception ex)
             {
@@ -399,7 +405,8 @@ namespace EventLogOutEmployeeService
                     System.Globalization.DateTimeStyles.RoundtripKind, out DateTime parsed))
                 return null;
 
-            return parsed.ToLocalTime();
+            // Checkpoint disimpan sebagai UTC (Z suffix) — return as UTC.
+            return parsed.Kind == DateTimeKind.Utc ? parsed : parsed.ToUniversalTime();
         }
 
         private void EnsureCheckpointBootstrap()
@@ -482,7 +489,7 @@ namespace EventLogOutEmployeeService
                     // Heartbeat menulis Now tanpa pengurangan — per-event sudah handle
                     // akurasi (eventTime - 1 detik). Heartbeat hanya safety net saat idle.
                     // Interval 1 menit cukup: worst-case gap = 59 detik, di-cover replay 7 hari.
-                    SaveStopCheckpoint(DateTime.Now);
+                    SaveStopCheckpoint(DateTime.UtcNow);
                 }
                 catch
                 {
@@ -538,7 +545,7 @@ namespace EventLogOutEmployeeService
             for (int i = securityEventLog.Entries.Count - 1; i >= 0; i--)
             {
                 EventLogEntry entry = securityEventLog.Entries[i];
-                DateTime eventTime = entry.TimeGenerated;
+                DateTime eventTime = entry.TimeGenerated.ToUniversalTime();
 
                 if (eventTime < fromTime.Value)
                     continue;
@@ -599,7 +606,7 @@ namespace EventLogOutEmployeeService
             for (int i = systemEventLog.Entries.Count - 1; i >= 0; i--)
             {
                 EventLogEntry entry = systemEventLog.Entries[i];
-                DateTime eventTime = entry.TimeGenerated;
+                DateTime eventTime = entry.TimeGenerated.ToUniversalTime();
 
                 if (eventTime < fromTime.Value)  // fromTime non-null guaranteed by guard above
                     continue;
@@ -692,7 +699,7 @@ namespace EventLogOutEmployeeService
                 // Hanya tulis kalau kandidat lebih baru dari checkpoint yang sudah ada —
                 // jangan mundurkan checkpoint yang sudah akurat dari per-event atau heartbeat.
                 // Now - 5 detik sebagai buffer kecil agar event yang sedang in-flight tidak terpotong.
-                DateTime candidate = DateTime.Now.AddSeconds(-5);
+                DateTime candidate = DateTime.UtcNow.AddSeconds(-5);
                 DateTime? existing = TryLoadCheckpoint(stopCheckpointPath);
                 DateTime stopCheckpoint = (existing.HasValue && existing.Value > candidate)
                     ? existing.Value
@@ -1005,7 +1012,7 @@ namespace EventLogOutEmployeeService
             if (e?.Entry == null) return;
 
             EventLogEntry entry = e.Entry;
-            if (ShouldSkipLiveEntry(entry.TimeGenerated))
+            if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime()))
                 return;
 
             _ = Task.Run(async () =>
@@ -1019,24 +1026,16 @@ namespace EventLogOutEmployeeService
                     SafeWriteEventLog("Application",
                         $"Unhandled exception in OnSecurityEventWritten: {ex}",
                         EventLogEntryType.Error, 9997);
-                    SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                    SaveStopCheckpoint(DateTime.UtcNow.AddMinutes(-1));
                 }
             });
         }
 
+        private DateTime _lastSkipLogTime = DateTime.MinValue;
+        private int _skipLogSuppressedCount = 0;
+
         private bool ShouldSkipLiveEntry(DateTime eventTime)
         {
-            // replayUpperBound di-capture tepat sebelum EnableRaisingEvents=true dan
-            // sebelum replay jalan. Semua event sampai dengan replayUpperBound sudah
-            // di-cover oleh ReplaySecurityEvents/ReplaySystemEvents.
-            //
-            // Filter ini berlaku PERMANEN (bukan hanya saat replay) karena Windows
-            // kadang mem-fire event lama setelah EnableRaisingEvents=true — baik saat
-            // replay masih jalan maupun sesudahnya.
-            //
-            // Exception: event yang terjadi saat service mati dan baru ditulis ke log
-            // setelah boot (misal 6006 shutdown) memiliki eventTime < replayUpperBound
-            // dan sudah masuk via replay — jadi di-skip di sini aman.
             if (eventTime <= replayUpperBound)
             {
                 if (replayInProgress)
@@ -1047,9 +1046,23 @@ namespace EventLogOutEmployeeService
                 }
                 else
                 {
-                    SafeWriteEventLog("Application",
-                        $"Live event skipped — older than replayUpperBound: eventTime={eventTime:O} replayUpperBound={replayUpperBound:O}",
-                        EventLogEntryType.Information, 1038);
+                    // Rate-limit log 1038 — maksimal 1x per 30 detik, sisanya di-suppress
+                    bool shouldLog = (DateTime.Now - _lastSkipLogTime).TotalSeconds >= 30;
+                    if (shouldLog)
+                    {
+                        string suffix = _skipLogSuppressedCount > 0
+                            ? $" (+ {_skipLogSuppressedCount} suppressed)"
+                            : string.Empty;
+                        SafeWriteEventLog("Application",
+                            $"Live event skipped — older than replayUpperBound: eventTime={eventTime:O} replayUpperBound={replayUpperBound:O}{suffix}",
+                            EventLogEntryType.Information, 1038);
+                        _lastSkipLogTime = DateTime.Now;
+                        _skipLogSuppressedCount = 0;
+                    }
+                    else
+                    {
+                        _skipLogSuppressedCount++;
+                    }
                 }
                 return true;
             }
@@ -1064,7 +1077,7 @@ namespace EventLogOutEmployeeService
                 int eventId = GetNormalizedEventId(log);
                 if (eventId != 4624 && eventId != 4647) return;
 
-                DateTime eventTime = log.TimeGenerated;
+                DateTime eventTime = log.TimeGenerated.ToUniversalTime();
                 string computerName = log.MachineName;
                 string eventMessage = log.Message;
 
@@ -1111,7 +1124,7 @@ namespace EventLogOutEmployeeService
             if (e?.Entry == null) return;
 
             EventLogEntry entry = e.Entry;
-            if (ShouldSkipLiveEntry(entry.TimeGenerated))
+            if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime()))
                 return;
 
             _ = Task.Run(async () =>
@@ -1125,7 +1138,7 @@ namespace EventLogOutEmployeeService
                     SafeWriteEventLog("Application",
                         $"Unhandled exception in OnSystemEventWritten: {ex}",
                         EventLogEntryType.Error, 9996);
-                    SaveStopCheckpoint(DateTime.Now.AddMinutes(-1));
+                    SaveStopCheckpoint(DateTime.UtcNow.AddMinutes(-1));
                 }
             });
         }
@@ -1138,7 +1151,7 @@ namespace EventLogOutEmployeeService
                 if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     return;
 
-                DateTime eventTime = log.TimeGenerated;
+                DateTime eventTime = log.TimeGenerated.ToUniversalTime();
                 string computerName = log.MachineName;
 
                 // ── 1074: Null-message guard + message preview for debugging ────────
@@ -1358,8 +1371,8 @@ namespace EventLogOutEmployeeService
 
                     int secEventId = GetNormalizedEventId(entry);
                     if ((secEventId == 4624 || secEventId == 4647) &&
-                        entry.TimeGenerated >= lookbackTime &&
-                        entry.TimeGenerated <= beforeTime &&
+                        entry.TimeGenerated.ToUniversalTime() >= lookbackTime &&
+                        entry.TimeGenerated.ToUniversalTime() <= beforeTime &&
                         entry.Message != null)
                     {
                         if (secEventId == 4624)
