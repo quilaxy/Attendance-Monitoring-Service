@@ -54,6 +54,13 @@ namespace EventLogOutEmployeeService
         /// Null berarti tidak ada hold — dispatch normal.
         /// </summary>
         public DateTime? ShutdownGroupHoldUntil { get; set; }
+
+        /// <summary>
+        /// True jika group ini adalah rangkaian restart (1074 adalah restart).
+        /// Kalau true → semua member group (4647, 1074, 6006) skip summary.
+        /// Di-set saat 1074 restart masuk queue dan di-propagate ke semua member group.
+        /// </summary>
+        public bool ShutdownGroupIsRestart { get; set; } = false;
     }
 
     public class PersistentEventQueue
@@ -259,6 +266,35 @@ namespace EventLogOutEmployeeService
                     item.SummaryDispatched = summaryDispatched.Value;
 
                 await WriteAllInternalAsync(items);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Tandai semua member group sebagai restart — dipanggil saat 1074 restart masuk queue.
+        /// Semua event dalam group (termasuk 4647 yang mungkin sudah masuk duluan) akan di-set
+        /// ShutdownGroupIsRestart=true sehingga summary-nya di-skip.
+        /// </summary>
+        public async Task MarkGroupAsRestartAsync(string groupId, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                bool changed = false;
+                foreach (var item in items.Where(x => x.ShutdownGroupId == groupId))
+                {
+                    if (!item.ShutdownGroupIsRestart)
+                    {
+                        item.ShutdownGroupIsRestart = true;
+                        changed = true;
+                    }
+                }
+                if (changed)
+                    await WriteAllInternalAsync(items);
             }
             finally
             {
