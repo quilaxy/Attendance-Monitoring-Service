@@ -871,6 +871,22 @@ namespace EventLogOutEmployeeService
                    item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41;
         }
 
+        /// <summary>
+        /// Priority untuk shutdown group — harus konsisten dengan SharePointIntegration.GetShutdownPriority.
+        /// Dipakai untuk menentukan event mana di group yang boleh dispatch summary saat timer expired.
+        /// </summary>
+        private static int GetShutdownEventPriority(int eventId, string eventType)
+        {
+            if (eventId == 6006)
+                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 5;
+            if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
+                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 4;
+            if (eventId == 4647) return 2;
+            if (eventId == 6008) return 1;
+            if (eventId == 41)   return 1;
+            return 0;
+        }
+
         private async Task<bool> TryDispatchQueuedEventAsync(QueuedAttendanceEvent item)
         {
             try
@@ -887,6 +903,62 @@ namespace EventLogOutEmployeeService
 
                 bool needsRaw     = item.WriteRawRecord && !item.RawRecordDispatched;
                 bool needsSummary = ShouldProcessSummary(item) && !item.SummaryDispatched;
+
+                // Shutdown group hold: tahan summary dispatch untuk 4647/1074/6006 sampai
+                // group lengkap (ada 6006) atau timer 10 detik habis.
+                // Raw tetap dispatch langsung — group hanya berlaku untuk summary.
+                if (needsSummary && item.ShutdownGroupId != null && item.ShutdownGroupHoldUntil.HasValue)
+                {
+                    bool timerExpired = DateTime.UtcNow >= item.ShutdownGroupHoldUntil.Value;
+                    bool has6006InGroup = await eventQueue.GroupHas6006Async(item.ShutdownGroupId);
+                    bool isThis6006 = item.EventId == 6006;
+
+                    if (!timerExpired && !has6006InGroup && !isThis6006)
+                    {
+                        // Group belum lengkap dan timer belum habis — tahan summary, proses raw dulu
+                        needsSummary = false;
+                        SafeWriteEventLog("Application",
+                            $"[DISPATCH] Shutdown group hold: waiting for 6006 or timer. " +
+                            $"queueId={item.QueueId} eventId={item.EventId} groupId={item.ShutdownGroupId} " +
+                            $"holdUntil={item.ShutdownGroupHoldUntil.Value:O}",
+                            EventLogEntryType.Information, 4008);
+                    }
+                    else if (!isThis6006 && has6006InGroup)
+                    {
+                        // 6006 sudah ada di group — event ini (4647/1074) tidak perlu kirim summary,
+                        // biarkan 6006 yang kirim dengan priority tertinggi.
+                        needsSummary = false;
+                        SafeWriteEventLog("Application",
+                            $"[DISPATCH] Shutdown group: 6006 already in group, skipping summary for " +
+                            $"queueId={item.QueueId} eventId={item.EventId}",
+                            EventLogEntryType.Information, 4009);
+                        await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
+                        item.SummaryDispatched = true;
+                    }
+                    else if (timerExpired && !has6006InGroup && !isThis6006)
+                    {
+                        // Timer expired, 6006 tidak muncul (misal Fast Startup).
+                        // Hanya event dengan priority tertinggi di group yang boleh kirim summary.
+                        // Cek apakah ada event lain di group yang priority-nya lebih tinggi.
+                        int myPriority = GetShutdownEventPriority(item.EventId, item.EventType);
+                        bool higherPriorityExistsInGroup = await eventQueue.GroupHasHigherPriorityAsync(
+                            item.ShutdownGroupId, myPriority);
+
+                        if (higherPriorityExistsInGroup)
+                        {
+                            // Ada yang lebih tinggi — skip summary untuk event ini
+                            needsSummary = false;
+                            SafeWriteEventLog("Application",
+                                $"[DISPATCH] Shutdown group: timer expired, higher priority exists, skipping summary for " +
+                                $"queueId={item.QueueId} eventId={item.EventId} priority={myPriority}",
+                                EventLogEntryType.Information, 4009);
+                            await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
+                            item.SummaryDispatched = true;
+                        }
+                        // else: ini yang tertinggi → kirim summary
+                    }
+                    // else: isThis6006=true → kirim summary dengan priority 5
+                }
 
                 SafeWriteEventLog("Application",
                     $"[DISPATCH] queueId={item.QueueId} eventId={item.EventId} user={item.Username} " +
@@ -1321,6 +1393,21 @@ namespace EventLogOutEmployeeService
                     ShutdownType    = shutdownType,
                     WriteRawRecord  = writeRawRecord
                 };
+
+                // Shutdown group: 4647, 1074, 6006 yang terjadi berbarengan dikelompokkan
+                // agar summary hanya di-dispatch setelah group lengkap (atau timeout 10 detik).
+                // Tujuan: mencegah 4647 atau 1074 overwrite satu sama lain via isNewSession
+                // padahal ketiganya satu rangkaian shutdown yang sama.
+                // 6008 dan 41 tidak di-group karena mereka standalone (tidak ada paired event).
+                if (eventId == 4647 || eventId == 1074 || eventId == 6006)
+                {
+                    string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
+                    // Group key: computer + user + tanggal + epoch menit (bukan detik) agar
+                    // event dalam 60 detik yang sama masuk group yang sama.
+                    long epochMinute = (long)(eventTime - DateTime.UnixEpoch).TotalMinutes;
+                    queuedEvent.ShutdownGroupId = $"shutdown_{computerName}_{username}_{workDate}_{epochMinute}";
+                    queuedEvent.ShutdownGroupHoldUntil = eventTime.AddSeconds(10);
+                }
 
                 bool enqueued = await eventQueue.EnqueueIfNotDuplicateAsync(queuedEvent);
 
