@@ -856,6 +856,11 @@ namespace EventLogOutEmployeeService
             if (item.EventId == 4624)
                 return item.IsSummaryEligible;
 
+            // Seluruh group ditandai restart → semua member skip summary.
+            // Ini mencakup 4647, 1074, dan 6006 dalam rangkaian restart.
+            if (item.ShutdownGroupIsRestart)
+                return false;
+
             // 1074 Restart: skip — bukan shutdown, tidak perlu tulis ShutdownTime.
             if (item.EventId == 1074 &&
                 (item.EventType.Contains("Restart", StringComparison.OrdinalIgnoreCase) ||
@@ -1407,9 +1412,22 @@ namespace EventLogOutEmployeeService
                     long epochMinute = (long)(eventTime - DateTime.UnixEpoch).TotalMinutes;
                     queuedEvent.ShutdownGroupId = $"shutdown_{computerName}_{username}_{workDate}_{epochMinute}";
                     queuedEvent.ShutdownGroupHoldUntil = eventTime.AddSeconds(10);
+
+                    // Kalau 1074 adalah restart, tandai seluruh group sebagai restart.
+                    // Ini memastikan 4647 yang mungkin sudah masuk queue duluan juga ikut di-skip summary.
+                    bool isRestartEvent = eventId == 1074 &&
+                        (eventType.Contains("Restart", StringComparison.OrdinalIgnoreCase) ||
+                         eventType.Contains("Reboot", StringComparison.OrdinalIgnoreCase));
+                    if (isRestartEvent)
+                        queuedEvent.ShutdownGroupIsRestart = true;
                 }
 
                 bool enqueued = await eventQueue.EnqueueIfNotDuplicateAsync(queuedEvent);
+
+                // Propagate restart flag ke seluruh group setelah enqueue,
+                // agar 4647 yang sudah ada di queue sebelum 1074 juga ter-mark.
+                if (enqueued && queuedEvent.ShutdownGroupIsRestart && queuedEvent.ShutdownGroupId != null)
+                    await eventQueue.MarkGroupAsRestartAsync(queuedEvent.ShutdownGroupId);
 
                 if (!enqueued)
                 {
