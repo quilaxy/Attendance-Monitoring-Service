@@ -39,6 +39,21 @@ namespace EventLogOutEmployeeService
         /// Untuk semua event lain: selalu true (shutdown/logout selalu eligible).
         /// </summary>
         public bool IsSummaryEligible { get; set; } = true;
+
+        /// <summary>
+        /// Untuk event shutdown (4647, 1074, 6006): ID grup yang menyatukan ketiga event
+        /// dalam satu rangkaian shutdown yang sama.
+        /// Format: "shutdown_{ComputerName}_{Username}_{WorkDate}_{EpochDetik event pertama}"
+        /// Null untuk event non-shutdown atau 6008/41 (unexpected shutdown — tidak perlu grouping).
+        /// </summary>
+        public string? ShutdownGroupId { get; set; }
+
+        /// <summary>
+        /// Summary tidak di-dispatch sampai UtcNow >= ShutdownGroupHoldUntil
+        /// ATAU 6006 sudah ada di group ini (mana yang lebih dulu).
+        /// Null berarti tidak ada hold — dispatch normal.
+        /// </summary>
+        public DateTime? ShutdownGroupHoldUntil { get; set; }
     }
 
     public class PersistentEventQueue
@@ -150,6 +165,61 @@ namespace EventLogOutEmployeeService
             {
                 fileLock.Release();
             }
+        }
+
+        /// <summary>
+        /// Returns true jika ada event EventId=6006 dengan ShutdownGroupId yang sama di queue.
+        /// Dipakai untuk cek apakah group shutdown sudah lengkap sebelum dispatch summary.
+        /// </summary>
+        public async Task<bool> GroupHas6006Async(string groupId, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                return items.Any(x =>
+                    x.EventId == 6006 &&
+                    x.ShutdownGroupId == groupId);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Returns true jika ada event lain dalam group yang memiliki priority lebih tinggi
+        /// dari <paramref name="thanPriority"/> dan belum di-dispatch summary-nya.
+        /// Dipakai saat timer expired tanpa 6006 — hanya event tertinggi yang kirim summary.
+        /// </summary>
+        public async Task<bool> GroupHasHigherPriorityAsync(string groupId, int thanPriority, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                return items.Any(x =>
+                    x.ShutdownGroupId == groupId &&
+                    !x.SummaryDispatched &&
+                    GetStaticShutdownPriority(x.EventId, x.EventType) > thanPriority);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        // Priority helper — harus konsisten dengan SharePointIntegration.GetShutdownPriority.
+        private static int GetStaticShutdownPriority(int eventId, string eventType)
+        {
+            if (eventId == 6006)
+                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 5;
+            if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
+                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 4;
+            if (eventId == 4647) return 2;
+            if (eventId == 6008) return 1;
+            if (eventId == 41)   return 1;
+            return 0;
         }
 
         public async Task RemoveByIdAsync(string queueId, CancellationToken cancellationToken = default)
