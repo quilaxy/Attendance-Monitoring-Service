@@ -724,6 +724,10 @@ namespace EventLogOutEmployeeService
                     {
                         deletedCount++;
                     }
+                    else if (deleteResponse.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        // 404 = sudah dihapus PC lain duluan — normal kalau cleanup jalan bersamaan
+                    }
                     else
                     {
                         SafeWriteEventLog("Application",
@@ -917,10 +921,21 @@ namespace EventLogOutEmployeeService
 
         private async Task<bool> RawRecordAlreadyExistsAsync(HttpClient client, string title, DateTime eventTime)
         {
-            string checkUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
-                $"?$expand=fields&$filter=fields/Title eq '{EscapeODataLiteral(title)}'&$top=20";
+            // Title mengandung backslash → OData filter HTTP 400.
+            // Filter pakai EventTime window saja — sudah cukup unik karena
+            // title (ComputerName+EventId+Username) di-check dari hasil query.
+            DateTime from = eventTime.ToUniversalTime().AddSeconds(-60);
+            DateTime to   = eventTime.ToUniversalTime().AddSeconds(60);
 
-            var checkResponse = await client.GetAsync(checkUrl);
+            string filter = $"fields/EventTime ge '{from:yyyy-MM-ddTHH:mm:ssZ}' and " +
+                            $"fields/EventTime le '{to:yyyy-MM-ddTHH:mm:ssZ}'";
+
+            string checkUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
+                $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=20";
+
+            var request = new HttpRequestMessage(HttpMethod.Get, checkUrl);
+            request.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
+            var checkResponse = await client.SendAsync(request);
             if (!checkResponse.IsSuccessStatusCode)
                 return false;
 
@@ -931,23 +946,16 @@ namespace EventLogOutEmployeeService
             if (existing == null || existing.Count == 0)
                 return false;
 
-            DateTime eventUtc = eventTime.ToUniversalTime();
+            // Cek apakah ada row dengan Title yang sama (ComputerName+EventId+Username)
+            // dalam window waktu tersebut.
             foreach (JToken row in existing)
             {
                 var fields = row["fields"] as JObject;
-                DateTime? existingTime = ParseFieldDateTime(fields, "EventTime");
-                if (!existingTime.HasValue)
-                    continue;
-
-                DateTime existingUtc = existingTime.Value.ToUniversalTime();
-                // 60-second window: Graph API has eventual consistency so a record
-                // inserted moments ago may not appear immediately in query results.
-                // A wide window is safe because title already encodes ComputerName+EventId+Username.
-                if (Math.Abs((existingUtc - eventUtc).TotalSeconds) <= 60)
+                string? existingTitle = fields?["Title"]?.ToString();
+                if (string.Equals(existingTitle, title, StringComparison.OrdinalIgnoreCase))
                 {
                     SafeWriteEventLog("Application",
-                        $"[RAW] Idempotency hit: title='{title}' existing={existingUtc:O} incoming={eventUtc:O} " +
-                        $"diff={(existingUtc - eventUtc).TotalSeconds:F1}s",
+                        $"[RAW] Idempotency hit: title='{title}' eventTime={eventTime:O}",
                         EventLogEntryType.Information, 4025);
                     return true;
                 }
@@ -966,7 +974,11 @@ namespace EventLogOutEmployeeService
         {
             string? value = fields?[fieldName]?.ToString();
             if (string.IsNullOrWhiteSpace(value)) return null;
-            return DateTime.TryParse(value, out DateTime parsed) ? parsed : null;
+            if (!DateTime.TryParse(value, null, System.Globalization.DateTimeStyles.RoundtripKind, out DateTime parsed))
+                return null;
+            // SharePoint returns UTC (Z suffix) — keep as UTC for consistent comparison
+            // with eventTime which is also now always UTC throughout the codebase.
+            return parsed.Kind == DateTimeKind.Utc ? parsed : parsed.ToUniversalTime();
         }
 
         private static string BuildShutdownType(int eventId, string eventType)
