@@ -8,24 +8,25 @@
 ## Table of Contents
 
 1. [Deploy & Service Management](#1-deploy--service-management)
-2. [Architecture Overview](#2-architecture-overview)
-3. [Data Files](#3-data-files)
-4. [Windows Event IDs Monitored](#4-windows-event-ids-monitored)
-5. [Application Log Event IDs](#5-application-log-event-ids)
-6. [Login Filtering](#6-login-filtering)
-7. [Admin Login Detection](#7-admin-login-detection)
-8. [Checkpoint System](#8-checkpoint-system)
-9. [Replay System](#9-replay-system)
-10. [Deduplication](#10-deduplication)
-11. [Queue System](#11-queue-system)
-12. [Dispatch & SharePoint Integration](#12-dispatch--sharepoint-integration)
-13. [Summary List Logic](#13-summary-list-logic)
-14. [Shutdown Priority](#14-shutdown-priority)
-15. [Summary Cache](#15-summary-cache)
-16. [Cleanup Task](#16-cleanup-task)
-17. [DateTime & Timezone](#17-datetime--timezone)
-18. [Username Resolution (System Events)](#18-username-resolution-system-events)
-19. [Multi-Device Behavior](#19-multi-device-behavior)
+2. [SharePoint Setup](#2-sharepoint-setup)
+3. [Architecture Overview](#3-architecture-overview)
+4. [Data Files](#4-data-files)
+5. [Windows Event IDs Monitored](#5-windows-event-ids-monitored)
+6. [Application Log Event IDs](#6-application-log-event-ids)
+7. [Login Filtering](#7-login-filtering)
+8. [Admin Login Detection](#8-admin-login-detection)
+9. [Checkpoint System](#9-checkpoint-system)
+10. [Replay System](#10-replay-system)
+11. [Deduplication](#11-deduplication)
+12. [Queue System](#12-queue-system)
+13. [Dispatch & SharePoint Integration](#13-dispatch--sharepoint-integration)
+14. [Summary List Logic](#14-summary-list-logic)
+15. [Shutdown Priority](#15-shutdown-priority)
+16. [Summary Cache](#16-summary-cache)
+17. [Cleanup Task](#17-cleanup-task)
+18. [DateTime & Timezone](#18-datetime--timezone)
+19. [Username Resolution (System Events)](#19-username-resolution-system-events)
+20. [Multi-Device Behavior](#20-multi-device-behavior)
 
 ---
 
@@ -75,7 +76,227 @@ C:\ProgramData\Attendance-Monitoring-Service\
 
 ---
 
-## 2. Architecture Overview
+## 2. SharePoint Setup
+
+### 2.1 Azure App Registration
+
+Service menggunakan **client credentials flow** (app-only, tanpa login user) untuk akses Microsoft Graph API.
+
+**Langkah-langkah:**
+
+1. Buka [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** (atau Azure Active Directory) → **App registrations** → **New registration**
+2. Isi form:
+   - **Name:** bebas, misal `Attendance-Monitoring-Service`
+   - **Supported account types:** Accounts in this organizational directory only (Single tenant)
+   - Redirect URI: kosongkan
+3. Klik **Register**
+4. Setelah terdaftar, catat dua nilai ini dari halaman Overview:
+   - **Application (client) ID** → akan diisi ke `ClientId` di `appsettings.json`
+   - **Directory (tenant) ID** → akan diisi ke `TenantId` di `appsettings.json`
+
+**Buat Client Secret:**
+
+5. Buka menu **Certificates & secrets** → **Client secrets** → **New client secret**
+6. Isi description dan pilih expiry (misal 24 months)
+7. Klik **Add** — salin **Value** sekarang, tidak bisa dilihat lagi setelah tutup halaman
+8. Value tersebut → isi ke `ClientSecret` di `appsettings.json`
+
+**Tambahkan API Permission:**
+
+9. Buka menu **API permissions** → **Add a permission** → **Microsoft Graph** → **Application permissions**
+10. Cari dan centang: `Sites.ReadWrite.All`
+11. Klik **Add permissions**
+12. Klik **Grant admin consent for [nama organisasi]** → konfirmasi **Yes**
+13. Pastikan status kolom **Status** berubah menjadi ✅ **Granted for...**
+
+---
+
+### 2.2 SharePoint Site
+
+1. Buka SharePoint (misal `https://contoso.sharepoint.com`)
+2. Buat Communication Site baru atau gunakan site yang sudah ada
+3. Catat URL site, misal: `https://contoso.sharepoint.com/sites/Attendance`
+
+**Ambil Site ID** via [Microsoft Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer):
+
+```
+GET https://graph.microsoft.com/v1.0/sites/contoso.sharepoint.com:/sites/Attendance
+```
+
+Dari response JSON, catat nilai field `id`. Formatnya seperti ini:
+
+```
+contoso.sharepoint.com,xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx,yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+```
+
+Nilai inilah yang diisi ke `SiteId` di `appsettings.json`.
+
+---
+
+### 2.3 Raw List — Semua Event Individual
+
+List ini menyimpan **setiap event** yang ditangkap service: login, logout, shutdown, restart, crash.
+
+**Buat List:**
+
+1. Buka SharePoint Site → klik **⚙ gear** → **Site contents** → **+ New** → **List**
+2. Pilih **Blank list**
+3. **Name:** bebas, misal `AttendanceLog`
+4. Klik **Create**
+
+**Kolom yang harus dibuat:**
+
+> Kolom `Title` sudah otomatis ada — tidak perlu dibuat ulang.
+
+| Display Name | Internal Name (harus persis) | Tipe | Catatan |
+|---|---|---|---|
+| Title | Title | Single line of text | Sudah ada otomatis |
+| Username | Username | Single line of text | Buat baru |
+| ComputerName | ComputerName | Single line of text | Buat baru |
+| EventID | EventID | Number | Buat baru — pilih **Number**, bukan text |
+| EventTime | EventTime | Date and Time | Buat baru — aktifkan **Include Time** |
+| EventType | EventType | Multiple lines of text | Buat baru — plain text, bukan rich text |
+
+> ⚠️ **Internal name harus persis sama** dengan kolom di atas (case-sensitive). Nama internal ditentukan saat pertama kali kolom dibuat. Jika display name diubah belakangan, internal name tidak berubah.
+
+**Index yang harus dibuat:**
+
+Buka **List Settings** → **Indexed columns** → **Create a new index**:
+
+| Primary Column | Secondary Column | Alasan |
+|---|---|---|
+| EventTime | (kosongkan) | Query idempotency check (filter `EventTime ge ... le ...`) dan cleanup task |
+
+---
+
+### 2.4 Summary List — Ringkasan Harian per User
+
+List ini menyimpan **satu row per user per hari** — jam masuk pertama dan jam pulang terakhir.
+
+**Buat List:**
+
+1. Buka SharePoint Site → klik **⚙ gear** → **Site contents** → **+ New** → **List**
+2. Pilih **Blank list**
+3. **Name:** bebas, misal `AttendanceSummary`
+4. Klik **Create**
+
+**Kolom yang harus dibuat:**
+
+> Kolom `Title` sudah otomatis ada — tidak perlu dibuat ulang.
+
+| Display Name | Internal Name (harus persis) | Tipe | Catatan |
+|---|---|---|---|
+| Title | Title | Single line of text | Sudah ada otomatis. Format: `ComputerName\Username\yyyy-MM-dd` |
+| Username | Username | Single line of text | Buat baru |
+| ComputerName | ComputerName | Single line of text | Buat baru |
+| WorkDate | WorkDate | Date and Time | Buat baru — pilih **Date Only** (tanpa time) |
+| LoginTime | LoginTime | Date and Time | Buat baru — aktifkan **Include Time** |
+| ExpectedTimeOut | ExpectedTimeOut | Date and Time | Buat baru — aktifkan **Include Time** |
+| ShutdownTime | ShutdownTime | Date and Time | Buat baru — aktifkan **Include Time** |
+| ShutdownType | ShutdownType | Single line of text | Buat baru |
+
+**Index yang harus dibuat:**
+
+Buka **List Settings** → **Indexed columns** → **Create a new index** — buat **3 index terpisah**, masing-masing satu kolom:
+
+| Primary Column | Secondary Column | Alasan |
+|---|---|---|
+| Username | (kosongkan) | OData filter `fields/Username eq '...'` |
+| ComputerName | (kosongkan) | OData filter `fields/ComputerName eq '...'` |
+| WorkDate | (kosongkan) | OData filter `fields/WorkDate eq '...'` dan cleanup task |
+
+> SharePoint mengindex per-kolom, bukan compound. Dengan ketiga kolom di-index, kombinasi query `Username AND ComputerName AND WorkDate` berjalan tanpa perlu header `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly`, sehingga tidak ada risiko query gagal secara random.
+
+---
+
+### 2.5 Ambil List ID
+
+Setelah kedua list dibuat, ambil ID masing-masing. Cara termudah via Graph Explorer:
+
+```
+GET https://graph.microsoft.com/v1.0/sites/{siteId}/lists
+```
+
+Dari response, cari berdasarkan `displayName`, lalu catat nilai `id` masing-masing list:
+
+```json
+{
+  "value": [
+    {
+      "id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "displayName": "AttendanceLog",
+      ...
+    },
+    {
+      "id": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy",
+      "displayName": "AttendanceSummary",
+      ...
+    }
+  ]
+}
+```
+
+- `AttendanceLog` → `ListId` di `appsettings.json`
+- `AttendanceSummary` → `SummaryListId` di `appsettings.json`
+
+---
+
+### 2.6 Regional Settings — Wajib untuk Tampilan Jam yang Benar
+
+Service selalu menyimpan datetime dalam **UTC** ke SharePoint. SharePoint secara otomatis mengkonversi UTC ke timezone lokal untuk **tampilan** — sesuai setting Regional Settings site.
+
+Kalau tidak diset, jam yang tampil di SharePoint akan **bergeser 7 jam** dari waktu sebenarnya.
+
+**Langkah:**
+
+1. Buka SharePoint Site
+2. Klik **⚙ gear icon** (pojok kanan atas) → **Site settings**
+
+   > Jika tidak ada opsi Site settings, coba akses langsung:  
+   > `https://contoso.sharepoint.com/sites/Attendance/_layouts/15/regionalsetng.aspx`
+
+3. Di bawah **Site Administration** → klik **Regional settings**
+4. Ubah **Time zone** menjadi:
+   ```
+   (UTC+07:00) Bangkok, Hanoi, Jakarta
+   ```
+5. Klik **OK**
+
+> Data UTC yang tersimpan di SharePoint tidak berubah. Hanya tampilan di browser yang mengikuti timezone ini.
+
+---
+
+### 2.7 appsettings.json
+
+Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish:
+
+```json
+{
+  "AzureSettings": {
+    "TenantId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "ClientId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "ClientSecret": "your-client-secret-value"
+  },
+  "SharePointSettings": {
+    "SiteId": "contoso.sharepoint.com,xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx,yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy",
+    "ListId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "SummaryListId": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+  }
+}
+```
+
+| Key | Sumber |
+|---|---|
+| `AzureSettings:TenantId` | Directory (tenant) ID dari App Registration |
+| `AzureSettings:ClientId` | Application (client) ID dari App Registration |
+| `AzureSettings:ClientSecret` | Client secret value yang dibuat di step 2.1 |
+| `SharePointSettings:SiteId` | ID dari response Graph API di step 2.2 |
+| `SharePointSettings:ListId` | ID raw list (`AttendanceLog`) dari step 2.5 |
+| `SharePointSettings:SummaryListId` | ID summary list (`AttendanceSummary`) dari step 2.5 — opsional, jika dikosongkan fitur Summary tidak aktif |
+
+---
+
+## 3. Architecture Overview
 
 ```
 Windows Event Log (Security + System)
@@ -105,7 +326,7 @@ Windows Event Log (Security + System)
 
 ---
 
-## 3. Data Files
+## 4. Data Files
 
 ### 3.1 Checkpoint Files
 
@@ -133,7 +354,7 @@ Crash saat write → file `.tmp` rusak, file utama tetap valid.
 
 ---
 
-## 4. Windows Event IDs Monitored
+## 5. Windows Event IDs Monitored
 
 ### 4.1 Security Log
 
@@ -154,7 +375,7 @@ Crash saat write → file `.tmp` rusak, file utama tetap valid.
 
 ---
 
-## 5. Application Log Event IDs
+## 6. Application Log Event IDs
 
 Semua log ditulis ke **Windows Application Event Log**.
 
@@ -307,7 +528,7 @@ Semua log ditulis ke **Windows Application Event Log**.
 
 ---
 
-## 6. Login Filtering
+## 7. Login Filtering
 
 ### 6.1 Logon Type
 
@@ -337,7 +558,7 @@ Hanya logon type berikut yang diproses:
 
 ---
 
-## 7. Admin Login Detection
+## 8. Admin Login Detection
 
 Windows membuat **2 event 4624** untuk setiap admin login (UAC split token):
 
@@ -352,7 +573,7 @@ Keduanya memiliki field `Linked Logon ID` yang **non-zero** dan saling pointing 
 
 ---
 
-## 8. Checkpoint System
+## 9. Checkpoint System
 
 ### 8.1 Writers
 
@@ -377,7 +598,7 @@ Keduanya memiliki field `Linked Logon ID` yang **non-zero** dan saling pointing 
 
 ---
 
-## 9. Replay System
+## 10. Replay System
 
 ### 9.1 Flow
 
@@ -434,7 +655,7 @@ Ini menangani kasus Windows yang mem-fire event lama dari Security log saat `Ena
 
 ---
 
-## 10. Deduplication
+## 11. Deduplication
 
 ### 10.1 Queue-Level Dedup
 
@@ -461,7 +682,7 @@ Field pada `QueuedAttendanceEvent` untuk event 4624:
 
 ---
 
-## 11. Queue System
+## 12. Queue System
 
 ### 11.1 PersistentEventQueue
 
@@ -496,7 +717,7 @@ Retry counter disimpan in-memory `Dictionary<string, int>` — reset saat servic
 
 ---
 
-## 12. Dispatch & SharePoint Integration
+## 13. Dispatch & SharePoint Integration
 
 ### 12.1 Raw List (ListId)
 
@@ -532,7 +753,7 @@ Satu row per user per hari:
 
 ---
 
-## 13. Summary List Logic
+## 14. Summary List Logic
 
 ### 13.1 UpsertDailySummaryLoginAsync
 
@@ -577,7 +798,7 @@ Satu row per user per hari:
 
 ---
 
-## 14. Shutdown Priority
+## 15. Shutdown Priority
 
 Priority menentukan event mana yang boleh overwrite `ShutdownTime` di Summary. Higher wins.
 
@@ -598,7 +819,7 @@ Priority menentukan event mana yang boleh overwrite `ShutdownTime` di Summary. H
 
 ---
 
-## 15. Summary Cache
+## 16. Summary Cache
 
 File: `summary-cache.json`
 
@@ -631,7 +852,7 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
 
 ---
 
-## 16. Cleanup Task
+## 17. Cleanup Task
 
 | Parameter | Value |
 |-----------|-------|
@@ -651,7 +872,7 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
 
 ---
 
-## 17. DateTime & Timezone
+## 18. DateTime & Timezone
 
 **Semua DateTime di sistem menggunakan UTC.**
 
@@ -670,7 +891,7 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
 
 ---
 
-## 18. Username Resolution (System Events)
+## 19. Username Resolution (System Events)
 
 System events (1074, 6006, 6008, 41) tidak selalu menyertakan username. Fallback chain:
 
@@ -684,7 +905,7 @@ System events (1074, 6006, 6008, 41) tidak selalu menyertakan username. Fallback
 
 ---
 
-## 19. Multi-Device Behavior
+## 20. Multi-Device Behavior
 
 Service dirancang untuk berjalan di banyak device secara bersamaan tanpa koordinasi:
 
