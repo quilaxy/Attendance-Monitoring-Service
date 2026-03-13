@@ -1,323 +1,698 @@
-# Attendance Monitoring Service - Technical Documentation
+# Attendance Monitoring Service — Technical Documentation
 
-Dokumentasi ini mencakup **Event ID**, **checkpoint & replay system**, **deduplication**, **shutdown priority**, dan **cleanup task** untuk Attendance Monitoring Service.
+> **Stack:** .NET 8, Windows Service, SharePoint (Microsoft Graph API)  
+> **Last updated:** 2026-03-13
 
 ---
-## 0. Publish & Deploy Service
-Run as administrator
 
-### 0.1 Publish
+## Table of Contents
+
+1. [Deploy & Service Management](#1-deploy--service-management)
+2. [Architecture Overview](#2-architecture-overview)
+3. [Data Files](#3-data-files)
+4. [Windows Event IDs Monitored](#4-windows-event-ids-monitored)
+5. [Application Log Event IDs](#5-application-log-event-ids)
+6. [Login Filtering](#6-login-filtering)
+7. [Admin Login Detection](#7-admin-login-detection)
+8. [Checkpoint System](#8-checkpoint-system)
+9. [Replay System](#9-replay-system)
+10. [Deduplication](#10-deduplication)
+11. [Queue System](#11-queue-system)
+12. [Dispatch & SharePoint Integration](#12-dispatch--sharepoint-integration)
+13. [Summary List Logic](#13-summary-list-logic)
+14. [Shutdown Priority](#14-shutdown-priority)
+15. [Summary Cache](#15-summary-cache)
+16. [Cleanup Task](#16-cleanup-task)
+17. [DateTime & Timezone](#17-datetime--timezone)
+18. [Username Resolution (System Events)](#18-username-resolution-system-events)
+19. [Multi-Device Behavior](#19-multi-device-behavior)
+
+---
+
+## 1. Deploy & Service Management
+
+Run semua command berikut **sebagai Administrator**.
+
+### 1.1 Build & Publish
+
+```bat
 dotnet build
 
-dotnet publish Attendance-Monitoring-Service.csproj -c Release -o ".\Attendance-Monitoring-Service" -p:DebugType=None
+dotnet publish Attendance-Monitoring-Service.csproj ^
+  -c Release ^
+  -o ".\Attendance-Monitoring-Service" ^
+  -p:DebugType=None
+```
 
-### 0.2 Install Service
-sc create Attendance-Service binPath= "C:\Program Files\Attendance-Monitoring-Service\Attendance-Monitoring-Service.exe" start= auto
+### 1.2 Install Service
 
-### 0.3 Start/Stop Service
+```bat
+sc create Attendance-Service ^
+  binPath= "C:\Program Files\Attendance-Monitoring-Service\Attendance-Monitoring-Service.exe" ^
+  start= auto
+```
+
+### 1.3 Start / Stop / Remove
+
+```bat
 sc start Attendance-Service
 sc stop Attendance-Service
-
-### 0.4 Remove Service
 sc delete Attendance-Service
+```
+
+### 1.4 Fresh Install / Reset
+
+Sebelum fresh install, hapus semua checkpoint dan cache:
+
+```
+C:\ProgramData\Attendance-Monitoring-Service\
+  ├── event-stop.checkpoint       ← hapus
+  ├── event-stop.checkpoint.bak   ← hapus
+  ├── event-replay.checkpoint     ← hapus
+  ├── event-queue.json            ← hapus
+  └── summary-cache.json          ← hapus
+```
 
 ---
 
-# 1. Shutdown Priority
+## 2. Architecture Overview
 
-| Priority | Event ID | Condition                                    | Label                                 |
-| -------- | -------- | -------------------------------------------- | ------------------------------------ |
-| 5        | 6006     | Ada paired 1074 yang confirmed shutdown     | Shutdown Completed (Confirmed)       |
-| 4        | 1074     | Shutdown/power-off initiated                 | Shutdown Initiated                    |
-| 3        | 6006     | Tidak ada paired 1074                        | Shutdown Completed (Unconfirmed)     |
-| 2        | 4647     | User logout eksplisit                        | User Logout                           |
-| 1        | 6008     | Unexpected shutdown (power loss)             | Unexpected Shutdown                   |
-| 1        | 41       | System crash / kernel panic                  | System Crash                          |
-| 0        | 1074     | Restart initiated                             | Restart Initiated                     |
-| 0        | 42       | Sleep                                        | Sleep                                 |
-
-> Catatan: 1074 → 6006 pairing window = 60 detik.
-
----
-
-# 2. Windows Event Log IDs
-
-## 2.1 Security Log
-
-| Event ID | Description        |
-| -------- | ----------------- |
-| 4624     | User login         |
-| 4647     | User logout        |
-
-## 2.2 System Log
-
-| Event ID | Description                 |
-| -------- | --------------------------- |
-| 1074     | Shutdown / restart initiated|
-| 6006     | Event Log service stopped   |
-| 6008     | Unexpected shutdown         |
-| 41       | Kernel power crash          |
-| 42       | Sleep                       |
+```
+Windows Event Log (Security + System)
+        │
+        ├── OnSecurityEventWritten (live)
+        └── OnSystemEventWritten   (live)
+                │
+         ShouldSkipLiveEntry?
+         (eventTime <= replayUpperBound → skip)
+                │
+         ProcessSecurityEntryAsync / ProcessSystemEntryAsync
+                │
+         ┌──────────────────────────────┐
+         │   PersistentEventQueue       │  event-queue.json
+         │   EnqueueIfNotDuplicateAsync │
+         └──────────────────────────────┘
+                │
+         ProcessQueuedEventsTask (background loop)
+                │
+         TryDispatchQueuedEventAsync
+                │
+         ┌──────────────┬──────────────┐
+         │              │              │
+      Raw List     Summary List    SummaryCache
+   (ListId)     (SummaryListId)  summary-cache.json
+```
 
 ---
 
-# 3. Application Log Event IDs
+## 3. Data Files
 
-| Event ID | Level   | Source       | Description                                           |
-| -------- | ------- | ------------ | ----------------------------------------------------- |
-| 0        | Info    | Attendance-Service | Service start/stop                                   |
-| 1001     | Error   | Application | Constructor error — gagal inisialisasi EventLog      |
-| 1002     | Error   | Application | Gagal start setelah max retries                       |
-| 1004     | Error   | Application | Failed to decrypt configuration                       |
-| 1015     | Warning | Application | Error in ProcessQueuedEventsTask                      |
-| 1016     | Info    | Application | Duplicate event skipped                                |
-| 1017     | Warning | Application | Failed to save stop checkpoint                         |
-| 1018     | Info    | Application | Saving checkpoint (OnStop/OnShutdown)                 |
-| 1019     | Info    | Application | Checkpoint saved (OnStop/OnShutdown)                  |
-| 1020     | Info    | Application | SaveStopCheckpoint: dir + path info                   |
-| 1021     | Info    | Application | SaveStopCheckpoint: created directory                 |
-| 1022     | Info    | Application | SaveStopCheckpoint: written to primary + backup       |
-| 1023     | Warning | Application | LoadStopCheckpoint: fallback / exception             |
-| 1024     | Info    | Application | LoadStopCheckpoint: loaded from primary               |
-| 1025     | Info    | Application | EnsureCheckpointBootstrap: seeded missing checkpoint |
-| 1026     | Warning | Application | EnsureCheckpointBootstrap failed                       |
-| 1027     | Warning | Application | LoadStopCheckpoint: exception                          |
-| 1029     | Info    | Application | ReplayMissedEvents: no checkpoint found, skipping     |
-| 1030     | Info    | Application | ReplaySystemEvents: found N events                    |
-| 1031     | Info    | Application | ReplaySystemEvents: processing EventId=X             |
-| 1032     | Info    | Application | ReplaySecurityEvents: found N events                  |
-| 1033     | Info    | Application | ReplaySecurityEvents: processing EventId=X           |
-| 1034     | Info    | Application | ReplayMissedEvents: replayFrom + replayTo            |
-| 1035     | Warning | Application | ReplaySecurityEvents: fromTime null — skipping       |
-| 1036     | Warning | Application | ReplaySystemEvents: fromTime null — skipping         |
-| 1037     | Info    | Application | Live event skipped during replay overlap             |
-| 1040     | Warning | Application | Queue: recovered from backup after JsonException     |
-| 1041     | Warning | Application | Queue: backup recovery failed                         |
-| 1042     | Warning | Application | Queue: JSON corrupted, resetting queue               |
-| 1043     | Warning | Application | LoadStopCheckpoint: replay checkpoint stale          |
-| 2001     | Warning | Application | DBG-1074: NULL message — skipping                     |
-| 2002     | Info    | Application | DBG-1074: message preview                              |
-| 2003     | Info    | Application | DBG-1074: GetUserFromSystem1074Message result        |
-| 2004     | Info    | Application | DBG-1074: Stored state username + shutdownType       |
-| 2005     | Info    | Application | DBG-6006: resolved username + confirmed shutdownType|
-| 2006     | Info    | Application | DBG-eventId: username null, fallback lastActiveUser |
-| 2007     | Info    | Application | DBG-eventId: GetMostRecentUser result                |
-| 2008     | Warning | Application | DBG-eventId: DROPPING event — no username resolved  |
-| 2010     | Info    | Application | DBG-6006: TryResolve — no prior 1074 state in memory|
-| 2011     | Info    | Application | DBG-6006: TryResolve — diff >60s                     |
-| 2012     | Info    | Application | DBG-6006: TryResolve — matched username + diff      |
-| 2020     | Info    | Application | DBG-1074: broad fallback matched candidate          |
-| 2021     | Warning | Application | DBG-1074: GetUserFromSystem1074Message exception   |
-| 3001     | Info    | Application | UpsertLogin: user, computer, loginTime, workDate, summaryKey |
-| 3002     | Info    | Application | UpsertLogin: row exists, storedLogin vs incoming    |
-| 3003     | Info    | Application | UpsertLogin: updating to earlier loginTime          |
-| 3004     | Info    | Application | UpsertLogin: creating new row                        |
-| 3005     | Info    | Application | UpsertLogin: successfully created row               |
-| 3010     | Info    | Application | TryUpdateShutdown: user, computer, shutdownTime, eventId |
-| 3011     | Info    | Application | TryUpdateShutdown: SKIP — no matching summary row  |
-| 3012     | Info    | Application | TryUpdateShutdown: found row — loginTime, expectedTimeOut, currentShutdown |
-| 3013     | Info    | Application | TryUpdateShutdown: SKIP — IsValidShutdownCandidate=false |
-| 3014     | Info    | Application | TryUpdateShutdown: SKIP — priority too low          |
-| 3015     | Info    | Application | TryUpdateShutdown: SKIP — same priority, existing later |
-| 3016     | Info    | Application | TryUpdateShutdown: PATCHING — detail priority + isNewSession |
-| 3017     | Info    | Application | TryUpdateShutdown: PATCH success                    |
-| 3018     | Info    | Application | TryUpdateShutdown: NEW SESSION detected — reset priority |
-| 4001     | Warning | Application | Token null — skipping dispatch                       |
-| 4002     | Info    | Application | DISPATCH: detail queueId, eventId, needsRaw, needsSummary |
-| 4003     | Info    | Application | DISPATCH: Raw record sent                             |
-| 4004     | Info    | Application | DISPATCH-SUMMARY→ListId: sending/OK login          |
-| 4005     | Info    | Application | DISPATCH-SUMMARY→ListId: sending/OK shutdown       |
-| 4006     | Info    | Application | DISPATCH: Summary dispatched                        |
-| 4007     | Info    | Application | DISPATCH: Done — doneRaw + doneSummary              |
-| 4010     | Info    | Application | Waiting 30s for network on fresh boot               |
-| 4011     | Warning | Application | Token attempt failed: HTTP status                   |
-| 4012     | Warning | Application | Token attempt network error (SocketException)       |
-| 4013     | Warning | Application | Token attempt exception                              |
-| 4020     | Info    | Application | RAW: Inserting — title, eventTime, eventType        |
-| 4021     | Info    | Application | RAW: Idempotency — record exists, skipping         |
-| 4022     | Info    | Application | RAW: Insert success                                 |
-| 4023     | Warning | Application | RAW: Insert attempt failed — HTTP status           |
-| 4024     | Warning | Application | RAW: Insert attempt exception                        |
-| 4025     | Info    | Application | RAW: Idempotency hit detail — diff seconds         |
-| 5001-5005 | Info/Warning | Application | Cleanup events                                      |
-| 9996     | Error   | Application | Unhandled exception in OnSystemEventWritten        |
-| 9997     | Error   | Application | Unhandled exception in OnSecurityEventWritten      |
-| 9998     | Error   | Application | Unobserved task exception                           |
-| 9999     | Error   | Application | Unhandled exception (crash handler)                |
+### 3.1 Checkpoint Files
 
----
+Lokasi: `C:\ProgramData\Attendance-Monitoring-Service\`
 
-# 4. Checkpoint System
+| File | Isi | Ditulis Kapan |
+|------|-----|---------------|
+| `event-stop.checkpoint` | Timestamp event terakhir diproses (UTC) | Per-event, heartbeat 1 menit, OnStop, crash handler |
+| `event-stop.checkpoint.bak` | Backup identik dari primary | Bersamaan dengan primary (atomic write) |
+| `event-replay.checkpoint` | `replayUpperBound` dari replay terakhir (UTC) | Setelah `ReplayMissedEventsFromCheckpoint()` selesai |
+| `event-queue.json` | Antrian event yang belum di-dispatch ke SharePoint | Persistent — survive restart |
+| `summary-cache.json` | Keys summary yang sudah berhasil dikirim ke SharePoint | Setiap `UpsertDailySummaryLoginAsync` berhasil |
+| `summary-cache.json.bak` | Backup dari summary-cache sebelum write terakhir | Atomic write (File.Replace) |
 
-## 4.1 Checkpoint Files
+### 3.2 Atomic Write Pattern
 
-| File                        | Location                                       | Content                                                 | Written When                                                                                  |
-| --------------------------- | ---------------------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `event-stop.checkpoint`     | `%ProgramData%\Attendance-Monitoring-Service\` | Last processed event timestamp (`eventTime - 1 detik`) | Per-event enqueue, heartbeat tiap 1 menit, OnStop/OnShutdown (`Now - 5 detik`, jika lebih baru) |
-| `event-stop.checkpoint.bak` | sama                                           | Backup identik                                         | Ditulis bersamaan menggunakan atomic write                                                   |
-| `event-replay.checkpoint`   | sama                                           | Replay upper bound (`replayTo`)                        | Setelah `ReplayMissedEventsFromCheckpoint()` selesai                                          |
-
----
-
-## 4.2 Atomic Write
-Primary write:
-1. Write → event-stop.checkpoint.tmp
+```
+1. Tulis ke  → event-stop.checkpoint.tmp
 2. File.Move(tmp → event-stop.checkpoint, overwrite:true)
+3. Tulis ke  → event-stop.checkpoint.bak.tmp
+4. File.Move(tmp → event-stop.checkpoint.bak, overwrite:true)
+```
 
-Backup write:
-1. Write → event-stop.checkpoint.bak.tmp
-2. File.Move(tmp → event-stop.checkpoint.bak, overwrite:true)
-
-- Crash-safe: file `.tmp` rusak → file utama tetap valid.
-
----
-
-## 4.3 Writers
-
-| Layer                                       | Trigger                                      | Value Written               | Purpose                              |
-| ------------------------------------------- | -------------------------------------------- | ---------------------------- | ------------------------------------ |
-| Per-event                                   | ProcessEvent enqueue                        | `eventTime - 1 detik`       | Akurasi checkpoint                    |
-| Heartbeat                                   | Timer 1 menit                               | `DateTime.Now`              | Safety net saat idle                  |
-| OnStop / OnShutdown                         | Service stop normal                          | `Now - 5 detik`             | Graceful stop                         |
-| Crash handler (UnhandledException)          | Unhandled exception                           | `Now - 1 menit`             | Last-resort checkpoint                |
-| Crash handler (UnobservedTaskException)    | Task exception                                | `Now - 1 menit`             | Last-resort checkpoint                |
-| EnsureCheckpointBootstrap                   | Service start, no checkpoint                 | `Now - 1 menit`             | Seed awal untuk replay                 |
+Crash saat write → file `.tmp` rusak, file utama tetap valid.
 
 ---
 
-# 5. Replay System
+## 4. Windows Event IDs Monitored
 
-## 5.1 LoadStopCheckpoint Fallback
+### 4.1 Security Log
 
-| Level                  | Condition                                       | `replayFrom` Value           | Event ID |
-| ---------------------- | ----------------------------------------------- | ---------------------------- | -------- |
-| Primary                | checkpoint ada dan valid                        | file content                 | 1024     |
-| Backup                 | primary hilang/rusak                            | file.bak                     | 1023     |
-| Derived                | checkpoint tidak ada, replay checkpoint ada     | replayCheckpoint - 5 menit  | 1023     |
-| Derived Stale          | derived < Now - 7 hari                           | Now - 7 hari                 | 1043     |
-| Fresh Install          | tidak ada checkpoint                             | today 00:00:00               | 1023     |
+| Event ID | Deskripsi |
+|----------|-----------|
+| 4624 | User login berhasil |
+| 4647 | User logout eksplisit |
+
+### 4.2 System Log
+
+| Event ID | Deskripsi |
+|----------|-----------|
+| 1074 | Shutdown atau restart diinisiasi |
+| 6006 | Event Log service berhenti (setelah shutdown/restart) |
+| 6008 | Unexpected shutdown (power loss) |
+| 41 | Kernel power — system crash |
+| 42 | Sleep |
 
 ---
 
-## 5.2 Replay Flow
+## 5. Application Log Event IDs
+
+Semua log ditulis ke **Windows Application Event Log**.
+
+### 5.1 Service Lifecycle
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 0 | Info | Service start / stop (source: Attendance-Service) |
+| 1001 | Error | Constructor error — gagal inisialisasi EventLog |
+| 1002 | Error | Gagal start setelah max retries |
+| 1004 | Error | Gagal decrypt konfigurasi |
+
+### 5.2 Checkpoint
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 1017 | Warning | Gagal save stop checkpoint |
+| 1018 | Info | Saving checkpoint (OnStop/OnShutdown) |
+| 1019 | Info | Checkpoint saved (OnStop/OnShutdown) |
+| 1020 | Info | SaveStopCheckpoint: dir + path info |
+| 1021 | Info | SaveStopCheckpoint: created directory |
+| 1022 | Info | SaveStopCheckpoint: berhasil ditulis ke primary + backup |
+| 1023 | Warning | LoadStopCheckpoint: fallback / exception |
+| 1024 | Info | LoadStopCheckpoint: loaded dari primary |
+| 1025 | Info | EnsureCheckpointBootstrap: seeded missing checkpoint |
+| 1026 | Warning | EnsureCheckpointBootstrap failed |
+| 1027 | Warning | LoadStopCheckpoint: exception |
+| 1043 | Warning | LoadStopCheckpoint: replay checkpoint stale → clamp ke 7 hari |
+
+### 5.3 Replay
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 1029 | Info | ReplayMissedEvents: no checkpoint found, skipping |
+| 1030 | Info | ReplaySystemEvents: found N events |
+| 1031 | Info | ReplaySystemEvents: processing EventId=X |
+| 1032 | Info | ReplaySecurityEvents: found N events |
+| 1033 | Info | ReplaySecurityEvents: processing EventId=X |
+| 1034 | Info | ReplayMissedEvents: replayFrom + replayTo |
+| 1035 | Warning | ReplaySecurityEvents: fromTime null — skipping |
+| 1036 | Warning | ReplaySystemEvents: fromTime null — skipping |
+| 1037 | Info | Live event skipped during replay overlap |
+| 1038 | Info | Live event skipped — older than replayUpperBound (rate-limited: 1x/30 detik) |
+
+### 5.4 Queue & Dispatch
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 1006 | Warning | HandleServiceStopping: timeout menunggu dispatch selesai |
+| 1007 | Error | Error in MonitorEvents |
+| 1008 | Warning | Error in CleanupOldRecordsTask |
+| 1009 | Warning | Error in ProcessSecurityEntryAsync |
+| 1010 | Warning | Error in ProcessSystemEntryAsync |
+| 1011 | Warning | Error in ProcessEvent |
+| 1014 | Warning | Error in ReplayMissedEventsFromCheckpoint |
+| 1015 | Warning | Error in ProcessQueuedEventsTask |
+| 1016 | Info | Duplicate event skipped |
+| 1028 | Warning | Dispatch failed (exception) |
+| 1029 | Warning | Summary permanently failed setelah 5 retry → skip |
+| 1040 | Warning | Queue: recovered from backup setelah JsonException |
+| 1041 | Warning | Queue: backup recovery failed |
+| 1042 | Warning | Queue: JSON corrupted, resetting queue |
+
+### 5.5 Debug System Event Parsing
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 2001 | Warning | DBG-1074: NULL message — skipping |
+| 2002 | Info | DBG-1074: message preview |
+| 2003 | Info | DBG-1074: GetUserFromSystem1074Message result |
+| 2004 | Info | DBG-1074: stored state username + shutdownType |
+| 2005 | Info | DBG-6006: resolved username + confirmed shutdownType |
+| 2006 | Info | DBG-eventId: username null, fallback lastActiveUser |
+| 2007 | Info | DBG-eventId: GetMostRecentUser result |
+| 2008 | Warning | DBG-eventId: DROPPING event — no username resolved |
+| 2010 | Info | DBG-6006: TryResolve — no prior 1074 state in memory |
+| 2011 | Info | DBG-6006: TryResolve — diff > 60 detik |
+| 2012 | Info | DBG-6006: TryResolve — matched username + diff |
+| 2020 | Info | DBG-1074: broad fallback matched candidate |
+| 2021 | Warning | DBG-1074: GetUserFromSystem1074Message exception |
+
+### 5.6 SharePoint Summary
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 3001 | Info | UpsertLogin: user, computer, loginTime, workDate, summaryKey |
+| 3002 | Info | UpsertLogin: row exists, storedLogin vs incoming |
+| 3003 | Info | UpsertLogin: updating to earlier loginTime |
+| 3004 | Info | UpsertLogin: creating new row |
+| 3005 | Info | UpsertLogin: successfully created row |
+| 3006 | Info | UpsertLogin: deleting duplicate row (auto-cleanup) |
+| 3007 | Info | UpsertLogin: cache hit — row already exists, skipping |
+| 3008 | Info | FindSummaryItemWithRetry: attempt N not found, retrying |
+| 3009 | Warning | FindSummaryItemWithRetry: all attempts exhausted |
+| 3010 | Info | TryUpdateShutdown: user, computer, shutdownTime, eventId |
+| 3011 | Info | TryUpdateShutdown: SKIP — no matching summary row |
+| 3012 | Info | TryUpdateShutdown: found row — loginTime, currentShutdown, allFields |
+| 3013 | Info | TryUpdateShutdown: SKIP — IsValidShutdownCandidate=false |
+| 3014 | Info | TryUpdateShutdown: SKIP — priority too low |
+| 3015 | Info | TryUpdateShutdown: SKIP — same priority, existing later |
+| 3016 | Info | TryUpdateShutdown: PATCHING — priority + isNewSession |
+| 3017 | Info | TryUpdateShutdown: PATCH success |
+| 3018 | Info | TryUpdateShutdown: NEW SESSION detected — reset priority |
+| 3019 | Warning | FindSummaryItemForShutdown: cache hit but not found on first attempt, retrying |
+| 3020 | Warning | FindSummaryItemAsync: HTTP error |
+| 3021 | Info | FindSummaryItemAsync: result count |
+| 3022 | Info | TryUpdateShutdown: PATCH body |
+
+### 5.7 Dispatch & Raw List
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 4001 | Warning | Token null — skipping dispatch |
+| 4002 | Info | DISPATCH: detail queueId, eventId, needsRaw, needsSummary |
+| 4003 | Info | DISPATCH: Raw record sent |
+| 4004 | Info | DISPATCH: Sending summary login |
+| 4005 | Info | DISPATCH: Sending summary shutdown |
+| 4006 | Info | DISPATCH: Summary dispatched |
+| 4007 | Info | DISPATCH: Done — doneRaw + doneSummary |
+| 4010 | Info | Waiting 30 detik for network on fresh boot |
+| 4011 | Warning | Token attempt failed: HTTP status |
+| 4012 | Warning | Token attempt network error (SocketException) |
+| 4013 | Warning | Token attempt exception |
+| 4020 | Info | RAW: Inserting — title, eventTime, eventType |
+| 4021 | Info | RAW: Idempotency — record already exists, skipping |
+| 4022 | Info | RAW: Insert success |
+| 4023 | Warning | RAW: Insert attempt failed — HTTP status |
+| 4024 | Warning | RAW: Insert attempt exception |
+| 4025 | Info | RAW: Idempotency hit — title match dalam window ±60 detik |
+
+### 5.8 Cleanup
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 5001 | Info | Cleanup started — cutoffDate, listId, summaryListId |
+| 5002 | Info | Cleanup ListId (raw) selesai — N items deleted |
+| 5003 | Info | Cleanup SummaryListId selesai — N items deleted |
+| 5004 | Warning | Cleanup gagal fetch items — HTTP error |
+| 5005 | Warning | Cleanup gagal delete item — HTTP error (bukan 404) |
+| 5006 | Info | SummaryCache cleanup: removed N old entries |
+
+### 5.9 Crash & Unhandled Exceptions
+
+| Event ID | Level | Deskripsi |
+|----------|-------|-----------|
+| 9996 | Error | Unhandled exception in OnSystemEventWritten |
+| 9997 | Error | Unhandled exception in OnSecurityEventWritten |
+| 9998 | Error | Unobserved task exception |
+| 9999 | Error | Unhandled exception (crash handler) |
+
+---
+
+## 6. Login Filtering
+
+### 6.1 Logon Type
+
+Hanya logon type berikut yang diproses:
+
+| LogonType | Nama | Diproses |
+|-----------|------|----------|
+| 2 | Interactive | ✅ |
+| 7 | Unlock | ✅ |
+| 10 | RemoteInteractive (RDP) | ✅ |
+| 11 | CachedInteractive | ✅ |
+| 3 | Network | ❌ |
+| 4 | Batch | ❌ |
+| 5 | Service | ❌ |
+| Lainnya | — | ❌ |
+
+### 6.2 Username Filtering
+
+| Kondisi | Hasil |
+|---------|-------|
+| Kosong / whitespace | ❌ rejected |
+| `SYSTEM`, `LOCAL SERVICE`, `LOCAL_SYSTEM`, `NETWORK SERVICE` | ❌ rejected |
+| `ANONYMOUS LOGON`, `Guest`, `DefaultAccount`, `Administrator` | ❌ rejected |
+| Berakhiran `$` | ❌ computer account |
+| Prefix `DWM-`, `UMFD-`, `NT Service` | ❌ system account |
+| Valid | ✅ diproses |
+
+---
+
+## 7. Admin Login Detection
+
+Windows membuat **2 event 4624** untuk setiap admin login (UAC split token):
+
+| Event | Elevated Token | Keterangan |
+|-------|---------------|------------|
+| Event 1 | Yes | High integrity token |
+| Event 2 | No | Filtered standard token |
+
+Keduanya memiliki field `Linked Logon ID` yang **non-zero** dan saling pointing satu sama lain.
+
+**Filter:** Kalau `Linked Logon ID != 0x0000000000000000` → ini bagian dari admin split token pair → **kedua event di-skip**. Login admin tidak dicatat sebagai attendance karena biasanya hanya untuk keperluan teknis (buka Event Viewer, jalankan sc command, copy file ke Program Files, dll).
+
+---
+
+## 8. Checkpoint System
+
+### 8.1 Writers
+
+| Layer | Trigger | Value Ditulis | Tujuan |
+|-------|---------|---------------|--------|
+| Per-event | ProcessEvent enqueue | `eventTime - 1 detik` (UTC) | Akurasi — event ini ikut di-replay jika service restart sebelum dispatch selesai |
+| Heartbeat | Timer 1 menit | `DateTime.UtcNow` | Safety net saat idle (tidak ada event masuk) |
+| OnStop / OnShutdown | Service stop normal | `UtcNow - 5 detik` (jika lebih baru dari existing) | Graceful stop |
+| Crash handler | UnhandledException / UnobservedTaskException | `UtcNow - 1 menit` | Last-resort sebelum process mati |
+
+**Guard:** Per-event hanya menulis jika `candidate > existingCheckpoint` — tidak pernah mundur. Tanpa ini, replay event lama bisa overwrite checkpoint hari ini.
+
+### 8.2 LoadStopCheckpoint — 4-Level Fallback
+
+| Level | Kondisi | replayFrom | Event ID |
+|-------|---------|-----------|----------|
+| 1 Primary | File primary ada dan valid | Isi file | 1024 Info |
+| 2 Backup | Primary hilang/rusak | Isi file.bak | 1023 Warning |
+| 3 Derived | Kedua stop checkpoint tidak ada, replay checkpoint ada | `replayCheckpoint - 5 menit` | 1023 Warning |
+| 3b Derived Stale | Derived < `UtcNow - 7 hari` | `UtcNow - MaxReplayLookback (7 hari)` | 1043 Warning |
+| 4 Fresh Install | Tidak ada checkpoint sama sekali | `today 00:00:00 UTC` | 1023 Warning |
+
+---
+
+## 9. Replay System
+
+### 9.1 Flow
+
+```
 OnStart()
-→ EnableRaisingEvents = true
-→ ReplayMissedEventsFromCheckpoint()
-→ replayTo = Now
-→ replayUpperBound = replayTo
-→ replayInProgress = true
-→ replayFrom = LoadStopCheckpoint()
-→ ReplaySecurityEvents(replayFrom, replayTo)
-→ scan Security log
-→ filter eventTime > replayFrom && <= replayTo
-→ filter EventId 4624, 4647
-→ pre-filter LogonType
-→ sort ascending
-→ process one-by-one
-→ ReplaySystemEvents(replayFrom, replayTo)
-→ scan System log
-→ filter eventTime > replayFrom && <= replayTo
-→ filter EventId 1074, 6006, 6008, 41, 42
-→ sort ascending
-→ process one-by-one
-→ SaveReplayCheckpoint(replayTo)
-→ replayInProgress = false
-→ StartCheckpointHeartbeat()
+  → EnableRaisingEvents = true          ← DULU sebelum replay
+  → replayTo = DateTime.UtcNow
+  → replayUpperBound = replayTo
+  → replayInProgress = true
+  → replayFrom = LoadStopCheckpoint()
+  → ReplaySecurityEvents(replayFrom, replayTo)
+      scan Security log
+      filter: eventTime > replayFrom && <= replayTo
+      filter: EventId 4624, 4647
+      pre-filter: LogonType harus valid
+      sort: ascending (eventTime)
+      process one-by-one
+  → ReplaySystemEvents(replayFrom - 30 detik, replayTo)
+      scan System log
+      filter: eventTime > (replayFrom - 30s) && <= replayTo
+      filter: EventId 1074, 6006, 6008, 41, 42
+      sort: ascending
+      process one-by-one
+  → SaveReplayCheckpoint(replayTo)
+  → replayInProgress = false
+  → StartCheckpointHeartbeat()
+```
 
+> **Catatan penting:** `EnableRaisingEvents = true` diaktifkan **sebelum** replay dimulai. Ini mencegah gap: event yang terjadi antara `replayTo` dan saat listener aktif akan muncul sebagai live event dan diproses dengan benar. Event yang terjadi sebelum `replayUpperBound` otomatis di-skip oleh `ShouldSkipLiveEntry`.
 
----
+### 9.2 Mengapa System Events Replay Dimulai 30 Detik Lebih Awal
 
-## 5.3 Replay Order Reasoning
+1074 dan 6006 bisa terjadi bersamaan di detik yang sama (misalnya 15:53:04 dan 15:53:07). Checkpoint di-save sebagai `eventTime - 1 detik` sehingga 1074 di 15:53:04 menghasilkan checkpoint 15:53:03. Namun karena berbagai faktor timing, 1074 bisa jatuh 1–2 detik sebelum `replayFrom`.
 
-| Reason                               | Explanation                                                     |
-| ------------------------------------ | --------------------------------------------------------------- |
-| lastActiveUser harus tersedia         | System events (6006, 6008, 41) membutuhkan fallback user        |
-| Replay security terlebih dahulu       | 4624 login event mengisi lastActiveUser                         |
-| 1074 harus sebelum 6006               | TryResolve1074StateFor6006 membutuhkan last1074Username          |
-| Sorting ascending menjamin urutan    | 1074 → 6006 benar-benar di-process sesuai prioritas             |
+Dengan extend `replayFrom - 30 detik` untuk system events, 1074 selalu masuk replay dan state-nya ter-set di memory **sebelum** 6006 di-replay → pairing 1074↔6006 bekerja → 6006 jadi "Confirmed" bukan "Unconfirmed".
 
----
+### 9.3 Urutan Replay
 
-# 6. Deduplication
+| Alasan | Penjelasan |
+|--------|-----------|
+| Security events dulu | 4624 mengisi `lastActiveUser` yang dibutuhkan system events |
+| 1074 sebelum 6006 | `TryResolve1074StateFor6006` butuh `last1074Username` di memory |
+| Sort ascending | Memastikan 1074 → 6006 diproses sesuai urutan kronologis |
 
-| Mechanism                                           | Description                                                                    |
-| --------------------------------------------------- | ------------------------------------------------------------------------------ |
-| ShouldSkipLiveEntryDuringReplay                     | Skip live events jika `eventTime <= replayUpperBound`                           |
-| PersistentEventQueue.EnqueueIfNotDuplicateAsync     | Event duplicate jika EventId+Username+ComputerName sama dalam window 10 menit  |
+### 9.4 Live Event Filter
 
-Special for 4624: incoming lebih awal → replace existing.
+Filter `ShouldSkipLiveEntry` berlaku **permanen** (bukan hanya saat replay):
 
----
+```
+if (eventTime <= replayUpperBound) → SKIP
+```
 
-# 7. Login & Username Filtering
-
-## 7.1 LogonType
-
-| LogonType | Name                    | Processed |
-| --------- | ----------------------- | --------- |
-| 2         | Interactive             | ✅         |
-| 7         | Unlock                  | ✅         |
-| 10        | RemoteInteractive (RDP) | ✅         |
-| 11        | CachedInteractive       | ✅         |
-| 3         | Network                 | ❌         |
-| 4         | Batch                   | ❌         |
-| 5         | Service                 | ❌         |
-| Others    | —                       | ❌         |
-
-## 7.2 Username Filtering
-
-| Condition                                                     | Result             |
-| ------------------------------------------------------------- | ------------------ |
-| Kosong / whitespace                                           | ❌ rejected        |
-| SYSTEM, LOCAL SERVICE, LOCAL_SYSTEM, NETWORK SERVICE          | ❌ rejected        |
-| ANONYMOUS LOGON, Guest, DefaultAccount, Administrator         | ❌ rejected        |
-| Berakhiran `$`                                                | ❌ computer account|
-| Prefix DWM-, UMFD-, NT Service                                 | ❌ system account  |
-| Valid                                                         | ✅ processed       |
-
-## 7.3 Username Resolution (System Events)
-
-| Order | Source                         | Condition                           |
-| ----- | ------------------------------ | ----------------------------------- |
-| 1     | GetUserFromSystem1074Message   | Hanya untuk 1074                    |
-| 2     | TryResolve1074StateFor6006     | Pair dengan 1074 dalam 60 detik     |
-| 3     | lastActiveUser                 | Setiap 4624 login                   |
-| 4     | GetMostRecentUser              | Scan Security log 12 jam            |
-| 5     | Drop event                      | Jika username tetap tidak ditemukan |
+Ini menangani kasus Windows yang mem-fire event lama dari Security log saat `EnableRaisingEvents = true` — bisa terjadi baik saat replay berlangsung maupun setelahnya. Log 1038 di-rate-limit (maksimal 1x per 30 detik) untuk menghindari spam.
 
 ---
 
-# 8. Shutdown Event Pairing
+## 10. Deduplication
 
-| Parameter              | Value    | Description                                  |
-| ---------------------- | -------- | -------------------------------------------- |
-| Max diff (1074 → 6006) | 60 detik | Pairing timeout                             |
-| ShutdownEventWindow    | 2 menit  | Window skip network wait saat dispatch      |
+### 10.1 Queue-Level Dedup
+
+`PersistentEventQueue.EnqueueIfNotDuplicateAsync`:
+
+| Kriteria | Window | Behaviour |
+|---------|--------|-----------|
+| EventId + Username + ComputerName sama | 30 detik | Skip duplicate |
+| EventId 4624, incoming lebih awal | 30 detik | Replace existing (simpan timestamp paling awal) |
+
+Window 30 detik: cukup lebar untuk menangkap Windows yang kadang fire 2 event 4624 dalam selisih beberapa detik, tapi cukup kecil agar unlock dan login berikutnya tidak saling ter-dedup.
+
+### 10.2 Raw List Idempotency Check
+
+Sebelum insert ke raw list, `RawRecordAlreadyExistsAsync` query SharePoint dengan filter `EventTime` window ±60 detik, lalu cocokkan `Title` dari hasil. Jika ada → skip insert.
+
+### 10.3 IsSummaryEligible
+
+Field pada `QueuedAttendanceEvent` untuk event 4624:
+- `true` hanya jika belum ada 4624 lain dengan `Username+ComputerName+WorkDate` yang sama di queue
+- Memastikan hanya 1 row per hari di SummaryListId dari sisi queue
+
+`IsSummaryEligible` **tidak persist** lintas restart (direset ke false setelah queue kosong). `FindSummaryItemWithRetryAsync` di `UpsertDailySummaryLoginAsync` adalah authoritative check — jika row sudah ada di SharePoint, tidak akan create baru.
 
 ---
 
-# 9. Cleanup Task
+## 11. Queue System
 
-| Parameter      | Value                                                         |
-| -------------- | ------------------------------------------------------------- |
-| Schedule       | 03:00 setiap hari                                             |
-| Retention      | 6 bulan                                                       |
-| Target Lists   | ListId (EventTime), SummaryListId (WorkDate)                  |
-| Random delay   | 0–5 menit                                                     |
-| Random seed    | MachineName.GetHashCode()                                     |
-| Missed cleanup | Jika service start > 03:00, cleanup langsung dijalankan       |
+### 11.1 PersistentEventQueue
+
+File: `event-queue.json`
+
+Queue di-persist ke disk sehingga event yang belum di-dispatch ke SharePoint tidak hilang kalau service restart / crash.
+
+### 11.2 Dispatch Loop
+
+`ProcessQueuedEventsTask` berjalan sebagai background task:
+
+```
+while not cancelled:
+  Peek item pertama dari queue
+  TryDispatchQueuedEventAsync(item)
+  
+  if success:
+    Remove item dari queue
+  else:
+    retryCount[queueId]++
+    if retryCount >= 5 AND raw sudah berhasil AND summary belum:
+      Log warning 1029
+      Mark summary dispatched
+      Remove dari queue   ← agar queue tidak stuck
+    else:
+      Delay 10 detik, retry
+```
+
+**Anti-stuck mechanism:** Kalau summary dispatch gagal terus-menerus (misalnya row tidak ditemukan di SharePoint karena alasan permanen), setelah 5 kali gagal item di-skip dari queue. Raw list tidak terpengaruh — raw record sudah berhasil dikirim sebelum summary dicoba.
+
+Retry counter disimpan in-memory `Dictionary<string, int>` — reset saat service restart (intentional: give fresh chance setelah restart).
 
 ---
 
-# 10. Event ID Ranges
+## 12. Dispatch & SharePoint Integration
 
-| Range       | Purpose                                     |
-| ----------- | ------------------------------------------- |
-| 0           | Service lifecycle                            |
-| 1001–1043   | Service infrastructure (checkpoint/replay)  |
-| 2001–2021   | Debug system event parsing                   |
-| 3001–3018   | SharePoint summary updates                   |
-| 4001–4025   | Dispatch & Raw SharePoint                     |
-| 5001–5005   | Cleanup tasks                                |
-| 9996–9999   | Crash & unhandled exceptions                 |
+### 12.1 Raw List (ListId)
 
+Setiap event yang valid dikirim ke raw list sebagai individual record:
+
+| Field SharePoint | Isi |
+|----------------|-----|
+| Title | `ComputerName\EventId\Username` |
+| Username | Username |
+| EventID | Event ID Windows |
+| EventTime | UTC (format: `yyyy-MM-ddTHH:mm:ssZ`) |
+| EventType | Deskripsi event (mis. "User Login\nLogon Type: 11 - CachedInteractive") |
+| ComputerName | Nama PC |
+
+**Index yang dibutuhkan di SharePoint:** `EventTime`
+
+### 12.2 Summary List (SummaryListId)
+
+Satu row per user per hari:
+
+| Field SharePoint | Isi |
+|----------------|-----|
+| Title | `ComputerName\Username\yyyy-MM-dd` |
+| Username | Username |
+| ComputerName | Nama PC |
+| WorkDate | Tanggal kerja (format: `yyyy-MM-dd`) |
+| LoginTime | UTC login pertama hari itu |
+| ExpectedTimeOut | LoginTime + 9 jam |
+| ShutdownTime | UTC shutdown/logout terakhir yang valid |
+| ShutdownType | Format: `EventId - Label` (mis. `6006 - Shutdown Completed (Shutdown Initiated)`) |
+
+**Index yang dibutuhkan di SharePoint:** `Username`, `ComputerName`, `WorkDate` (masing-masing as primary column)
+
+---
+
+## 13. Summary List Logic
+
+### 13.1 UpsertDailySummaryLoginAsync
+
+```
+1. Cek SummaryCache → cache hit? → return (skip query)
+2. FindSummaryItemWithRetryAsync (retry 3x: 3s, 6s, 12s delay)
+3. Row ada?
+   → pilih canonical row (LoginTime paling awal)
+   → hapus duplikat row jika ada (Event ID 3006)
+   → update LoginTime jika incoming lebih awal
+   → tulis ke SummaryCache
+   → return
+4. Row tidak ada setelah semua retry → create new row
+   → tulis ke SummaryCache
+```
+
+**FindSummaryItemWithRetryAsync** dibutuhkan karena Graph API eventual consistency — row yang baru di-insert mungkin belum muncul di query berikutnya dalam beberapa detik.
+
+### 13.2 TryUpdateDailySummaryShutdownAsync
+
+```
+1. FindSummaryItemForShutdownAsync
+   - Cek SummaryCache untuk today key
+   - Cache hit? → FindSummaryItemAsync (1 attempt)
+     - Gagal? → FindSummaryItemWithRetryAsync (retry penuh)
+   - Cache miss? → FindSummaryItemWithRetryAsync langsung
+   - Fallback: cek yesterday key (untuk overnight session, max 20 jam)
+2. Row tidak ada → SKIP (log 3011)
+3. IsValidShutdownCandidate? → validasi timing
+4. Priority check → hanya overwrite jika priority lebih tinggi
+5. isNewSession check → jika shutdownTime > currentShutdown → reset priority (sesi baru)
+6. PATCH ShutdownTime + ShutdownType
+```
+
+### 13.3 IsValidShutdownCandidate
+
+| Rule | Kondisi | Hasil |
+|------|---------|-------|
+| 1074 Restart | `eventType` mengandung "restart"/"reboot" | ❌ skip |
+| Sebelum login | `shutdownTime < loginTime` | ❌ skip |
+| Session guardrail | `shutdownTime > loginTime + 20 jam` | ❌ skip |
+
+---
+
+## 14. Shutdown Priority
+
+Priority menentukan event mana yang boleh overwrite `ShutdownTime` di Summary. Higher wins.
+
+| Priority | Event ID | Kondisi | Label Tersimpan |
+|----------|----------|---------|-----------------|
+| 5 | 6006 | Ada paired 1074 shutdown (bukan restart) | `6006 - Shutdown Completed (Shutdown Initiated)` |
+| 4 | 1074 | Shutdown/power-off (bukan restart) | `1074 - Shutdown Initiated` |
+| 2 | 4647 | User logout eksplisit | `4647 - User Logout` |
+| 1 | 6008 | Unexpected shutdown (power loss) | `6008 - Unexpected Shutdown` |
+| 1 | 41 | System crash / kernel panic | `41 - System Crash` |
+| 0 | 1074 | Restart initiated | ❌ tidak ditulis ke Summary |
+| 0 | 6006 | Tidak ada paired 1074 (unconfirmed) | ❌ tidak ditulis ke Summary |
+| 0 | 42 | Sleep | ❌ tidak ditulis ke Summary |
+
+**1074 ↔ 6006 pairing window:** 60 detik. Jika dalam 60 detik setelah 1074 ada 6006, keduanya dipasangkan.
+
+**isNewSession rule:** Jika `incoming shutdownTime > existing shutdownTime`, ini dianggap sesi baru (user sudah login lagi lalu shutdown lagi). Priority lama diabaikan — shutdown terbaru selalu menang. Contoh: 6006 jam 09:00 (priority 5) lalu user login jam 13:00 lalu 4647 jam 17:00 → tanpa rule ini 4647 (priority 2) di-skip → dengan rule ini 4647 jam 17:00 > 09:00 → tulis 17:00.
+
+---
+
+## 15. Summary Cache
+
+File: `summary-cache.json`
+
+### 15.1 Tujuan
+
+Mencegah duplikat row di SummaryListId **lintas service restart**. Setelah restart, queue kosong sehingga `IsSummaryEligible` tidak bisa mendeteksi bahwa row untuk `user+computer+workDate` hari ini sudah ada. Cache ini menjawab pertanyaan itu secara lokal tanpa query SharePoint.
+
+### 15.2 Format
+
+```json
+{
+  "keys": [
+    "ON-083\\annafi\\2026-03-13",
+    "ON-083\\kidannafi\\2026-03-13"
+  ]
+}
+```
+
+Key format: `ComputerName\Username\yyyy-MM-dd`
+
+### 15.3 Write Policy
+
+- Ditulis setelah `UpsertDailySummaryLoginAsync` berhasil confirm atau create row
+- Idempotent — aman dipanggil berkali-kali untuk key yang sama
+- Atomic write dengan `.bak` file
+
+### 15.4 Cleanup
+
+Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggil bersamaan dengan cleanup SharePoint di `CleanupOldRecordsTask`.
+
+---
+
+## 16. Cleanup Task
+
+| Parameter | Value |
+|-----------|-------|
+| Jadwal | 03:00 setiap hari (local time) |
+| Retention | 6 bulan |
+| Target lists | ListId (filter: `EventTime`), SummaryListId (filter: `WorkDate`) |
+| SummaryCache | Entry > 7 hari dihapus |
+| Random delay | 0–5 menit (seed: `MachineName.GetHashCode()`) |
+| Missed cleanup | Jika service start setelah jam 03:00 → cleanup langsung dijalankan |
+
+### 16.1 Behavior di 36 Device
+
+- Tidak ada koordinasi antar device
+- Setiap device cleanup **semua** data lama (tidak dibatasi per ComputerName)
+- Kalau 2 device cleanup bersamaan dan coba hapus item yang sama → device kedua dapat HTTP 404 → diabaikan (bukan error)
+- Tidak ada data corrupt, tidak ada race condition
+
+---
+
+## 17. DateTime & Timezone
+
+**Semua DateTime di sistem menggunakan UTC.**
+
+| Komponen | Format | Keterangan |
+|---------|--------|------------|
+| Windows Event Log (internal) | UTC | `SystemTime` di XML event |
+| `entry.TimeGenerated` | Local | Di-convert ke UTC segera: `.ToUniversalTime()` |
+| Checkpoint files | UTC string dengan Z suffix | `DateTime.UtcNow.ToString("O")` |
+| SharePoint fields (LoginTime, ShutdownTime, EventTime) | UTC dengan Z suffix | `"yyyy-MM-ddTHH:mm:ssZ"` |
+| WorkDate | `yyyy-MM-dd` (local date) | Tidak di-convert ke UTC — agar tanggal sesuai hari kerja setempat |
+| SummaryCache keys | `yyyy-MM-dd` (local date) | Sama dengan WorkDate |
+
+**SharePoint Regional Settings** harus diset ke **UTC+7 (Bangkok/Hanoi/Jakarta)** agar display di SharePoint menampilkan waktu yang benar. System tetap menyimpan UTC — SharePoint yang convert untuk tampilan.
+
+**ParseFieldDateTime:** SharePoint mengembalikan UTC (Z suffix). Di-parse dengan `DateTimeStyles.RoundtripKind` lalu tetap sebagai UTC untuk comparison yang konsisten dengan `eventTime` yang juga UTC.
+
+---
+
+## 18. Username Resolution (System Events)
+
+System events (1074, 6006, 6008, 41) tidak selalu menyertakan username. Fallback chain:
+
+| Urutan | Source | Kondisi |
+|--------|--------|---------|
+| 1 | `GetUserFromSystem1074Message` | Hanya untuk 1074 — parse dari message field |
+| 2 | `TryResolve1074StateFor6006` | Hanya untuk 6006 — pair dengan 1074 dalam 60 detik |
+| 3 | `lastActiveUser` | In-memory, diupdate setiap 4624 login |
+| 4 | `GetMostRecentUser` | Scan Security log 12 jam ke belakang, max 500 entries |
+| 5 | Drop event | Jika username tetap tidak ditemukan |
+
+---
+
+## 19. Multi-Device Behavior
+
+Service dirancang untuk berjalan di banyak device secara bersamaan tanpa koordinasi:
+
+| Aspek | Behavior |
+|-------|---------|
+| Raw list writes | Concurrent insert dari device berbeda — SharePoint handle ini natively |
+| Summary list writes | Tiap device upsert row-nya sendiri (`ComputerName\Username\WorkDate` unik per device) |
+| SummaryCache | Lokal per device — tidak di-share |
+| Cleanup | Siapapun yang cleanup pertama, hapus semua data lama semua device. Device lain yang cleanup belakangan tidak ketemu data lama → nothing to delete → aman |
+| Cleanup 404 | HTTP 404 saat delete diabaikan (item sudah dihapus device lain) |
+| Token | Masing-masing device fetch token sendiri (App Registration shared) |
