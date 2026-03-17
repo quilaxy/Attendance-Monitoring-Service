@@ -1016,6 +1016,13 @@ namespace EventLogOutEmployeeService
                     SafeWriteEventLog("Application",
                         $"[DISPATCH] Summary dispatched: queueId={item.QueueId} eventId={item.EventId} user={item.Username}",
                         EventLogEntryType.Information, 4006);
+
+                    // Kalau ini adalah event dari shutdown group, mark semua member lain
+                    // sebagai summaryDispatched=true agar mereka tidak ikut kirim summary.
+                    // Ini penting untuk kasus timer expired tanpa 6006 — setelah 1074 kirim
+                    // summary, 4647 yang masih di queue tidak boleh kirim lagi.
+                    if (item.ShutdownGroupId != null)
+                        await eventQueue.MarkGroupSummaryDispatchedAsync(item.ShutdownGroupId, exceptQueueId: item.QueueId);
                 }
 
                 bool doneRaw     = !item.WriteRawRecord || item.RawRecordDispatched;
