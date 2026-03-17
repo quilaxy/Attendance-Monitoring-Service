@@ -161,6 +161,9 @@ namespace EventLogOutEmployeeService
 
         private static void SafeLog(string message, EventLogEntryType type, int eventId)
         {
+            // 5006 (cleanup detail) adalah verbose-only
+            if (!LoginLogoutMonitorService.VerboseLogging && eventId == 5006)
+                return;
             try { EventLog.WriteEntry("Application", message, type, eventId); }
             catch { }
         }
