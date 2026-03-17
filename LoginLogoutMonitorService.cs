@@ -537,8 +537,8 @@ namespace EventLogOutEmployeeService
             1018, 1019, 1020, 1021, 1022, 1025,
             // Replay progress
             1030, 1031, 1032, 1033, 1034,
-            // Live event skip (rate-limited tapi tetap noise di production)
-            1037, 1038,
+            // Live event skip & duplicate skip — normal behavior, bukan error
+            1016, 1037, 1038,
             // Debug system event parsing — semua [DBG-*]
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
             // SharePoint summary detail
