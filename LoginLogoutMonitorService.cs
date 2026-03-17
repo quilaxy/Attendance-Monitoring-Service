@@ -56,6 +56,18 @@ namespace EventLogOutEmployeeService
 
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
 
+        /// <summary>
+        /// Kalau false, hanya log essential (error, warning, lifecycle) yang ditulis.
+        /// Log verbose (detail dispatch, debug system event, replay progress, dll) di-skip.
+        /// Di-set dari AppSettings:VerboseLogging di appsettings.json. Default: false.
+        /// </summary>
+        public static bool VerboseLogging
+        {
+            get => _verboseLogging;
+            set => _verboseLogging = value;
+        }
+        private static bool _verboseLogging = false;
+
         public LoginLogoutMonitorService()
         {
             // Allow OnShutdown() to be called during system shutdown/restart.
@@ -500,6 +512,11 @@ namespace EventLogOutEmployeeService
 
         private static void SafeWriteEventLog(string source, string message, EventLogEntryType type, int eventId)
         {
+            // Kalau VerboseLogging=false, skip event ID yang masuk kategori verbose.
+            // Hanya error, warning essential, dan lifecycle event yang tetap ditulis.
+            if (!_verboseLogging && _verboseOnlyEventIds.Contains(eventId))
+                return;
+
             try
             {
                 EventLog.WriteEntry(source, message, type, eventId);
@@ -509,6 +526,31 @@ namespace EventLogOutEmployeeService
                 // Ignore EventLog failures during shutdown windows.
             }
         }
+
+        /// <summary>
+        /// Event ID yang hanya ditulis saat VerboseLogging=true.
+        /// Di production, log ini terlalu banyak dan tidak diperlukan untuk monitoring normal.
+        /// </summary>
+        private static readonly HashSet<int> _verboseOnlyEventIds = new HashSet<int>
+        {
+            // Checkpoint detail
+            1018, 1019, 1020, 1021, 1022, 1025,
+            // Replay progress
+            1030, 1031, 1032, 1033, 1034,
+            // Live event skip (rate-limited tapi tetap noise di production)
+            1037, 1038,
+            // Debug system event parsing — semua [DBG-*]
+            2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
+            // SharePoint summary detail
+            3001, 3002, 3003, 3004, 3005, 3007, 3008,
+            3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
+            // Dispatch detail
+            4002, 4003, 4004, 4005, 4008, 4009, 4010,
+            // RAW insert success detail
+            4020, 4021, 4022, 4025,
+            // Cleanup progress detail
+            5001, 5002, 5003, 5006,
+        };
 
         private void SaveReplayCheckpoint(DateTime checkpoint)
         {
@@ -643,37 +685,46 @@ namespace EventLogOutEmployeeService
         private IConfiguration LoadConfiguration(string baseDirectory)
         {
             string plainConfigPath = Path.Combine(baseDirectory, "appsettings.json");
+            IConfiguration config;
+
             if (File.Exists(plainConfigPath))
             {
-                return new ConfigurationBuilder()
+                config = new ConfigurationBuilder()
                     .SetBasePath(baseDirectory)
                     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
                     .Build();
             }
-
-            string encryptedConfigPath = Path.Combine(baseDirectory, "appsettings.json.encrypted");
-            if (!File.Exists(encryptedConfigPath))
-                throw new FileNotFoundException(
-                    $"Configuration file not found. Expected '{plainConfigPath}' or '{encryptedConfigPath}'.");
-
-            try
+            else
             {
-                byte[] encryptedData = File.ReadAllBytes(encryptedConfigPath);
-                byte[] decryptedData = ProtectedData.Unprotect(encryptedData, null, DataProtectionScope.LocalMachine);
-                string jsonContent = Encoding.UTF8.GetString(decryptedData);
+                string encryptedConfigPath = Path.Combine(baseDirectory, "appsettings.json.encrypted");
+                if (!File.Exists(encryptedConfigPath))
+                    throw new FileNotFoundException(
+                        $"Configuration file not found. Expected '{plainConfigPath}' or '{encryptedConfigPath}'.");
 
-                var configBuilder = new ConfigurationBuilder();
-                using var stream = new MemoryStream(Encoding.UTF8.GetBytes(jsonContent));
-                configBuilder.AddJsonStream(stream);
-                return configBuilder.Build();
+                try
+                {
+                    byte[] encryptedData = File.ReadAllBytes(encryptedConfigPath);
+                    byte[] decryptedData = ProtectedData.Unprotect(encryptedData, null, DataProtectionScope.LocalMachine);
+                    string jsonContent = Encoding.UTF8.GetString(decryptedData);
+
+                    var configBuilder = new ConfigurationBuilder();
+                    using var stream = new MemoryStream(Encoding.UTF8.GetBytes(jsonContent));
+                    configBuilder.AddJsonStream(stream);
+                    config = configBuilder.Build();
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"Failed to decrypt configuration: {ex.Message}",
+                        EventLogEntryType.Error, 1004);
+                    throw;
+                }
             }
-            catch (Exception ex)
-            {
-                SafeWriteEventLog("Application",
-                    $"Failed to decrypt configuration: {ex.Message}",
-                    EventLogEntryType.Error, 1004);
-                throw;
-            }
+
+            // Baca VerboseLogging dari AppSettings — default false (production mode)
+            VerboseLogging = config.GetValue<bool>("AppSettings:VerboseLogging", defaultValue: false);
+
+            return config;
         }
 
         // ─── Lifecycle ───────────────────────────────────────────────────────────
