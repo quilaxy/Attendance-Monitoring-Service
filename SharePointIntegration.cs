@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
@@ -777,6 +778,10 @@ namespace EventLogOutEmployeeService
         /// </summary>
         private static void SafeWriteEventLog(string source, string message, EventLogEntryType type, int eventId)
         {
+            // Kalau VerboseLogging=false, skip event ID yang masuk kategori verbose.
+            if (!LoginLogoutMonitorService.VerboseLogging && _verboseOnlyEventIds.Contains(eventId))
+                return;
+
             try
             {
                 EventLog.WriteEntry(source, message, type, eventId);
@@ -786,6 +791,20 @@ namespace EventLogOutEmployeeService
                 // Suppress all EventLog failures silently.
             }
         }
+
+        /// <summary>
+        /// Event ID yang hanya ditulis saat VerboseLogging=true.
+        /// </summary>
+        private static readonly HashSet<int> _verboseOnlyEventIds = new HashSet<int>
+        {
+            // SharePoint summary detail
+            3001, 3002, 3003, 3004, 3005, 3007, 3008,
+            3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
+            // Dispatch & raw detail
+            4010, 4020, 4021, 4022, 4025,
+            // Cleanup progress
+            5001, 5002, 5003,
+        };
 
         private async Task<JToken?> FindSummaryItemForShutdownAsync(
             HttpClient client, string computerName, string username, DateTime shutdownTime,
