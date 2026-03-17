@@ -302,6 +302,36 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        /// <summary>
+        /// Tandai semua member group (kecuali <paramref name="exceptQueueId"/>) sebagai
+        /// summaryDispatched=true. Dipanggil setelah event dengan priority tertinggi berhasil
+        /// dispatch summary — mencegah event lain di group ikut kirim summary setelah winner
+        /// sudah di-remove dari queue.
+        /// </summary>
+        public async Task MarkGroupSummaryDispatchedAsync(string groupId, string exceptQueueId, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                bool changed = false;
+                foreach (var item in items.Where(x =>
+                    x.ShutdownGroupId == groupId &&
+                    x.QueueId != exceptQueueId &&
+                    !x.SummaryDispatched))
+                {
+                    item.SummaryDispatched = true;
+                    changed = true;
+                }
+                if (changed)
+                    await WriteAllInternalAsync(items);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
         public async Task<int> GetCountAsync(CancellationToken cancellationToken = default)
         {
             await fileLock.WaitAsync(cancellationToken);
