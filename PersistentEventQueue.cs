@@ -139,12 +139,12 @@ namespace EventLogOutEmployeeService
                 // Kalau ada → IsSummaryEligible = false (bukan first login of day).
                 if (item.EventId == 4624)
                 {
-                    string itemWorkDate = item.EventTime.ToString("yyyy-MM-dd");
+                    string itemWorkDate = item.EventTime.ToLocalTime().ToString("yyyy-MM-dd");
                     bool alreadyHasLoginToday = items.Any(x =>
                         x.EventId == 4624 &&
                         x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
                         x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
-                        x.EventTime.ToString("yyyy-MM-dd") == itemWorkDate &&
+                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == itemWorkDate &&
                         x.IsSummaryEligible);
 
                     item.IsSummaryEligible = !alreadyHasLoginToday;
