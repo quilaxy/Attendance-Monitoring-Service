@@ -385,16 +385,16 @@ namespace EventLogOutEmployeeService
 
                 // Level 4 – Fresh install seed.
                 // Tidak ada checkpoint sama sekali (primary, backup, replay) — ini fresh install
-                // atau DataDirectory baru dibersihkan. Replay dari 00:00 hari ini (UTC) agar event
-                // login pagi (sebelum service pertama kali distart) ikut masuk.
+                // atau DataDirectory baru dibersihkan. Replay dari 00:00 hari ini (local time)
+                // agar event login pagi (sebelum service pertama kali distart) ikut masuk.
                 // Tidak replay lebih jauh agar tidak flood Security log historical.
-                DateTime todayMidnightUtc = now.Date; // UTC midnight
+                DateTime todayMidnightLocal = DateTime.Today.ToUniversalTime(); // local midnight → UTC
                 SafeWriteEventLog("Application",
                     $"LoadStopCheckpoint: FRESH INSTALL — no checkpoint found anywhere. " +
-                    $"Seeding replayFrom to today midnight {todayMidnightUtc:O} " +
-                    $"so events from 00:00 today are captured.",
+                    $"Seeding replayFrom to today local midnight {todayMidnightLocal:O} " +
+                    $"so events from 00:00 local today are captured.",
                     EventLogEntryType.Warning, 1023);
-                return todayMidnightUtc;
+                return todayMidnightLocal;
             }
             catch (Exception ex)
             {
