@@ -326,7 +326,7 @@ namespace EventLogOutEmployeeService
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
-            string workDate    = loginTime.ToString("yyyy-MM-dd");
+            string workDate    = loginTime.ToLocalTime().ToString("yyyy-MM-dd");
             string summaryKey  = BuildSummaryKey(computerName, username, workDate);
             DateTime expectedTimeOut = loginTime.AddHours(9);
 
@@ -812,7 +812,7 @@ namespace EventLogOutEmployeeService
         {
             // Prefer same-day summary row. Pakai retry karena shutdown bisa di-dispatch
             // sebelum login row ter-index di SharePoint (eventual consistency).
-            string todayKey = BuildSummaryKey(computerName, username, shutdownTime.ToString("yyyy-MM-dd"));
+            string todayKey = BuildSummaryKey(computerName, username, shutdownTime.ToLocalTime().ToString("yyyy-MM-dd"));
 
             // Kalau key ada di cache, row pasti ada — tapi tetap fetch untuk ambil itemId dan fields.
             // Pakai retry penuh kalau tidak di cache, retry lebih agresif kalau di cache
@@ -835,7 +835,7 @@ namespace EventLogOutEmployeeService
                 return todayItems[0];
 
             // Fallback: previous-day row for overnight sessions.
-            string yesterdayKey = BuildSummaryKey(computerName, username, shutdownTime.AddDays(-1).ToString("yyyy-MM-dd"));
+            string yesterdayKey = BuildSummaryKey(computerName, username, shutdownTime.ToLocalTime().AddDays(-1).ToString("yyyy-MM-dd"));
             bool yesterdayInCache = summaryCache != null && await summaryCache.ContainsAsync(yesterdayKey);
             var yesterdayItems = yesterdayInCache
                 ? await FindSummaryItemAsync(client, yesterdayKey)
