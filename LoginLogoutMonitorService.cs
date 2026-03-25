@@ -1458,7 +1458,7 @@ namespace EventLogOutEmployeeService
                 };
 
                 // Shutdown group: 4647, 1074, 6006 yang terjadi berbarengan dikelompokkan
-                // agar summary hanya di-dispatch setelah group lengkap (atau timeout 10 detik).
+                // agar summary hanya di-dispatch setelah group lengkap (atau timeout 3 detik).
                 // Tujuan: mencegah 4647 atau 1074 overwrite satu sama lain via isNewSession
                 // padahal ketiganya satu rangkaian shutdown yang sama.
                 // 6008 dan 41 tidak di-group karena mereka standalone (tidak ada paired event).
@@ -1469,7 +1469,9 @@ namespace EventLogOutEmployeeService
                     // event dalam 60 detik yang sama masuk group yang sama.
                     long epochMinute = (long)(eventTime - DateTime.UnixEpoch).TotalMinutes;
                     queuedEvent.ShutdownGroupId = $"shutdown_{computerName}_{username}_{workDate}_{epochMinute}";
-                    queuedEvent.ShutdownGroupHoldUntil = eventTime.AddSeconds(10);
+                    // Timer 3 detik — cukup untuk tunggu 1074/6006 yang fired hampir bersamaan,
+                    // tapi tidak terlalu lama sampai network mati saat shutdown.
+                    queuedEvent.ShutdownGroupHoldUntil = eventTime.AddSeconds(3);
 
                     // Kalau 1074 adalah restart, tandai seluruh group sebagai restart.
                     // Ini memastikan 4647 yang mungkin sudah masuk queue duluan juga ikut di-skip summary.
