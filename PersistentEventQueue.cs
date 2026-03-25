@@ -175,8 +175,10 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Returns true jika ada event EventId=6006 dengan ShutdownGroupId yang sama di queue.
-        /// Dipakai untuk cek apakah group shutdown sudah lengkap sebelum dispatch summary.
+        /// Returns true jika ada event EventId=6006 **confirmed** (bukan unconfirmed)
+        /// dengan ShutdownGroupId yang sama di queue.
+        /// 6006 unconfirmed (tidak ada paired 1074) tidak dianggap sebagai group lengkap
+        /// karena dia tidak akan kirim summary — 4647 harus tetap kirim summary sendiri.
         /// </summary>
         public async Task<bool> GroupHas6006Async(string groupId, CancellationToken cancellationToken = default)
         {
@@ -186,7 +188,8 @@ namespace EventLogOutEmployeeService
                 List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
                 return items.Any(x =>
                     x.EventId == 6006 &&
-                    x.ShutdownGroupId == groupId);
+                    x.ShutdownGroupId == groupId &&
+                    !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase));
             }
             finally
             {
