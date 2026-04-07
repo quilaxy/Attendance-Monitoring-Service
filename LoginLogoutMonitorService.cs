@@ -1241,7 +1241,7 @@ namespace EventLogOutEmployeeService
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
                     return;
 
-                string? sid = GetUserSidFromEvent(eventMessage, eventId);
+                string? sid = GetUserSidFromSecurityEvent(eventMessage, eventId);
                 username = ResolveUsernameBySid(username, sid);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
                     return;
@@ -1700,12 +1700,13 @@ namespace EventLogOutEmployeeService
             return null;
         }
 
-        private string? GetUserSidFromEvent(string message, int eventId)
+        private string? GetUserSidFromSecurityEvent(string message, int securityEventId)
         {
             try
             {
-                string anchor = eventId == 4624 ? "New Logon:" :
-                                eventId == 4647 ? "Subject:" : string.Empty;
+                // Security event only: 4624 (New Logon) and 4647 (Subject).
+                string anchor = securityEventId == 4624 ? "New Logon:" :
+                                securityEventId == 4647 ? "Subject:" : string.Empty;
                 if (string.IsNullOrEmpty(anchor))
                     return null;
 
@@ -1713,8 +1714,8 @@ namespace EventLogOutEmployeeService
                 if (anchorIndex == -1)
                     return null;
 
-                string section = message.Substring(anchorIndex);
-                var match = Regex.Match(section, @"Security ID:\s*([^\r\n]+)", RegexOptions.IgnoreCase);
+                var regex = new Regex(@"Security ID:\s*([^\r\n]+)", RegexOptions.IgnoreCase);
+                var match = regex.Match(message, anchorIndex);
                 if (!match.Success)
                     return null;
 
@@ -1771,7 +1772,7 @@ namespace EventLogOutEmployeeService
             if (normalized.Contains("\\"))
             {
                 int slashIndex = normalized.LastIndexOf('\\');
-                if (slashIndex >= 0 && slashIndex < normalized.Length - 1)
+                if (slashIndex != -1)
                     normalized = normalized.Substring(slashIndex + 1).Trim();
             }
 
