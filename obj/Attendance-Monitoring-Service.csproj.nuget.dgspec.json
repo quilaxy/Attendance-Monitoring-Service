@@ -10,7 +10,7 @@
         "projectUniqueName": "/home/runner/work/Attendance-Monitoring-Service/Attendance-Monitoring-Service/Attendance-Monitoring-Service.csproj",
         "projectName": "Attendance-Monitoring-Service",
         "projectPath": "/home/runner/work/Attendance-Monitoring-Service/Attendance-Monitoring-Service/Attendance-Monitoring-Service.csproj",
-        "packagesPath": "/home/runner/.nuget/packages/",
+        "packagesPath": "/tmp/codeql-scratch-3ad1a8f1f812c639/dbs/csharp/working/packages",
         "outputPath": "/home/runner/work/Attendance-Monitoring-Service/Attendance-Monitoring-Service/obj/",
         "projectStyle": "PackageReference",
         "configFilePaths": [
@@ -92,11 +92,19 @@
           "warn": true,
           "downloadDependencies": [
             {
+              "name": "Microsoft.AspNetCore.App.Ref",
+              "version": "[8.0.25, 8.0.25]"
+            },
+            {
               "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
               "version": "[8.0.25, 8.0.25]"
             },
             {
               "name": "Microsoft.NETCore.App.Host.win-x64",
+              "version": "[8.0.25, 8.0.25]"
+            },
+            {
+              "name": "Microsoft.NETCore.App.Ref",
               "version": "[8.0.25, 8.0.25]"
             },
             {
