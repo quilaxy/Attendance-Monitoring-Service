@@ -1740,7 +1740,7 @@ namespace EventLogOutEmployeeService
 
             lock (sidCacheLock)
             {
-                if (sidUsernameCache.TryGetValue(sid, out string? cached) && !string.IsNullOrWhiteSpace(cached))
+                if (sidUsernameCache.TryGetValue(sid, out string? cached) && IsValidUsername(cached))
                     return cached;
             }
 
@@ -1772,8 +1772,7 @@ namespace EventLogOutEmployeeService
             if (normalized.Contains("\\"))
             {
                 int slashIndex = normalized.LastIndexOf('\\');
-                if (slashIndex != -1)
-                    normalized = normalized.Substring(slashIndex + 1).Trim();
+                normalized = normalized.Substring(slashIndex + 1).Trim();
             }
 
             if (normalized.Contains("@"))
