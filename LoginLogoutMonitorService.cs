@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -21,6 +22,7 @@ namespace EventLogOutEmployeeService
         private CancellationToken? cancellationToken;
         private Timer? checkpointHeartbeatTimer;
         private readonly object userLock = new object();
+        private readonly object sidCacheLock = new object();
         private readonly object checkpointWriteLock = new object();
         private int activeDispatchCount = 0;
         private DateTime serviceStartTime;
@@ -34,6 +36,8 @@ namespace EventLogOutEmployeeService
         private static string? last1074Username;
         private static DateTime last1074EventTime = DateTime.MinValue;
         private static string? last1074ShutdownType;
+        private readonly Dictionary<string, string> sidUsernameCache =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         private static readonly string DataDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -1237,6 +1241,11 @@ namespace EventLogOutEmployeeService
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
                     return;
 
+                string? sid = GetUserSidFromSecurityEvent(eventMessage, eventId);
+                username = ResolveUsernameBySid(username, sid);
+                if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
+                    return;
+
                 if (eventId == 4624)
                 {
                     lock (userLock)
@@ -1663,7 +1672,8 @@ namespace EventLogOutEmployeeService
                         accountName.EndsWith("$", StringComparison.OrdinalIgnoreCase))
                         return null;
 
-                    return accountName.Contains("@") ? accountName.Split('@')[0].Trim() : accountName;
+                    string normalized = NormalizeDisplayUsername(accountName);
+                    return IsValidUsername(normalized) ? normalized : null;
                 }
 
                 if (eventId == 4647)
@@ -1681,12 +1691,94 @@ namespace EventLogOutEmployeeService
                         accountName.EndsWith("$", StringComparison.OrdinalIgnoreCase))
                         return null;
 
-                    return accountName.Contains("@") ? accountName.Split('@')[0].Trim() : accountName;
+                    string normalized = NormalizeDisplayUsername(accountName);
+                    return IsValidUsername(normalized) ? normalized : null;
                 }
             }
             catch { /* silent fail */ }
 
             return null;
+        }
+
+        private string? GetUserSidFromSecurityEvent(string message, int securityEventId)
+        {
+            try
+            {
+                // Security event only: 4624 (New Logon) and 4647 (Subject).
+                string anchor = securityEventId == 4624 ? "New Logon:" :
+                                securityEventId == 4647 ? "Subject:" : string.Empty;
+                if (string.IsNullOrEmpty(anchor))
+                    return null;
+
+                int anchorIndex = message.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
+                if (anchorIndex == -1)
+                    return null;
+
+                var regex = new Regex(@"Security ID:\s*([^\r\n]+)", RegexOptions.IgnoreCase);
+                var match = regex.Match(message, anchorIndex);
+                if (!match.Success)
+                    return null;
+
+                string sid = match.Groups[1].Value.Trim();
+                if (string.IsNullOrWhiteSpace(sid) ||
+                    sid.Equals("-", StringComparison.OrdinalIgnoreCase) ||
+                    sid.Equals("NULL SID", StringComparison.OrdinalIgnoreCase))
+                    return null;
+
+                return sid.StartsWith("S-", StringComparison.OrdinalIgnoreCase) ? sid : null;
+            }
+            catch { /* silent fail */ }
+
+            return null;
+        }
+
+        private string ResolveUsernameBySid(string username, string? sid)
+        {
+            string fallback = NormalizeDisplayUsername(username);
+            if (string.IsNullOrWhiteSpace(sid))
+                return fallback;
+
+            lock (sidCacheLock)
+            {
+                if (sidUsernameCache.TryGetValue(sid, out string? cached) && IsValidUsername(cached))
+                    return cached;
+            }
+
+            try
+            {
+                var securityId = new SecurityIdentifier(sid);
+                var ntAccount = securityId.Translate(typeof(NTAccount)) as NTAccount;
+                string translated = NormalizeDisplayUsername(ntAccount?.Value ?? string.Empty);
+
+                if (IsValidUsername(translated))
+                {
+                    lock (sidCacheLock)
+                        sidUsernameCache[sid] = translated;
+                    return translated;
+                }
+            }
+            catch { /* fallback to parsed account name */ }
+
+            return fallback;
+        }
+
+        private static string NormalizeDisplayUsername(string username)
+        {
+            if (string.IsNullOrWhiteSpace(username))
+                return string.Empty;
+
+            string normalized = username.Trim();
+
+            if (normalized.Contains("\\"))
+            {
+                int slashIndex = normalized.LastIndexOf('\\');
+                normalized = normalized.Substring(slashIndex + 1).Trim();
+            }
+
+            if (normalized.Contains("@"))
+                normalized = normalized.Split('@')[0].Trim();
+
+            return normalized;
         }
 
         private bool IsRelevantLogonType(int logonType)
@@ -1717,11 +1809,7 @@ namespace EventLogOutEmployeeService
                     if (reasonIndex > 0)
                         candidate = candidate.Substring(0, reasonIndex).Trim();
 
-                    if (candidate.Contains("\\"))
-                        candidate = candidate.Substring(candidate.LastIndexOf('\\') + 1).Trim();
-
-                    if (candidate.Contains("@"))
-                        candidate = candidate.Split('@')[0].Trim();
+                    candidate = NormalizeDisplayUsername(candidate);
 
                     if (IsValidUsername(candidate))
                         return candidate;
