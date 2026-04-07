@@ -556,6 +556,14 @@ Hanya logon type berikut yang diproses:
 | Prefix `DWM-`, `UMFD-`, `NT Service` | ❌ system account |
 | Valid | ✅ diproses |
 
+### 7.3 Username Normalization (4624 / 4647 / 1074)
+
+- Untuk event **4624** dan **4647**, service parse `Security ID` (SID) dari message.
+- Jika SID valid, service resolve SID ke `NTAccount` (`DOMAIN\Username`) lalu simpan **display username tanpa domain**.
+- Fallback jika translate SID gagal: gunakan `Account Name` yang diparse dari event.
+- Akibatnya, variasi seperti `annafi.nur@...` (4624) dan `AnnafiNur` (4647) akan dinormalisasi ke satu username yang konsisten berdasarkan SID.
+- Untuk event **1074**, username tetap diambil dari message dan selalu disimpan tanpa domain (format sama seperti 4647).
+
 ---
 
 ## 8. Admin Login Detection
