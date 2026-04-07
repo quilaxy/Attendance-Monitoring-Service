@@ -1238,9 +1238,11 @@ namespace EventLogOutEmployeeService
                     return;
 
                 string? username = GetUsernameFromEvent(eventMessage, eventId);
+                if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
+                    return;
+
                 string? sid = GetUserSidFromEvent(eventMessage, eventId);
-                if (!string.IsNullOrEmpty(username))
-                    username = ResolveUsernameBySid(username, sid);
+                username = ResolveUsernameBySid(username, sid);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
                     return;
 
@@ -1756,12 +1758,6 @@ namespace EventLogOutEmployeeService
             }
             catch { /* fallback to parsed account name */ }
 
-            if (IsValidUsername(fallback))
-            {
-                lock (sidCacheLock)
-                    sidUsernameCache[sid] = fallback;
-            }
-
             return fallback;
         }
 
@@ -1773,7 +1769,11 @@ namespace EventLogOutEmployeeService
             string normalized = username.Trim();
 
             if (normalized.Contains("\\"))
-                normalized = normalized.Substring(normalized.LastIndexOf('\\') + 1).Trim();
+            {
+                int slashIndex = normalized.LastIndexOf('\\');
+                if (slashIndex >= 0 && slashIndex < normalized.Length - 1)
+                    normalized = normalized.Substring(slashIndex + 1).Trim();
+            }
 
             if (normalized.Contains("@"))
                 normalized = normalized.Split('@')[0].Trim();
