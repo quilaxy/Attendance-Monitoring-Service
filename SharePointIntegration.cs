@@ -447,7 +447,7 @@ namespace EventLogOutEmployeeService
                     ExpectedTimeOut  = ToUtcString(expectedTimeOut),
                     ClockIn          = ToLocalTimeString(loginTime),
                     ExpectedClockOut = ToLocalTimeString(expectedTimeOut),
-                    ClockOut         = string.Empty,
+                    ClockOut         = (string?)null,
                     ShutdownType     = string.Empty
                 }
             };
@@ -770,6 +770,7 @@ namespace EventLogOutEmployeeService
         /// <summary>
         /// Converts a DateTime to local time and formats only the clock part (HH:mm:ss)
         /// for string-based SharePoint display columns.
+        /// Local time here follows the server/host OS timezone where this service runs.
         /// </summary>
         private static string ToLocalTimeString(DateTime dt)
             => dt.ToLocalTime().ToString("HH:mm:ss");
