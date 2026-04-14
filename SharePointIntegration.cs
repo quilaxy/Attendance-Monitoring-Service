@@ -404,8 +404,10 @@ namespace EventLogOutEmployeeService
                     {
                         fields = new
                         {
-                            LoginTime       = ToUtcString(loginTime),
-                            ExpectedTimeOut = ToUtcString(loginTime.AddHours(9))
+                            LoginTime        = ToUtcString(loginTime),
+                            ExpectedTimeOut  = ToUtcString(loginTime.AddHours(9)),
+                            ClockIn          = ToLocalTimeString(loginTime),
+                            ExpectedClockOut = ToLocalTimeString(loginTime.AddHours(9))
                         }
                     };
                     var patchContent = new StringContent(JsonConvert.SerializeObject(updateData), Encoding.UTF8, "application/json");
@@ -437,13 +439,16 @@ namespace EventLogOutEmployeeService
             {
                 fields = new
                 {
-                    Title           = summaryKey,
-                    Username        = username,
-                    ComputerName    = computerName,
-                    WorkDate        = workDate,
-                    LoginTime       = ToUtcString(loginTime),
-                    ExpectedTimeOut = ToUtcString(expectedTimeOut),
-                    ShutdownType    = string.Empty
+                    Title            = summaryKey,
+                    Username         = username,
+                    ComputerName     = computerName,
+                    WorkDate         = workDate,
+                    LoginTime        = ToUtcString(loginTime),
+                    ExpectedTimeOut  = ToUtcString(expectedTimeOut),
+                    ClockIn          = ToLocalTimeString(loginTime),
+                    ExpectedClockOut = ToLocalTimeString(expectedTimeOut),
+                    ClockOut         = string.Empty,
+                    ShutdownType     = string.Empty
                 }
             };
 
@@ -590,6 +595,7 @@ namespace EventLogOutEmployeeService
             var patchBody = new JObject
             {
                 ["ShutdownTime"] = ToUtcString(shutdownTime),
+                ["ClockOut"] = ToLocalTimeString(shutdownTime),
                 ["ShutdownType"] = shutdownTypeStr
             };
 
@@ -760,6 +766,9 @@ namespace EventLogOutEmployeeService
         /// </summary>
         private static string ToUtcString(DateTime dt)
             => dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+        private static string ToLocalTimeString(DateTime dt)
+            => dt.ToLocalTime().ToString("HH:mm:ss");
 
         private HttpClient CreateGraphClient(string accessToken, int timeoutSeconds)
         {
