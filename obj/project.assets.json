@@ -2665,19 +2665,19 @@
     ]
   },
   "packageFolders": {
-    "/tmp/codeql-scratch-3ad1a8f1f812c639/dbs/csharp/working/packages": {}
+    "C:\\Users\\annafi\\.nuget\\packages\\": {}
   },
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "/home/runner/work/Attendance-Monitoring-Service/Attendance-Monitoring-Service/Attendance-Monitoring-Service.csproj",
+      "projectUniqueName": "D:\\Attendance-Monitoring-Service\\Attendance-Monitoring-Service.csproj",
       "projectName": "Attendance-Monitoring-Service",
-      "projectPath": "/home/runner/work/Attendance-Monitoring-Service/Attendance-Monitoring-Service/Attendance-Monitoring-Service.csproj",
-      "packagesPath": "/tmp/codeql-scratch-3ad1a8f1f812c639/dbs/csharp/working/packages",
-      "outputPath": "/home/runner/work/Attendance-Monitoring-Service/Attendance-Monitoring-Service/obj/",
+      "projectPath": "D:\\Attendance-Monitoring-Service\\Attendance-Monitoring-Service.csproj",
+      "packagesPath": "C:\\Users\\annafi\\.nuget\\packages\\",
+      "outputPath": "D:\\Attendance-Monitoring-Service\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
-        "/home/runner/.nuget/NuGet/NuGet.Config"
+        "C:\\Users\\annafi\\AppData\\Roaming\\NuGet\\NuGet.Config"
       ],
       "originalTargetFrameworks": [
         "net8.0-windows"
@@ -2700,8 +2700,7 @@
         "enableAudit": "true",
         "auditLevel": "low",
         "auditMode": "direct"
-      },
-      "SdkAnalysisLevel": "10.0.200"
+      }
     },
     "frameworks": {
       "net8.0-windows7.0": {
@@ -2755,23 +2754,15 @@
         "warn": true,
         "downloadDependencies": [
           {
-            "name": "Microsoft.AspNetCore.App.Ref",
-            "version": "[8.0.25, 8.0.25]"
-          },
-          {
             "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
             "version": "[8.0.25, 8.0.25]"
           },
           {
-            "name": "Microsoft.NETCore.App.Host.win-x64",
-            "version": "[8.0.25, 8.0.25]"
-          },
-          {
-            "name": "Microsoft.NETCore.App.Ref",
-            "version": "[8.0.25, 8.0.25]"
-          },
-          {
             "name": "Microsoft.NETCore.App.Runtime.win-x64",
+            "version": "[8.0.25, 8.0.25]"
+          },
+          {
+            "name": "Microsoft.WindowsDesktop.App.Runtime.win-x64",
             "version": "[8.0.25, 8.0.25]"
           }
         ],
@@ -2780,7 +2771,7 @@
             "privateAssets": "all"
           }
         },
-        "runtimeIdentifierGraphPath": "/usr/share/dotnet/sdk/10.0.201/PortableRuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.419/PortableRuntimeIdentifierGraph.json"
       }
     },
     "runtimes": {
