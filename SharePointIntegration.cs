@@ -767,6 +767,10 @@ namespace EventLogOutEmployeeService
         private static string ToUtcString(DateTime dt)
             => dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
 
+        /// <summary>
+        /// Converts a DateTime to local time and formats only the clock part (HH:mm:ss)
+        /// for string-based SharePoint display columns.
+        /// </summary>
         private static string ToLocalTimeString(DateTime dt)
             => dt.ToLocalTime().ToString("HH:mm:ss");
 
