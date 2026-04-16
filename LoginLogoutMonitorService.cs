@@ -24,6 +24,7 @@ namespace EventLogOutEmployeeService
         private readonly object userLock = new object();
         private readonly object sidCacheLock = new object();
         private readonly object checkpointWriteLock = new object();
+        private readonly object knownLoginLock = new object();
         private int activeDispatchCount = 0;
         private DateTime serviceStartTime;
         private volatile bool replayInProgress = false;
@@ -38,6 +39,10 @@ namespace EventLogOutEmployeeService
         private static string? last1074ShutdownType;
         private readonly Dictionary<string, string> sidUsernameCache =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, (string Username, DateTime EventTime)> lastKnownLoginByComputer =
+            new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
+        private int queueAlertThreshold = 500;
+        private bool queueThresholdAlerted = false;
 
         private static readonly string DataDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -53,12 +58,15 @@ namespace EventLogOutEmployeeService
             Path.Combine(DataDirectory, "event-stop.checkpoint.bak");
 
         private readonly PersistentEventQueue eventQueue =
-            new PersistentEventQueue(Path.Combine(DataDirectory, "event-queue.json"));
+            new PersistentEventQueue(Path.Combine(DataDirectory, "queue"));
 
         private readonly SummaryCache summaryCache =
             new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
 
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
+        // Exponential-ish retry schedule for queue dispatch failures:
+        // 30s, 1m, 2m, 5m, 10m (then capped at 10m for subsequent retries).
+        private static readonly int[] DispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
 
         /// <summary>
         /// Kalau false, hanya log essential (error, warning, lifecycle) yang ditulis.
@@ -165,19 +173,12 @@ namespace EventLogOutEmployeeService
                     // Make sure ProgramData checkpoint files exist even after abrupt previous crash.
                     EnsureCheckpointBootstrap();
 
-                    // FIX [GAP]: Aktifkan listener SEBELUM replay dimulai.
-                    //
-                    // Masalah sebelumnya:
-                    //   replayTo = DateTime.Now (di-capture sebelum listener aktif)
-                    //   Replay jalan ~8 detik → listener baru aktif di MonitorEvents()
-                    //   Event yang terjadi antara replayTo dan listener-aktif = HILANG
-                    //   Inilah yang menyebabkan 4624 annafi (10:25:15) tidak masuk.
-                    //
-                    // Solusi:
-                    //   EnableRaisingEvents = true SEBELUM ReplayMissedEventsFromCheckpoint().
-                    //   Event yang masuk saat replay berlangsung akan di-dedup secara otomatis
-                    //   oleh PersistentEventQueue.EnqueueIfNotDuplicateAsync() — tidak ada
-                    //   risiko duplikasi.
+                    // Startup queue-first flow:
+                    // 1) Retry pending queue items
+                    // 2) Enable listeners
+                    // 3) Replay missed events to queue
+                    RetryPendingQueueOnStartupAsync(cancellationToken.Value).GetAwaiter().GetResult();
+
                     if (securityEventLog != null)
                         securityEventLog.EnableRaisingEvents = true;
                     if (systemEventLog != null)
@@ -661,7 +662,7 @@ namespace EventLogOutEmployeeService
                     continue;
 
                 int eventId = GetNormalizedEventId(entry);
-                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
+                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 6005 && eventId != 41 && eventId != 42)
                     continue;
 
                 entries.Add((eventTime, entry, eventId));
@@ -727,6 +728,7 @@ namespace EventLogOutEmployeeService
 
             // Baca VerboseLogging dari AppSettings — default false (production mode)
             VerboseLogging = config.GetValue<bool>("AppSettings:VerboseLogging", defaultValue: false);
+            queueAlertThreshold = Math.Max(1, config.GetValue<int>("AppSettings:QueueAlertThreshold", defaultValue: 500));
 
             return config;
         }
@@ -841,16 +843,25 @@ namespace EventLogOutEmployeeService
 
         private async Task ProcessQueuedEventsTask(CancellationToken cancellationToken)
         {
-            var retryCount = new Dictionary<string, int>();
-
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
-                    QueuedAttendanceEvent? next = await eventQueue.PeekAsync(cancellationToken);
+                    DateTime nowUtc = DateTime.UtcNow;
+                    QueuedAttendanceEvent? next = await eventQueue.PeekNextReadyAsync(nowUtc, cancellationToken);
                     if (next == null)
                     {
-                        await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                        DateTime? earliestRetryUtc = await eventQueue.GetEarliestNextRetryUtcAsync(cancellationToken);
+                        TimeSpan wait = TimeSpan.FromSeconds(5);
+                        if (earliestRetryUtc.HasValue && earliestRetryUtc.Value > nowUtc)
+                        {
+                            TimeSpan untilRetry = earliestRetryUtc.Value - nowUtc;
+                            wait = untilRetry > TimeSpan.FromSeconds(30) ? TimeSpan.FromSeconds(30) : untilRetry;
+                            if (wait < TimeSpan.FromSeconds(1))
+                                wait = TimeSpan.FromSeconds(1);
+                        }
+
+                        await Task.Delay(wait, cancellationToken);
                         continue;
                     }
 
@@ -867,31 +878,24 @@ namespace EventLogOutEmployeeService
 
                     if (sent)
                     {
-                        retryCount.Remove(next.QueueId);
                         await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
                         continue;
                     }
 
-                    // Kalau gagal, increment retry counter in-memory.
-                    // Setelah 5x gagal, skip summary agar queue tidak stuck.
-                    retryCount.TryGetValue(next.QueueId, out int count);
-                    retryCount[next.QueueId] = ++count;
+                    int retryCount = next.DispatchRetryCount + 1;
+                    TimeSpan retryDelay = GetDispatchBackoffDelay(retryCount);
+                    DateTime nextRetryAtUtc = DateTime.UtcNow.Add(retryDelay);
+                    await eventQueue.UpdateRetryStateAsync(
+                        next.QueueId,
+                        retryCount,
+                        nextRetryAtUtc,
+                        next.LastDispatchError ?? "Dispatch failed",
+                        cancellationToken);
 
-                    if (count >= 5 &&
-                        (!next.WriteRawRecord || next.RawRecordDispatched) &&
-                        ShouldProcessSummary(next) && !next.SummaryDispatched)
-                    {
-                        SafeWriteEventLog("Application",
-                            $"[DISPATCH] Summary permanently failed after {count} attempts — " +
-                            $"skipping summary for queueId={next.QueueId} eventId={next.EventId} user={next.Username}",
-                            EventLogEntryType.Warning, 1029);
-                        retryCount.Remove(next.QueueId);
-                        await eventQueue.UpdateDispatchStateAsync(next.QueueId, summaryDispatched: true);
-                        await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
-                        continue;
-                    }
-
-                    await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+                    SafeWriteEventLog("Application",
+                        $"[DISPATCH] Retry scheduled queueId={next.QueueId} eventId={next.EventId} user={next.Username} " +
+                        $"attempt={retryCount} nextRetryAt={nextRetryAtUtc:O} delay={retryDelay.TotalSeconds:F0}s",
+                        EventLogEntryType.Warning, 1039);
                 }
                 catch (TaskCanceledException) { break; }
                 catch (Exception ex)
@@ -905,10 +909,16 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        private static TimeSpan GetDispatchBackoffDelay(int retryCount)
+        {
+            int index = Math.Clamp(retryCount - 1, 0, DispatchBackoffSeconds.Length - 1);
+            return TimeSpan.FromSeconds(DispatchBackoffSeconds[index]);
+        }
+
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
         {
-            // 4624: hanya proses summary kalau ini first login of day (IsSummaryEligible).
-            if (item.EventId == 4624)
+            // Login events (4624 normal, 6005 fallback): summary hanya first login of day.
+            if (item.EventId == 4624 || item.EventId == 6005)
                 return item.IsSummaryEligible;
 
             // Seluruh group ditandai restart → semua member skip summary.
@@ -955,6 +965,7 @@ namespace EventLogOutEmployeeService
                 string? accessToken = await sharePoint.GetAccessTokenAsync(item.EventTime, item.EventId);
                 if (string.IsNullOrEmpty(accessToken))
                 {
+                    item.LastDispatchError = "Access token is null";
                     SafeWriteEventLog("Application",
                         $"[DISPATCH] Token null — skipping queueId={item.QueueId} eventId={item.EventId} user={item.Username}",
                         EventLogEntryType.Warning, 4001);
@@ -1041,7 +1052,7 @@ namespace EventLogOutEmployeeService
 
                 if (needsSummary)
                 {
-                    if (item.EventId == 4624)
+                    if (item.EventId == 4624 || item.EventId == 6005)
                     {
                         SafeWriteEventLog("Application",
                             $"[DISPATCH] Sending summary login: user={item.Username} computer={item.ComputerName} " +
@@ -1087,10 +1098,12 @@ namespace EventLogOutEmployeeService
                     $"[DISPATCH] Done: queueId={item.QueueId} doneRaw={doneRaw} doneSummary={doneSummary}",
                     EventLogEntryType.Information, 4007);
 
+                item.LastDispatchError = null;
                 return doneRaw && doneSummary;
             }
             catch (Exception ex)
             {
+                item.LastDispatchError = $"{ex.GetType().Name}: {ex.Message}";
                 SafeWriteEventLog("Application",
                     $"Dispatch failed: queueId={item.QueueId} eventId={item.EventId} user={item.Username} " +
                     $"time={item.EventTime:O} error={ex.GetType().Name}: {ex.Message}",
@@ -1250,6 +1263,8 @@ namespace EventLogOutEmployeeService
                 {
                     lock (userLock)
                         lastActiveUser = username;
+                    lock (knownLoginLock)
+                        lastKnownLoginByComputer[computerName] = (username, eventTime);
                 }
 
                 await ProcessEvent(eventId, username, eventTime, computerName,
@@ -1292,11 +1307,14 @@ namespace EventLogOutEmployeeService
             try
             {
                 int eventId = GetNormalizedEventId(log);
-                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
+                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 6005 && eventId != 41 && eventId != 42)
                     return;
 
                 DateTime eventTime = log.TimeGenerated.ToUniversalTime();
                 string computerName = log.MachineName;
+                string usernameResolutionSource = "Direct";
+                string? originalUsername = null;
+                string? fallbackSource = null;
 
                 // ── 1074: Null-message guard + message preview for debugging ────────
                 if (eventId == 1074)
@@ -1316,6 +1334,18 @@ namespace EventLogOutEmployeeService
                         EventLogEntryType.Information, 2002);
                 }
 
+                if (eventId == 6005)
+                {
+                    bool handled = await TryProcessFallbackLoginFrom6005Async(eventTime, computerName, writeRawRecord);
+                    if (!handled)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-6005] Event ignored at {eventTime:O} on {computerName} — no fallback login needed/resolved.",
+                            EventLogEntryType.Information, 2014);
+                    }
+                    return;
+                }
+
                 string? eventMessage = (eventId == 1074) ? log.Message : null;
                 string? username = (eventId == 1074) ? GetUserFromSystem1074Message(eventMessage) : null;
 
@@ -1324,6 +1354,38 @@ namespace EventLogOutEmployeeService
                     SafeWriteEventLog("Application",
                         $"[DBG-1074] GetUserFromSystem1074Message returned: '{username ?? "(null)"}'",
                         EventLogEntryType.Information, 2003);
+                }
+
+                if (eventId == 1074)
+                {
+                    originalUsername = username;
+
+                    bool fallbackRequired = string.IsNullOrWhiteSpace(username) ||
+                                            IsSystemFallbackTriggerAccount(username) ||
+                                            !IsValidUsername(username);
+
+                    if (fallbackRequired)
+                    {
+                        string? resolvedFrom4624 = GetMostRecentUserForComputer(
+                            eventTime, computerName, TimeSpan.FromDays(1), requireRelevant4624: true);
+                        if (!string.IsNullOrWhiteSpace(resolvedFrom4624))
+                        {
+                            username = resolvedFrom4624;
+                            usernameResolutionSource = "Fallback4624";
+                            SafeWriteEventLog("Application",
+                                $"[DBG-1074] Fallback resolved username='{username}' from 4624 " +
+                                $"(original='{originalUsername ?? "(null)"}', computer='{computerName}')",
+                                EventLogEntryType.Information, 2013);
+                        }
+                        else
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[DBG-1074] DROPPING 1074 at {eventTime:O} on {computerName} — " +
+                                $"username='{originalUsername ?? "(null)"}' and no valid 4624 fallback found.",
+                                EventLogEntryType.Warning, 2008);
+                            return;
+                        }
+                    }
                 }
 
                 if (eventId == 1074 && !string.IsNullOrEmpty(username))
@@ -1382,7 +1444,8 @@ namespace EventLogOutEmployeeService
                     SharePointIntegration.MarkSleepEvent(eventTime);
 
                 await ProcessEvent(eventId, username, eventTime, computerName,
-                    "System", 0, eventMessage, writeRawRecord);
+                    "System", 0, eventMessage, writeRawRecord,
+                    usernameResolutionSource, originalUsername, fallbackSource);
             }
             catch (Exception ex)
             {
@@ -1398,7 +1461,10 @@ namespace EventLogOutEmployeeService
             int eventId, string username, DateTime eventTime,
             string computerName, string logType,
             int logonType, string? eventMessage,
-            bool writeRawRecord)
+            bool writeRawRecord,
+            string usernameResolutionSource = "Direct",
+            string? originalUsername = null,
+            string? fallbackSource = null)
         {
             try
             {
@@ -1412,6 +1478,7 @@ namespace EventLogOutEmployeeService
                     },
                     "System" => eventId switch
                     {
+                        6005 => "UNCONFIRMED - Fallback from Event 6005, Security Log unavailable",
                         1074 => ParseShutdownType(eventMessage),
                         // For 6006: eventMessage carries the confirmed 1074 shutdown type (if paired).
                         // If null, we don't know the cause — label it as unconfirmed.
@@ -1438,7 +1505,7 @@ namespace EventLogOutEmployeeService
                 DateTime? shutdownTime = null;
                 string? shutdownType = null;
 
-                if (eventId == 4624)
+                if (eventId == 4624 || eventId == 6005)
                 {
                     loginTime = eventTime;
                     expectedTimeOut = eventTime.AddHours(9);
@@ -1463,7 +1530,10 @@ namespace EventLogOutEmployeeService
                     ExpectedTimeOut = expectedTimeOut,
                     ShutdownTime    = shutdownTime,
                     ShutdownType    = shutdownType,
-                    WriteRawRecord  = writeRawRecord
+                    WriteRawRecord  = writeRawRecord,
+                    UsernameResolutionSource = usernameResolutionSource,
+                    OriginalUsername = originalUsername,
+                    FallbackSource = fallbackSource
                 };
 
                 // Shutdown group: 4647, 1074, 6006 yang terjadi berbarengan dikelompokkan
@@ -1506,6 +1576,8 @@ namespace EventLogOutEmployeeService
                 }
                 else
                 {
+                    await CheckQueueSizeThresholdAsync(cancellationToken: default);
+
                     // FIX [CRASH-0xe0434352]: Checkpoint per-event — tulis setiap kali event
                     // berhasil masuk queue. eventTime - 1 detik agar event ini ikut di-replay
                     // kalau service restart sebelum dispatch selesai.
@@ -1529,6 +1601,67 @@ namespace EventLogOutEmployeeService
         }
 
         // ─── Helpers ─────────────────────────────────────────────────────────────
+
+        private async Task RetryPendingQueueOnStartupAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                int initialPending = await eventQueue.GetCountAsync(cancellationToken);
+                if (initialPending == 0)
+                    return;
+
+                SafeWriteEventLog("Application",
+                    $"[STARTUP] Pending queue detected: {initialPending} item(s). Retrying before new ingestion.",
+                    EventLogEntryType.Warning, 1044);
+
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var next = await eventQueue.PeekNextReadyAsync(DateTime.UtcNow, cancellationToken);
+                    if (next == null)
+                        break;
+
+                    bool sent = await TryDispatchQueuedEventAsync(next);
+                    if (sent)
+                    {
+                        await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
+                        continue;
+                    }
+
+                    int retryCount = next.DispatchRetryCount + 1;
+                    TimeSpan retryDelay = GetDispatchBackoffDelay(retryCount);
+                    DateTime nextRetryAt = DateTime.UtcNow.Add(retryDelay);
+                    await eventQueue.UpdateRetryStateAsync(
+                        next.QueueId,
+                        retryCount,
+                        nextRetryAt,
+                        next.LastDispatchError ?? "Dispatch failed on startup retry",
+                        cancellationToken);
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[STARTUP] Pending queue retry pass failed: {ex.Message}",
+                    EventLogEntryType.Warning, 1045);
+            }
+        }
+
+        private async Task CheckQueueSizeThresholdAsync(CancellationToken cancellationToken)
+        {
+            int pending = await eventQueue.GetCountAsync(cancellationToken);
+
+            if (pending > queueAlertThreshold && !queueThresholdAlerted)
+            {
+                queueThresholdAlerted = true;
+                SafeWriteEventLog("Application",
+                    $"[QUEUE] Pending queue high-water alert: {pending} item(s), threshold={queueAlertThreshold}.",
+                    EventLogEntryType.Warning, 1046);
+            }
+            else if (pending <= Math.Max(1, (int)Math.Floor(queueAlertThreshold * 0.8)))
+            {
+                queueThresholdAlerted = false;
+            }
+        }
 
         private string? GetMostRecentUser(DateTime beforeTime)
         {
@@ -1698,6 +1831,122 @@ namespace EventLogOutEmployeeService
             catch { /* silent fail */ }
 
             return null;
+        }
+
+        private string? GetMostRecentUserForComputer(
+            DateTime beforeTime,
+            string computerName,
+            TimeSpan lookbackWindow,
+            bool requireRelevant4624)
+        {
+            try
+            {
+                DateTime lookbackTime = beforeTime - lookbackWindow;
+                EventLog secLog = new EventLog("Security");
+                int checkCount = 0;
+
+                for (int i = secLog.Entries.Count - 1; i >= 0 && checkCount < 1000; i--)
+                {
+                    checkCount++;
+                    EventLogEntry entry = secLog.Entries[i];
+                    if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    int secEventId = GetNormalizedEventId(entry);
+                    if (secEventId != 4624)
+                        continue;
+
+                    DateTime entryTime = entry.TimeGenerated.ToUniversalTime();
+                    if (entryTime < lookbackTime || entryTime > beforeTime || entry.Message == null)
+                        continue;
+
+                    int lt = ParseLogonType(entry.Message);
+                    if (requireRelevant4624 && !IsRelevantLogonType(lt))
+                        continue;
+
+                    string? u = GetUsernameFromEvent(entry.Message, secEventId);
+                    if (!string.IsNullOrEmpty(u) && IsValidUsername(u))
+                        return u;
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"GetMostRecentUserForComputer failed for computer='{computerName}': {ex.Message}",
+                    EventLogEntryType.Warning, 2015);
+            }
+
+            return null;
+        }
+
+        private async Task<bool> TryProcessFallbackLoginFrom6005Async(DateTime eventTime, string computerName, bool writeRawRecord)
+        {
+            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
+            string? today4624 = GetMostRecentUserForComputer(
+                eventTime, computerName, TimeSpan.FromHours(24), requireRelevant4624: true);
+
+            if (!string.IsNullOrWhiteSpace(today4624))
+                return false;
+
+            string? resolvedUsername = null;
+            string? fallbackSource = null;
+
+            lock (knownLoginLock)
+            {
+                if (lastKnownLoginByComputer.TryGetValue(computerName, out var known) &&
+                    known.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
+                    IsValidUsername(known.Username))
+                {
+                    resolvedUsername = known.Username;
+                    fallbackSource = "PreviousLog";
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                string? fromQueue = await eventQueue.FindMostRecentUsernameForComputerAsync(computerName, eventTime);
+                if (!string.IsNullOrWhiteSpace(fromQueue) && IsValidUsername(fromQueue))
+                {
+                    resolvedUsername = fromQueue;
+                    fallbackSource = "PreviousLog";
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                string? fromSharePoint = await sharePointIntegration.Value.GetLatestUsernameByComputerAsync(computerName, eventTime);
+                if (!string.IsNullOrWhiteSpace(fromSharePoint) && IsValidUsername(fromSharePoint))
+                {
+                    resolvedUsername = fromSharePoint;
+                    fallbackSource = "SharePoint";
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-6005] DROPPING fallback login at {eventTime:O} on {computerName} — username could not be resolved.",
+                    EventLogEntryType.Warning, 2008);
+                return false;
+            }
+
+            lock (knownLoginLock)
+                lastKnownLoginByComputer[computerName] = (resolvedUsername, eventTime);
+
+            await ProcessEvent(
+                6005,
+                resolvedUsername,
+                eventTime,
+                computerName,
+                "System",
+                0,
+                null,
+                writeRawRecord,
+                usernameResolutionSource: "Fallback6005",
+                originalUsername: null,
+                fallbackSource: fallbackSource);
+
+            return true;
         }
 
         private string? GetUserSidFromSecurityEvent(string message, int securityEventId)
@@ -1907,6 +2156,29 @@ namespace EventLogOutEmployeeService
 
             return shutdownType.Contains("restart", StringComparison.OrdinalIgnoreCase) ||
                    shutdownType.Contains("reboot", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsSystemFallbackTriggerAccount(string username)
+        {
+            if (string.IsNullOrWhiteSpace(username))
+                return true;
+
+            string normalized = username.Trim();
+            var systemAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "SYSTEM",
+                "system32",
+                "servicing",
+                "TrustedInstaller",
+                "NT AUTHORITY\\SYSTEM",
+                "NT AUTHORITY\\LOCAL SERVICE",
+                "NT AUTHORITY\\NETWORK SERVICE"
+            };
+
+            if (systemAccounts.Contains(normalized))
+                return true;
+
+            return normalized.StartsWith("NT AUTHORITY\\", StringComparison.OrdinalIgnoreCase);
         }
 
         private bool IsValidUsername(string username)

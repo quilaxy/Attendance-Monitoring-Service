@@ -219,6 +219,50 @@ namespace EventLogOutEmployeeService
             return null;
         }
 
+        public async Task<string?> GetLatestUsernameByComputerAsync(string computerName, DateTime referenceTime)
+        {
+            try
+            {
+                string? accessToken = await GetAccessTokenAsync(referenceTime, 0);
+                if (string.IsNullOrWhiteSpace(accessToken))
+                    return null;
+
+                using var client = CreateGraphClient(accessToken, timeoutSeconds: 30);
+                string filter = $"fields/ComputerName eq '{EscapeODataLiteral(computerName)}'";
+                string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
+                             $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=50";
+
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                var response = await client.SendAsync(request);
+                if (!response.IsSuccessStatusCode)
+                    return null;
+
+                var payload = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
+                var items = payload?["value"] as JArray;
+                if (items == null || items.Count == 0)
+                    return null;
+
+                var latest = items
+                    .Select(x => new
+                    {
+                        Username = x["fields"]?["Username"]?.ToString(),
+                        EventTime = ParseFieldDateTime(x["fields"] as JObject, "EventTime")
+                    })
+                    .Where(x => !string.IsNullOrWhiteSpace(x.Username) && x.EventTime.HasValue)
+                    .OrderByDescending(x => x.EventTime!.Value)
+                    .FirstOrDefault();
+
+                return latest?.Username;
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[6005-FALLBACK] GetLatestUsernameByComputerAsync failed for '{computerName}': {ex.Message}",
+                    EventLogEntryType.Warning, 3023);
+                return null;
+            }
+        }
+
         // ── Raw list record ───────────────────────────────────────────────────────
 
         /// <summary>
