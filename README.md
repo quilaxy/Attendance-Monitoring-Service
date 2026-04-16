@@ -70,7 +70,7 @@ C:\ProgramData\Attendance-Monitoring-Service\
   ├── event-stop.checkpoint       ← hapus
   ├── event-stop.checkpoint.bak   ← hapus
   ├── event-replay.checkpoint     ← hapus
-  ├── event-queue.json            ← hapus
+  ├── queue\pending\*.json        ← hapus
   └── summary-cache.json          ← hapus
 ```
 
@@ -310,7 +310,7 @@ Windows Event Log (Security + System)
          ProcessSecurityEntryAsync / ProcessSystemEntryAsync
                 │
          ┌──────────────────────────────┐
-         │   PersistentEventQueue       │  event-queue.json
+         │   PersistentEventQueue       │  queue\\pending\\*.json
          │   EnqueueIfNotDuplicateAsync │
          └──────────────────────────────┘
                 │
@@ -335,7 +335,7 @@ Lokasi: `C:\ProgramData\Attendance-Monitoring-Service\`
 | `event-stop.checkpoint` | Timestamp event terakhir diproses (UTC) | Per-event, heartbeat 1 menit, OnStop, crash handler |
 | `event-stop.checkpoint.bak` | Backup identik dari primary | Bersamaan dengan primary (atomic write) |
 | `event-replay.checkpoint` | `replayUpperBound` dari replay terakhir (UTC) | Setelah `ReplayMissedEventsFromCheckpoint()` selesai |
-| `event-queue.json` | Antrian event yang belum di-dispatch ke SharePoint | Persistent — survive restart |
+| `queue\\pending\\*.json` | Antrian event yang belum di-dispatch ke SharePoint (1 file per event) | Persistent — survive restart |
 | `summary-cache.json` | Keys summary yang sudah berhasil dikirim ke SharePoint | Setiap `UpsertDailySummaryLoginAsync` berhasil |
 | `summary-cache.json.bak` | Backup dari summary-cache sebelum write terakhir | Atomic write (File.Replace) |
 
@@ -682,11 +682,11 @@ Sebelum insert ke raw list, `RawRecordAlreadyExistsAsync` query SharePoint denga
 
 ### 11.3 IsSummaryEligible
 
-Field pada `QueuedAttendanceEvent` untuk event 4624:
-- `true` hanya jika belum ada 4624 lain dengan `Username+ComputerName+WorkDate` yang sama di queue
+Field pada `QueuedAttendanceEvent` untuk event login (4624 normal atau 6005 fallback):
+- `true` hanya jika belum ada event login lain dengan `Username+ComputerName+WorkDate` yang sama di queue
 - Memastikan hanya 1 row per hari di SummaryListId dari sisi queue
 
-`IsSummaryEligible` **tidak persist** lintas restart (direset ke false setelah queue kosong). `FindSummaryItemWithRetryAsync` di `UpsertDailySummaryLoginAsync` adalah authoritative check — jika row sudah ada di SharePoint, tidak akan create baru.
+`IsSummaryEligible` dipersist di file queue per-event, namun `FindSummaryItemWithRetryAsync` di `UpsertDailySummaryLoginAsync` tetap menjadi authoritative check — jika row sudah ada di SharePoint, service tidak akan create baru.
 
 ---
 
@@ -694,7 +694,7 @@ Field pada `QueuedAttendanceEvent` untuk event 4624:
 
 ### 12.1 PersistentEventQueue
 
-File: `event-queue.json`
+Path: `queue\\pending\\*.json`
 
 Queue di-persist ke disk sehingga event yang belum di-dispatch ke SharePoint tidak hilang kalau service restart / crash.
 
