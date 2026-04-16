@@ -64,6 +64,8 @@ namespace EventLogOutEmployeeService
             new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
 
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
+        // Exponential-ish retry schedule for queue dispatch failures:
+        // 30s, 1m, 2m, 5m, 10m (then capped at 10m for subsequent retries).
         private static readonly int[] DispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
 
         /// <summary>
@@ -1655,7 +1657,7 @@ namespace EventLogOutEmployeeService
                     $"[QUEUE] Pending queue high-water alert: {pending} item(s), threshold={queueAlertThreshold}.",
                     EventLogEntryType.Warning, 1046);
             }
-            else if (pending <= queueAlertThreshold)
+            else if (pending <= Math.Max(1, (int)Math.Floor(queueAlertThreshold * 0.8)))
             {
                 queueThresholdAlerted = false;
             }
@@ -1867,8 +1869,11 @@ namespace EventLogOutEmployeeService
                         return u;
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                SafeWriteEventLog("Application",
+                    $"GetMostRecentUserForComputer failed for computer='{computerName}': {ex.Message}",
+                    EventLogEntryType.Warning, 2015);
             }
 
             return null;

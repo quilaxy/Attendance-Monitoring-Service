@@ -233,7 +233,6 @@ namespace EventLogOutEmployeeService
                              $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=50";
 
                 var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
                 var response = await client.SendAsync(request);
                 if (!response.IsSuccessStatusCode)
                     return null;
@@ -255,8 +254,11 @@ namespace EventLogOutEmployeeService
 
                 return latest?.Username;
             }
-            catch
+            catch (Exception ex)
             {
+                SafeWriteEventLog("Application",
+                    $"[6005-FALLBACK] GetLatestUsernameByComputerAsync failed for '{computerName}': {ex.Message}",
+                    EventLogEntryType.Warning, 3023);
                 return null;
             }
         }
