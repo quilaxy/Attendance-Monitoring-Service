@@ -861,7 +861,7 @@ namespace EventLogOutEmployeeService
 
             SafeWriteEventLog("Application",
                 $"[CLEANUP] listId='{listId}' — {totalFetched} total items fetched, " +
-                $"scanning for {dateField} < {cutoffDate:yyyy-MM-dd}",
+                $"scanned for {dateField} < {cutoffDate:yyyy-MM-dd}",
                 EventLogEntryType.Information, 5001);
 
             return deletedCount;
