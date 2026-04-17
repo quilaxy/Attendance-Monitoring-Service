@@ -158,7 +158,6 @@ namespace EventLogOutEmployeeService
                 {
                     if (isShutdownEvent || inShutdownWindow)
                     {
-                        _hasWaitedForNetwork = true;
                     }
                     else
                     {
@@ -167,8 +166,9 @@ namespace EventLogOutEmployeeService
                             EventLogEntryType.Information, 4010);
                         _networkWarmupTask ??= Task.Delay(TimeSpan.FromSeconds(30));
                         networkWarmupTask = _networkWarmupTask;
-                        _hasWaitedForNetwork = true;
                     }
+
+                    _hasWaitedForNetwork = true;
                 }
                 else if (_networkWarmupTask != null && !_networkWarmupTask.IsCompleted)
                 {
@@ -788,6 +788,9 @@ namespace EventLogOutEmployeeService
                         $"[CLEANUP] Failed to fetch items from listId='{listId}' — " +
                         $"HTTP {(int)response.StatusCode}",
                         EventLogEntryType.Warning, 5004);
+                    SafeWriteEventLog("Application",
+                        $"[CLEANUP] listId='{listId}' partial progress: fetched={totalFetched}, deleted={deletedCount}.",
+                        EventLogEntryType.Warning, 5005);
                     return deletedCount;
                 }
 
