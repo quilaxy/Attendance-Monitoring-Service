@@ -29,6 +29,8 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </None>
+
+    <None Remove="appsettings-template.json" />
   </ItemGroup>
 
 </Project>
