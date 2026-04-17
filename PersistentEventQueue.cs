@@ -32,8 +32,12 @@ namespace EventLogOutEmployeeService
 
         // Username resolution metadata (audit)
         public string UsernameResolutionSource { get; set; } = "Direct";
+        public string? ResolvedUsername { get; set; }
         public string? OriginalUsername { get; set; }
+        public bool IsFallback { get; set; } = false;
         public string? FallbackSource { get; set; }
+        public string? Status { get; set; }
+        public bool PendingUsernameResolution { get; set; } = false;
 
         // Persistent retry state
         public int DispatchRetryCount { get; set; } = 0;
@@ -267,6 +271,19 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        public async Task ReplaceAsync(QueuedAttendanceEvent item, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await WriteItemInternalAsync(item);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
         public async Task MarkGroupAsRestartAsync(string groupId, CancellationToken cancellationToken = default)
         {
             await fileLock.WaitAsync(cancellationToken);
@@ -316,6 +333,19 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        public async Task<List<QueuedAttendanceEvent>> GetAllAsync(CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                return SortQueue(await ReadAllInternalAsync());
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
         public async Task<string?> FindMostRecentUsernameForComputerAsync(string computerName, DateTime beforeTimeUtc, CancellationToken cancellationToken = default)
         {
             await fileLock.WaitAsync(cancellationToken);
@@ -334,6 +364,60 @@ namespace EventLogOutEmployeeService
                     .FirstOrDefault();
 
                 return latest?.Username;
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        public async Task<string?> FindMostRecent4624UsernameForComputerAsync(string computerName, DateTime beforeTimeUtc, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                string workDate = beforeTimeUtc.ToLocalTime().ToString("yyyy-MM-dd");
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                var latest = items
+                    .Where(x =>
+                        x.EventId == 4624 &&
+                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                        x.EventTime <= beforeTimeUtc &&
+                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
+                        !string.IsNullOrWhiteSpace(x.Username))
+                    .OrderByDescending(x => x.EventTime)
+                    .FirstOrDefault();
+
+                return latest?.Username;
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        public async Task<(string Username, DateTime EventTime)?> FindFirst4624ForComputerWorkDateAsync(
+            string computerName,
+            string workDate,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                var first = items
+                    .Where(x =>
+                        x.EventId == 4624 &&
+                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
+                        !string.IsNullOrWhiteSpace(x.Username))
+                    .OrderBy(x => x.EventTime)
+                    .FirstOrDefault();
+
+                if (first == null)
+                    return null;
+
+                return (first.Username, first.EventTime);
             }
             finally
             {
