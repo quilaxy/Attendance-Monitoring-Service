@@ -2091,6 +2091,9 @@ namespace EventLogOutEmployeeService
 
         private async Task<bool> ShouldAllow6005FallbackAsync(DateTime eventTime, string computerName)
         {
+            if (replayInProgress)
+                return false;
+
             string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
             if (await HasAny4624ForComputerWorkDateAsync(computerName, workDate, eventTime))
                 return false;
