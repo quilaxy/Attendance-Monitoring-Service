@@ -286,19 +286,7 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
   "AppSettings": {
     "VerboseLogging": false,
     "QueueAlertThreshold": 500,
-    "DispatchBackoffSeconds": [30, 60, 120, 300, 600],
-    "SystemAccountTriggerList": [
-      "NT AUTHORITY\\SYSTEM",
-      "NT AUTHORITY\\LOCAL SERVICE",
-      "NT AUTHORITY\\NETWORK SERVICE"
-    ],
-    "SystemAccountContainsTriggers": [
-      "TrustedInstaller",
-      "servicing",
-      "SYSTEM",
-      "LOCAL SERVICE",
-      "NETWORK SERVICE"
-    ]
+    "DispatchBackoffSeconds": [30, 60, 120, 300, 600]
   }
 }
 ```
@@ -314,8 +302,6 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
 | `AppSettings:VerboseLogging` | `true` untuk debug log detail, `false` untuk log essential |
 | `AppSettings:QueueAlertThreshold` | Batas pending queue untuk high-water alert |
 | `AppSettings:DispatchBackoffSeconds[]` | Jadwal retry dispatch (default: 30,60,120,300,600 detik; setelah itu tetap interval terakhir) |
-| `AppSettings:SystemAccountTriggerList[]` | Daftar exact username trigger fallback 1074 |
-| `AppSettings:SystemAccountContainsTriggers[]` | Daftar keyword trigger fallback 1074 (contains, case-insensitive) |
 
 ---
 

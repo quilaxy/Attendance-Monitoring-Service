@@ -747,18 +747,6 @@ namespace EventLogOutEmployeeService
             queueAlertThreshold = Math.Max(1, config.GetValue<int>("AppSettings:QueueAlertThreshold", defaultValue: 500));
             dispatchBackoffSeconds = ReadIntListSetting(
                 config, "AppSettings:DispatchBackoffSeconds", new[] { 30, 60, 120, 300, 600 });
-            systemFallbackTriggerAccounts = new HashSet<string>(
-                ReadStringListSetting(config, "AppSettings:SystemAccountTriggerList", new[]
-                {
-                    "NT AUTHORITY\\SYSTEM",
-                    "NT AUTHORITY\\LOCAL SERVICE",
-                    "NT AUTHORITY\\NETWORK SERVICE"
-                }),
-                StringComparer.OrdinalIgnoreCase);
-            systemFallbackTriggerContains = ReadStringListSetting(
-                config,
-                "AppSettings:SystemAccountContainsTriggers",
-                new[] { "TrustedInstaller", "servicing", "SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE" });
 
             return config;
         }
@@ -780,28 +768,6 @@ namespace EventLogOutEmployeeService
             {
                 return fallback;
             }
-        }
-
-        private static List<string> ReadStringListSetting(IConfiguration config, string keyPath, IEnumerable<string> fallback)
-        {
-            try
-            {
-                var values = new List<string>();
-                foreach (var child in config.GetSection(keyPath).GetChildren())
-                {
-                    string? raw = child.Value;
-                    if (!string.IsNullOrWhiteSpace(raw))
-                        values.Add(raw.Trim());
-                }
-
-                if (values.Count > 0)
-                    return values;
-            }
-            catch
-            {
-            }
-
-            return new List<string>(fallback);
         }
 
         // ─── Lifecycle ───────────────────────────────────────────────────────────
