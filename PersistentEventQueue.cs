@@ -98,7 +98,6 @@ namespace EventLogOutEmployeeService
                     bool alreadyHasLoginToday = items.Any(x =>
                         (x.EventId == 4624 || x.EventId == 6005) &&
                         x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
-                        x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
                         x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == itemWorkDate &&
                         x.IsSummaryEligible);
 

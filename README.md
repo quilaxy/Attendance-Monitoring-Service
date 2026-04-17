@@ -192,7 +192,7 @@ List ini menyimpan **satu row per user per hari** — jam masuk pertama dan jam 
 
 | Display Name | Internal Name (harus persis) | Tipe | Catatan |
 |---|---|---|---|
-| Title | Title | Single line of text | Sudah ada otomatis. Format: `ComputerName\Username\yyyy-MM-dd` |
+| Title | Title | Single line of text | Sudah ada otomatis. Format: `Username\yyyy-MM-dd` |
 | Username | Username | Single line of text | Buat baru |
 | ComputerName | ComputerName | Single line of text | Buat baru |
 | WorkDate | WorkDate | Date and Time | Buat baru — pilih **Date Only** (tanpa time) |
@@ -204,15 +204,14 @@ List ini menyimpan **satu row per user per hari** — jam masuk pertama dan jam 
 
 **Index yang harus dibuat:**
 
-Buka **List Settings** → **Indexed columns** → **Create a new index** — buat **3 index terpisah**, masing-masing satu kolom:
+Buka **List Settings** → **Indexed columns** → **Create a new index** — buat **2 index terpisah**, masing-masing satu kolom:
 
 | Primary Column | Secondary Column | Alasan |
 |---|---|---|
 | Username | (kosongkan) | OData filter `fields/Username eq '...'` |
-| ComputerName | (kosongkan) | OData filter `fields/ComputerName eq '...'` |
 | WorkDate | (kosongkan) | OData filter `fields/WorkDate eq '...'` dan cleanup task |
 
-> SharePoint mengindex per-kolom, bukan compound. Dengan ketiga kolom di-index, kombinasi query `Username AND ComputerName AND WorkDate` berjalan tanpa perlu header `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly`, sehingga tidak ada risiko query gagal secara random.
+> SharePoint mengindex per-kolom, bukan compound. Dengan kedua kolom di-index, kombinasi query `Username AND WorkDate` berjalan tanpa perlu header `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly`, sehingga tidak ada risiko query gagal secara random.
 
 ---
 
@@ -698,7 +697,7 @@ Sebelum insert ke raw list, `RawRecordAlreadyExistsAsync` query SharePoint denga
 ### 11.3 IsSummaryEligible
 
 Field pada `QueuedAttendanceEvent` untuk event login (4624 normal atau 6005 fallback):
-- `true` hanya jika belum ada event login lain dengan `Username+ComputerName+WorkDate` yang sama di queue
+- `true` hanya jika belum ada event login lain dengan `Username+WorkDate` yang sama di queue
 - Memastikan hanya 1 row per hari di SummaryListId dari sisi queue
 
 `IsSummaryEligible` dipersist di file queue per-event, namun `FindSummaryItemWithRetryAsync` di `UpsertDailySummaryLoginAsync` tetap menjadi authoritative check — jika row sudah ada di SharePoint, service tidak akan create baru.
@@ -794,16 +793,16 @@ Satu row per user per hari:
 
 | Field SharePoint | Isi |
 |----------------|-----|
-| Title | `ComputerName\Username\yyyy-MM-dd` |
+| Title | `Username\yyyy-MM-dd` |
 | Username | Username |
-| ComputerName | Nama PC |
+| ComputerName | LastComputerName (awal: device login pertama; di-overwrite saat shutdown terakhir) |
 | WorkDate | Tanggal kerja (format: `yyyy-MM-dd`) |
 | LoginTime | UTC login pertama hari itu — tidak pernah diupdate ke yang lebih baru |
 | ExpectedTimeOut | LoginTime + 9 jam |
 | ShutdownTime | UTC shutdown/logout terakhir yang valid |
 | ShutdownType | Format: `EventId - Label` (mis. `6006 - Shutdown Completed (Shutdown Initiated)`) |
 
-**Index yang dibutuhkan di SharePoint:** `Username`, `ComputerName`, `WorkDate` (masing-masing as primary column)
+**Index yang dibutuhkan di SharePoint:** `Username`, `WorkDate` (masing-masing as primary column)
 
 ---
 
@@ -839,7 +838,7 @@ Satu row per user per hari:
 3. IsValidShutdownCandidate? → validasi timing
 4. Priority check → hanya overwrite jika priority lebih tinggi
 5. isNewSession check → jika shutdownTime > currentShutdown → reset priority (sesi baru)
-6. PATCH ShutdownTime + ShutdownType
+6. PATCH ShutdownTime + ShutdownType + ComputerName (last device)
 ```
 
 ### 14.3 IsValidShutdownCandidate
@@ -897,19 +896,19 @@ File: `summary-cache.json`
 
 ### 16.1 Tujuan
 
-Mencegah duplikat row di SummaryListId **lintas service restart**. Setelah restart, queue kosong sehingga `IsSummaryEligible` tidak bisa mendeteksi bahwa row untuk `user+computer+workDate` hari ini sudah ada. Cache ini menjawab pertanyaan itu secara lokal tanpa query SharePoint.
+Mencegah duplikat row di SummaryListId **lintas service restart**. Setelah restart, queue kosong sehingga `IsSummaryEligible` tidak bisa mendeteksi bahwa row untuk `user+workDate` hari ini sudah ada. Cache ini menjawab pertanyaan itu secara lokal tanpa query SharePoint.
 
 ### 16.2 Format
 
 ```json
 {
   "keys": [
-    "ON-083\\annafi\\2026-03-13",
+    "annafi\\2026-03-13",
   ]
 }
 ```
 
-Key format: `ComputerName\Username\yyyy-MM-dd`
+Key format: `Username\yyyy-MM-dd`
 
 ### 16.3 Write Policy
 
@@ -1000,7 +999,7 @@ Service dirancang untuk berjalan di banyak device secara bersamaan tanpa koordin
 | Aspek | Behavior |
 |-------|---------|
 | Raw list writes | Concurrent insert dari device berbeda — SharePoint handle ini natively |
-| Summary list writes | Tiap device upsert row-nya sendiri (`ComputerName\Username\WorkDate` unik per device) |
+| Summary list writes | Semua device upsert row user yang sama (`Username\WorkDate` unik per user per hari). LoginTime pakai paling awal lintas device, ShutdownTime pakai paling akhir lintas device |
 | SummaryCache | Lokal per device — tidak di-share |
 | Cleanup | Siapapun yang cleanup pertama, hapus semua data lama semua device. Device lain yang cleanup belakangan tidak ketemu data lama → nothing to delete → aman |
 | Cleanup 404 | HTTP 404 saat delete diabaikan (item sudah dihapus device lain) |

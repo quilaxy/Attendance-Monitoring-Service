@@ -14,19 +14,19 @@ namespace EventLogOutEmployeeService
     ///
     /// Tujuan: mencegah duplikat row di SummaryListId lintas service restart.
     /// Setelah service restart, queue kosong sehingga IsSummaryEligible tidak bisa
-    /// mendeteksi bahwa row untuk user+computer+workDate hari ini sudah ada.
+    /// mendeteksi bahwa row untuk user+workDate hari ini sudah ada.
     /// Cache ini menjawab pertanyaan itu secara lokal tanpa perlu query SharePoint.
     ///
     /// Format file (summary-cache.json):
     /// {
     ///   "keys": [
-    ///     "ON-083\\annafi\\2026-03-12",
-    ///     "ON-083\\kidannafi\\2026-03-12"
+    ///     "annafi\\2026-03-12",
+    ///     "kidannafi\\2026-03-12"
     ///   ]
     /// }
     ///
     /// Cleanup: entry lebih dari 7 hari otomatis dihapus. WorkDate di-parse dari
-    /// key format "ComputerName\\Username\\yyyy-MM-dd".
+    /// key format "Username\\yyyy-MM-dd".
     /// </summary>
     public class SummaryCache
     {
@@ -44,7 +44,7 @@ namespace EventLogOutEmployeeService
 
         /// <summary>
         /// Cek apakah summaryKey sudah ada di cache.
-        /// Format key: "ComputerName\\Username\\yyyy-MM-dd"
+        /// Format key: "Username\\yyyy-MM-dd"
         /// </summary>
         public async Task<bool> ContainsAsync(string summaryKey, CancellationToken cancellationToken = default)
         {
@@ -97,7 +97,7 @@ namespace EventLogOutEmployeeService
 
                 keys.RemoveAll(key =>
                 {
-                    // Key format: "ComputerName\\Username\\yyyy-MM-dd"
+                    // Key format: "Username\\yyyy-MM-dd"
                     // WorkDate adalah segmen terakhir
                     int lastSlash = key.LastIndexOf('\\');
                     if (lastSlash < 0) return false;
