@@ -58,6 +58,7 @@ namespace EventLogOutEmployeeService
             this.queueDirectoryPath = queueDirectoryPath;
             pendingDirectoryPath = Path.Combine(queueDirectoryPath, "pending");
             EnsureQueueDirectories();
+            CleanupOrphanedTempFiles();
         }
 
         public async Task<bool> EnqueueIfNotDuplicateAsync(
@@ -458,6 +459,28 @@ namespace EventLogOutEmployeeService
         {
             Directory.CreateDirectory(queueDirectoryPath);
             Directory.CreateDirectory(pendingDirectoryPath);
+        }
+
+        private void CleanupOrphanedTempFiles()
+        {
+            try
+            {
+                foreach (string tempFile in Directory.GetFiles(pendingDirectoryPath, "*.tmp", SearchOption.TopDirectoryOnly))
+                {
+                    try
+                    {
+                        File.Delete(tempFile);
+                    }
+                    catch (Exception ex)
+                    {
+                        SafeQueueLog($"Queue temp file cleanup failed '{tempFile}': {ex.Message}", EventLogEntryType.Warning, 1042);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeQueueLog($"Queue temp file scan failed in '{pendingDirectoryPath}': {ex.Message}", EventLogEntryType.Warning, 1042);
+            }
         }
 
         private async Task<List<QueuedAttendanceEvent>> ReadAllInternalAsync()
