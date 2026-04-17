@@ -39,10 +39,16 @@ Run semua command berikut **sebagai Administrator**.
 ```bat
 dotnet build
 
-dotnet publish Attendance-Monitoring-Service.csproj ^
-  -c Release ^
-  -o ".\Attendance-Monitoring-Service" ^
-  -p:DebugType=None
+dotnet publish "D:\Attendance-Monitoring-Service\Attendance-Monitoring-Service.csproj" `
+  -c Release `
+  -r win-x64 `
+  --self-contained true `
+  -o "D:\Attendance-Monitoring-Service\Attendance-Monitoring-Service" `
+  -p:PublishSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:EnableCompressionInSingleFile=true `
+  -p:DebugType=None `
+  -p:DebugSymbols=false
 ```
 
 ### 1.2 Install Service
