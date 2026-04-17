@@ -25,6 +25,7 @@ namespace EventLogOutEmployeeService
         private readonly object sidCacheLock = new object();
         private readonly object checkpointWriteLock = new object();
         private readonly object knownLoginLock = new object();
+        private readonly object firstLogonLock = new object();
         private int activeDispatchCount = 0;
         private DateTime serviceStartTime;
         private volatile bool replayInProgress = false;
@@ -41,8 +42,25 @@ namespace EventLogOutEmployeeService
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, (string Username, DateTime EventTime)> lastKnownLoginByComputer =
             new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, (string Username, DateTime EventTime)> firstLogon4624ByDeviceWorkDate =
+            new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
         private int queueAlertThreshold = 500;
         private bool queueThresholdAlerted = false;
+        private int[] dispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
+        private HashSet<string> systemFallbackTriggerAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "NT AUTHORITY\\SYSTEM",
+            "NT AUTHORITY\\LOCAL SERVICE",
+            "NT AUTHORITY\\NETWORK SERVICE"
+        };
+        private List<string> systemFallbackTriggerContains = new List<string>
+        {
+            "TrustedInstaller",
+            "servicing",
+            "SYSTEM",
+            "LOCAL SERVICE",
+            "NETWORK SERVICE"
+        };
 
         private static readonly string DataDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -64,9 +82,6 @@ namespace EventLogOutEmployeeService
             new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
 
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
-        // Exponential-ish retry schedule for queue dispatch failures:
-        // 30s, 1m, 2m, 5m, 10m (then capped at 10m for subsequent retries).
-        private static readonly int[] DispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
 
         /// <summary>
         /// Kalau false, hanya log essential (error, warning, lifecycle) yang ditulis.
@@ -177,6 +192,7 @@ namespace EventLogOutEmployeeService
                     // 1) Retry pending queue items
                     // 2) Enable listeners
                     // 3) Replay missed events to queue
+                    PrimeFirstLogonIndexFromQueueAsync(cancellationToken.Value).GetAwaiter().GetResult();
                     RetryPendingQueueOnStartupAsync(cancellationToken.Value).GetAwaiter().GetResult();
 
                     if (securityEventLog != null)
@@ -729,8 +745,63 @@ namespace EventLogOutEmployeeService
             // Baca VerboseLogging dari AppSettings — default false (production mode)
             VerboseLogging = config.GetValue<bool>("AppSettings:VerboseLogging", defaultValue: false);
             queueAlertThreshold = Math.Max(1, config.GetValue<int>("AppSettings:QueueAlertThreshold", defaultValue: 500));
+            dispatchBackoffSeconds = ReadIntListSetting(
+                config, "AppSettings:DispatchBackoffSeconds", new[] { 30, 60, 120, 300, 600 });
+            systemFallbackTriggerAccounts = new HashSet<string>(
+                ReadStringListSetting(config, "AppSettings:SystemAccountTriggerList", new[]
+                {
+                    "NT AUTHORITY\\SYSTEM",
+                    "NT AUTHORITY\\LOCAL SERVICE",
+                    "NT AUTHORITY\\NETWORK SERVICE"
+                }),
+                StringComparer.OrdinalIgnoreCase);
+            systemFallbackTriggerContains = ReadStringListSetting(
+                config,
+                "AppSettings:SystemAccountContainsTriggers",
+                new[] { "TrustedInstaller", "servicing", "SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE" });
 
             return config;
+        }
+
+        private static int[] ReadIntListSetting(IConfiguration config, string keyPath, int[] fallback)
+        {
+            try
+            {
+                var values = new List<int>();
+                foreach (var child in config.GetSection(keyPath).GetChildren())
+                {
+                    if (int.TryParse(child.Value, out int n) && n > 0)
+                        values.Add(n);
+                }
+
+                return values.Count > 0 ? values.ToArray() : fallback;
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        private static List<string> ReadStringListSetting(IConfiguration config, string keyPath, IEnumerable<string> fallback)
+        {
+            try
+            {
+                var values = new List<string>();
+                foreach (var child in config.GetSection(keyPath).GetChildren())
+                {
+                    string? raw = child.Value;
+                    if (!string.IsNullOrWhiteSpace(raw))
+                        values.Add(raw.Trim());
+                }
+
+                if (values.Count > 0)
+                    return values;
+            }
+            catch
+            {
+            }
+
+            return new List<string>(fallback);
         }
 
         // ─── Lifecycle ───────────────────────────────────────────────────────────
@@ -909,10 +980,10 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        private static TimeSpan GetDispatchBackoffDelay(int retryCount)
+        private TimeSpan GetDispatchBackoffDelay(int retryCount)
         {
-            int index = Math.Clamp(retryCount - 1, 0, DispatchBackoffSeconds.Length - 1);
-            return TimeSpan.FromSeconds(DispatchBackoffSeconds[index]);
+            int index = Math.Clamp(retryCount - 1, 0, dispatchBackoffSeconds.Length - 1);
+            return TimeSpan.FromSeconds(dispatchBackoffSeconds[index]);
         }
 
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
@@ -961,6 +1032,16 @@ namespace EventLogOutEmployeeService
         {
             try
             {
+                if (item.EventId == 6005 && item.PendingUsernameResolution)
+                {
+                    bool resolved = await TryResolvePending6005UsernameAsync(item);
+                    if (!resolved)
+                    {
+                        item.LastDispatchError ??= "6005 username is still unresolved";
+                        return false;
+                    }
+                }
+
                 var sharePoint = sharePointIntegration.Value;
                 string? accessToken = await sharePoint.GetAccessTokenAsync(item.EventTime, item.EventId);
                 if (string.IsNullOrEmpty(accessToken))
@@ -1061,7 +1142,7 @@ namespace EventLogOutEmployeeService
 
                         await sharePoint.UpsertDailySummaryLoginAsync(
                             accessToken, item.Username, item.ComputerName,
-                            item.LoginTime ?? item.EventTime, summaryCache);
+                            item.LoginTime ?? item.EventTime, summaryCache, item.Status);
                     }
                     else
                     {
@@ -1265,6 +1346,7 @@ namespace EventLogOutEmployeeService
                         lastActiveUser = username;
                     lock (knownLoginLock)
                         lastKnownLoginByComputer[computerName] = (username, eventTime);
+                    RegisterFirst4624Logon(computerName, username, eventTime);
                 }
 
                 await ProcessEvent(eventId, username, eventTime, computerName,
@@ -1315,6 +1397,10 @@ namespace EventLogOutEmployeeService
                 string usernameResolutionSource = "Direct";
                 string? originalUsername = null;
                 string? fallbackSource = null;
+                bool isFallback = false;
+                string? resolvedUsername = null;
+                string? status = null;
+                bool pendingUsernameResolution = false;
 
                 // ── 1074: Null-message guard + message preview for debugging ────────
                 if (eventId == 1074)
@@ -1366,12 +1452,14 @@ namespace EventLogOutEmployeeService
 
                     if (fallbackRequired)
                     {
-                        string? resolvedFrom4624 = GetMostRecentUserForComputer(
-                            eventTime, computerName, TimeSpan.FromDays(1), requireRelevant4624: true);
+                        string? resolvedFrom4624 = await ResolveFirst4624UsernameForWorkDateAsync(computerName, eventTime);
                         if (!string.IsNullOrWhiteSpace(resolvedFrom4624))
                         {
                             username = resolvedFrom4624;
                             usernameResolutionSource = "Fallback4624";
+                            resolvedUsername = resolvedFrom4624;
+                            isFallback = true;
+                            fallbackSource = "FirstLogon4624";
                             SafeWriteEventLog("Application",
                                 $"[DBG-1074] Fallback resolved username='{username}' from 4624 " +
                                 $"(original='{originalUsername ?? "(null)"}', computer='{computerName}')",
@@ -1445,7 +1533,8 @@ namespace EventLogOutEmployeeService
 
                 await ProcessEvent(eventId, username, eventTime, computerName,
                     "System", 0, eventMessage, writeRawRecord,
-                    usernameResolutionSource, originalUsername, fallbackSource);
+                    usernameResolutionSource, originalUsername, fallbackSource,
+                    isFallback, resolvedUsername, status, pendingUsernameResolution);
             }
             catch (Exception ex)
             {
@@ -1464,7 +1553,11 @@ namespace EventLogOutEmployeeService
             bool writeRawRecord,
             string usernameResolutionSource = "Direct",
             string? originalUsername = null,
-            string? fallbackSource = null)
+            string? fallbackSource = null,
+            bool isFallback = false,
+            string? resolvedUsername = null,
+            string? status = null,
+            bool pendingUsernameResolution = false)
         {
             try
             {
@@ -1532,8 +1625,12 @@ namespace EventLogOutEmployeeService
                     ShutdownType    = shutdownType,
                     WriteRawRecord  = writeRawRecord,
                     UsernameResolutionSource = usernameResolutionSource,
+                    ResolvedUsername = resolvedUsername,
                     OriginalUsername = originalUsername,
-                    FallbackSource = fallbackSource
+                    IsFallback = isFallback,
+                    FallbackSource = fallbackSource,
+                    Status = status,
+                    PendingUsernameResolution = pendingUsernameResolution
                 };
 
                 // Shutdown group: 4647, 1074, 6006 yang terjadi berbarengan dikelompokkan
@@ -1881,15 +1978,13 @@ namespace EventLogOutEmployeeService
 
         private async Task<bool> TryProcessFallbackLoginFrom6005Async(DateTime eventTime, string computerName, bool writeRawRecord)
         {
-            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-            string? today4624 = GetMostRecentUserForComputer(
-                eventTime, computerName, TimeSpan.FromHours(24), requireRelevant4624: true);
-
-            if (!string.IsNullOrWhiteSpace(today4624))
+            if (!ShouldAllow6005Fallback(eventTime, computerName))
                 return false;
 
             string? resolvedUsername = null;
             string? fallbackSource = null;
+            bool isNetworkUnavailable = false;
+            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
 
             lock (knownLoginLock)
             {
@@ -1898,32 +1993,55 @@ namespace EventLogOutEmployeeService
                     IsValidUsername(known.Username))
                 {
                     resolvedUsername = known.Username;
-                    fallbackSource = "PreviousLog";
+                    fallbackSource = "Event6005_PreviousLog";
                 }
             }
 
             if (string.IsNullOrWhiteSpace(resolvedUsername))
             {
-                string? fromQueue = await eventQueue.FindMostRecentUsernameForComputerAsync(computerName, eventTime);
+                string? fromQueue = await eventQueue.FindMostRecent4624UsernameForComputerAsync(computerName, eventTime);
                 if (!string.IsNullOrWhiteSpace(fromQueue) && IsValidUsername(fromQueue))
                 {
                     resolvedUsername = fromQueue;
-                    fallbackSource = "PreviousLog";
+                    fallbackSource = "Event6005_PreviousLog";
                 }
             }
 
             if (string.IsNullOrWhiteSpace(resolvedUsername))
             {
-                string? fromSharePoint = await sharePointIntegration.Value.GetLatestUsernameByComputerAsync(computerName, eventTime);
+                var sharePointLookup = await sharePointIntegration.Value.GetLatestUsernameByComputerWithStatusAsync(computerName, eventTime);
+                string? fromSharePoint = sharePointLookup.Username;
+                isNetworkUnavailable = sharePointLookup.NetworkUnavailable;
                 if (!string.IsNullOrWhiteSpace(fromSharePoint) && IsValidUsername(fromSharePoint))
                 {
                     resolvedUsername = fromSharePoint;
-                    fallbackSource = "SharePoint";
+                    fallbackSource = "Event6005_SharePoint";
                 }
             }
 
             if (string.IsNullOrWhiteSpace(resolvedUsername))
             {
+                if (isNetworkUnavailable)
+                {
+                    await ProcessEvent(
+                        6005,
+                        "__UNRESOLVED__",
+                        eventTime,
+                        computerName,
+                        "System",
+                        0,
+                        null,
+                        writeRawRecord,
+                        usernameResolutionSource: "Fallback6005_Pending",
+                        originalUsername: null,
+                        fallbackSource: "Event6005_Pending",
+                        isFallback: true,
+                        resolvedUsername: null,
+                        status: "UNCONFIRMED",
+                        pendingUsernameResolution: true);
+                    return true;
+                }
+
                 SafeWriteEventLog("Application",
                     $"[DBG-6005] DROPPING fallback login at {eventTime:O} on {computerName} — username could not be resolved.",
                     EventLogEntryType.Warning, 2008);
@@ -1944,10 +2062,221 @@ namespace EventLogOutEmployeeService
                 writeRawRecord,
                 usernameResolutionSource: "Fallback6005",
                 originalUsername: null,
-                fallbackSource: fallbackSource);
+                fallbackSource: fallbackSource,
+                isFallback: true,
+                resolvedUsername: resolvedUsername,
+                status: "UNCONFIRMED",
+                pendingUsernameResolution: false);
 
             return true;
         }
+
+        private async Task<bool> TryResolvePending6005UsernameAsync(QueuedAttendanceEvent item)
+        {
+            if (item.EventId != 6005 || !item.PendingUsernameResolution)
+                return true;
+
+            string? resolvedUsername = await eventQueue.FindMostRecent4624UsernameForComputerAsync(item.ComputerName, item.EventTime);
+            string? fallbackSource = null;
+            bool networkUnavailable = false;
+
+            if (!string.IsNullOrWhiteSpace(resolvedUsername) && IsValidUsername(resolvedUsername))
+            {
+                fallbackSource = "Event6005_PreviousLog";
+            }
+            else
+            {
+                var sharePointLookup = await sharePointIntegration.Value.GetLatestUsernameByComputerWithStatusAsync(
+                    item.ComputerName, item.EventTime);
+                resolvedUsername = sharePointLookup.Username;
+                networkUnavailable = sharePointLookup.NetworkUnavailable;
+                if (!string.IsNullOrWhiteSpace(resolvedUsername) && IsValidUsername(resolvedUsername))
+                    fallbackSource = "Event6005_SharePoint";
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                item.PendingUsernameResolution = true;
+                item.Username = "__UNRESOLVED__";
+                item.ResolvedUsername = null;
+                item.FallbackSource = "Event6005_Pending";
+                item.Status = "UNCONFIRMED";
+                item.LastDispatchError = networkUnavailable
+                    ? "6005 username unresolved due to network unavailable"
+                    : "6005 username unresolved";
+                await eventQueue.ReplaceAsync(item);
+                return false;
+            }
+
+            lock (knownLoginLock)
+                lastKnownLoginByComputer[item.ComputerName] = (resolvedUsername, item.EventTime);
+
+            item.Username = resolvedUsername;
+            item.ResolvedUsername = resolvedUsername;
+            item.IsFallback = true;
+            item.UsernameResolutionSource = "Fallback6005";
+            item.FallbackSource = fallbackSource;
+            item.Status = "UNCONFIRMED";
+            item.PendingUsernameResolution = false;
+            item.LastDispatchError = null;
+            await eventQueue.ReplaceAsync(item);
+            return true;
+        }
+
+        private bool ShouldAllow6005Fallback(DateTime eventTime, string computerName)
+        {
+            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
+            if (HasAny4624ForComputerWorkDate(computerName, workDate, eventTime))
+                return false;
+
+            return IsSecurityLogUnavailableOrLikelyCleared(eventTime, computerName);
+        }
+
+        private bool HasAny4624ForComputerWorkDate(string computerName, string workDate, DateTime eventTime)
+        {
+            string key = BuildDeviceWorkDateKey(computerName, workDate);
+
+            lock (firstLogonLock)
+            {
+                if (firstLogon4624ByDeviceWorkDate.ContainsKey(key))
+                    return true;
+            }
+
+            try
+            {
+                string? fromQueue = eventQueue
+                    .FindMostRecent4624UsernameForComputerAsync(computerName, eventTime)
+                    .GetAwaiter()
+                    .GetResult();
+                if (!string.IsNullOrWhiteSpace(fromQueue))
+                    return true;
+            }
+            catch
+            {
+                // ignored
+            }
+
+            return false;
+        }
+
+        private bool IsSecurityLogUnavailableOrLikelyCleared(DateTime eventTime, string computerName)
+        {
+            try
+            {
+                EventLog secLog = securityEventLog ?? new EventLog("Security");
+                int total = secLog.Entries.Count;
+                if (total == 0)
+                    return true;
+
+                DateTime workDateStartLocal = eventTime.ToLocalTime().Date;
+                DateTime workDateStartUtc = workDateStartLocal.ToUniversalTime();
+                DateTime oldestSeen = DateTime.MaxValue;
+                bool has4624Today = false;
+                bool hasLogClearedSignal = false;
+                int scanned = 0;
+
+                for (int i = total - 1; i >= 0 && scanned < 4000; i--)
+                {
+                    scanned++;
+                    EventLogEntry entry = secLog.Entries[i];
+                    DateTime t = entry.TimeGenerated.ToUniversalTime();
+                    if (t < oldestSeen)
+                        oldestSeen = t;
+
+                    if (t < workDateStartUtc)
+                        break;
+
+                    int eventId = GetNormalizedEventId(entry);
+                    if (eventId == 1102)
+                        hasLogClearedSignal = true;
+
+                    if (eventId == 4624 && entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        int lt = ParseLogonType(entry.Message ?? string.Empty);
+                        if (IsRelevantLogonType(lt))
+                        {
+                            has4624Today = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (has4624Today)
+                    return false;
+
+                if (hasLogClearedSignal)
+                    return true;
+
+                return oldestSeen > workDateStartUtc;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        private async Task<string?> ResolveFirst4624UsernameForWorkDateAsync(string computerName, DateTime eventTime)
+        {
+            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
+            string key = BuildDeviceWorkDateKey(computerName, workDate);
+
+            lock (firstLogonLock)
+            {
+                if (firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var fromMemory) &&
+                    !string.IsNullOrWhiteSpace(fromMemory.Username))
+                    return fromMemory.Username;
+            }
+
+            var firstFromQueue = await eventQueue.FindFirst4624ForComputerWorkDateAsync(computerName, workDate);
+            if (firstFromQueue.HasValue && IsValidUsername(firstFromQueue.Value.Username))
+            {
+                lock (firstLogonLock)
+                    firstLogon4624ByDeviceWorkDate[key] = firstFromQueue.Value;
+                return firstFromQueue.Value.Username;
+            }
+
+            return null;
+        }
+
+        private void RegisterFirst4624Logon(string computerName, string username, DateTime eventTime)
+        {
+            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
+            string key = BuildDeviceWorkDateKey(computerName, workDate);
+
+            lock (firstLogonLock)
+            {
+                if (!firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var existing) ||
+                    eventTime < existing.EventTime)
+                {
+                    firstLogon4624ByDeviceWorkDate[key] = (username, eventTime);
+                }
+            }
+        }
+
+        private async Task PrimeFirstLogonIndexFromQueueAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var firstItems = await eventQueue.FindFirst4624ForComputerWorkDateAsync(
+                    Environment.MachineName,
+                    DateTime.Now.ToString("yyyy-MM-dd"),
+                    cancellationToken);
+
+                if (firstItems.HasValue && IsValidUsername(firstItems.Value.Username))
+                {
+                    RegisterFirst4624Logon(Environment.MachineName, firstItems.Value.Username, firstItems.Value.EventTime);
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[STARTUP] Failed to prime first-4624 index from queue: {ex.Message}",
+                    EventLogEntryType.Warning, 1045);
+            }
+        }
+
+        private static string BuildDeviceWorkDateKey(string computerName, string workDate)
+            => $"{computerName}::{workDate}";
 
         private string? GetUserSidFromSecurityEvent(string message, int securityEventId)
         {
@@ -2158,27 +2487,24 @@ namespace EventLogOutEmployeeService
                    shutdownType.Contains("reboot", StringComparison.OrdinalIgnoreCase);
         }
 
-        private static bool IsSystemFallbackTriggerAccount(string username)
+        private bool IsSystemFallbackTriggerAccount(string username)
         {
             if (string.IsNullOrWhiteSpace(username))
                 return true;
 
             string normalized = username.Trim();
-            var systemAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                "SYSTEM",
-                "system32",
-                "servicing",
-                "TrustedInstaller",
-                "NT AUTHORITY\\SYSTEM",
-                "NT AUTHORITY\\LOCAL SERVICE",
-                "NT AUTHORITY\\NETWORK SERVICE"
-            };
-
-            if (systemAccounts.Contains(normalized))
+            if (systemFallbackTriggerAccounts.Contains(normalized))
                 return true;
 
-            return normalized.StartsWith("NT AUTHORITY\\", StringComparison.OrdinalIgnoreCase);
+            for (int i = 0; i < systemFallbackTriggerContains.Count; i++)
+            {
+                string token = systemFallbackTriggerContains[i];
+                if (!string.IsNullOrWhiteSpace(token) &&
+                    normalized.Contains(token, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
         }
 
         private bool IsValidUsername(string username)

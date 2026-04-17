@@ -221,11 +221,18 @@ namespace EventLogOutEmployeeService
 
         public async Task<string?> GetLatestUsernameByComputerAsync(string computerName, DateTime referenceTime)
         {
+            var result = await GetLatestUsernameByComputerWithStatusAsync(computerName, referenceTime);
+            return result.Username;
+        }
+
+        public async Task<(string? Username, bool NetworkUnavailable)> GetLatestUsernameByComputerWithStatusAsync(
+            string computerName, DateTime referenceTime)
+        {
             try
             {
                 string? accessToken = await GetAccessTokenAsync(referenceTime, 0);
                 if (string.IsNullOrWhiteSpace(accessToken))
-                    return null;
+                    return (null, true);
 
                 using var client = CreateGraphClient(accessToken, timeoutSeconds: 30);
                 string filter = $"fields/ComputerName eq '{EscapeODataLiteral(computerName)}'";
@@ -235,12 +242,12 @@ namespace EventLogOutEmployeeService
                 var request = new HttpRequestMessage(HttpMethod.Get, url);
                 var response = await client.SendAsync(request);
                 if (!response.IsSuccessStatusCode)
-                    return null;
+                    return (null, false);
 
                 var payload = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
                 var items = payload?["value"] as JArray;
                 if (items == null || items.Count == 0)
-                    return null;
+                    return (null, false);
 
                 var latest = items
                     .Select(x => new
@@ -252,14 +259,22 @@ namespace EventLogOutEmployeeService
                     .OrderByDescending(x => x.EventTime!.Value)
                     .FirstOrDefault();
 
-                return latest?.Username;
+                return (latest?.Username, false);
+            }
+            catch (HttpRequestException)
+            {
+                return (null, true);
+            }
+            catch (TaskCanceledException)
+            {
+                return (null, true);
             }
             catch (Exception ex)
             {
                 SafeWriteEventLog("Application",
                     $"[6005-FALLBACK] GetLatestUsernameByComputerAsync failed for '{computerName}': {ex.Message}",
                     EventLogEntryType.Warning, 3023);
-                return null;
+                return (null, false);
             }
         }
 
@@ -366,7 +381,8 @@ namespace EventLogOutEmployeeService
         /// </summary>
         public async Task UpsertDailySummaryLoginAsync(
             string accessToken, string username, string computerName, DateTime loginTime,
-            SummaryCache? summaryCache = null)
+            SummaryCache? summaryCache = null,
+            string? status = null)
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
@@ -432,6 +448,7 @@ namespace EventLogOutEmployeeService
                 string? itemId = canonical?["id"]?.ToString();
                 var fields = canonical?["fields"] as JObject;
                 DateTime? storedLogin = ParseFieldDateTime(fields, "LoginTime");
+                string? storedStatus = fields?["Status"]?.ToString();
 
                 SafeWriteEventLog("Application",
                     $"[DBG-Summary] UpsertLogin: row exists itemId={itemId} storedLogin={storedLogin?.ToString("O") ?? "(null)"} incoming={loginTime:O} totalFound={existingItems.Count}",
@@ -467,6 +484,22 @@ namespace EventLogOutEmployeeService
                     }
                 }
 
+                if (!string.IsNullOrWhiteSpace(itemId) &&
+                    !string.IsNullOrWhiteSpace(status) &&
+                    !string.Equals(storedStatus, status, StringComparison.OrdinalIgnoreCase))
+                {
+                    var statusPatch = new JObject
+                    {
+                        ["Status"] = status
+                    };
+                    var statusPatchContent = new StringContent(
+                        statusPatch.ToString(Newtonsoft.Json.Formatting.None), Encoding.UTF8, "application/json");
+                    using var statusPatchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
+                        $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
+                    { Content = statusPatchContent };
+                    await client.SendAsync(statusPatchRequest);
+                }
+
                 // Tulis ke cache: row sudah confirmed ada di SharePoint
                 if (summaryCache != null)
                     await summaryCache.AddAsync(summaryKey);
@@ -479,21 +512,25 @@ namespace EventLogOutEmployeeService
                 $"[DBG-Summary] UpsertLogin: creating new row for summaryKey={summaryKey}",
                 EventLogEntryType.Information, 3004);
 
-            var postData = new
+            var fieldsData = new JObject
             {
-                fields = new
-                {
-                    Title            = summaryKey,
-                    Username         = username,
-                    ComputerName     = computerName,
-                    WorkDate         = workDate,
-                    LoginTime        = ToUtcString(loginTime),
-                    ExpectedTimeOut  = ToUtcString(expectedTimeOut),
-                    ClockIn          = ToLocalTimeString(loginTime),
-                    ExpectedClockOut = ToLocalTimeString(expectedTimeOut),
-                    ClockOut         = (string?)null,
-                    ShutdownType     = string.Empty
-                }
+                ["Title"] = summaryKey,
+                ["Username"] = username,
+                ["ComputerName"] = computerName,
+                ["WorkDate"] = workDate,
+                ["LoginTime"] = ToUtcString(loginTime),
+                ["ExpectedTimeOut"] = ToUtcString(expectedTimeOut),
+                ["ClockIn"] = ToLocalTimeString(loginTime),
+                ["ExpectedClockOut"] = ToLocalTimeString(expectedTimeOut),
+                ["ClockOut"] = null,
+                ["ShutdownType"] = string.Empty
+            };
+            if (!string.IsNullOrWhiteSpace(status))
+                fieldsData["Status"] = status;
+
+            var postData = new JObject
+            {
+                ["fields"] = fieldsData
             };
 
             var createContent = new StringContent(JsonConvert.SerializeObject(postData), Encoding.UTF8, "application/json");
