@@ -194,7 +194,7 @@ List ini menyimpan **satu row per user per hari** — jam masuk pertama dan jam 
 | ExpectedTimeOut | ExpectedTimeOut | Date and Time | Buat baru — aktifkan **Include Time** |
 | ShutdownTime | ShutdownTime | Date and Time | Buat baru — aktifkan **Include Time** |
 | ShutdownType | ShutdownType | Single line of text | Buat baru |
-| Status | Status | Single line of text | Opsional tapi direkomendasikan: untuk flag `UNCONFIRMED` (fallback 6005) |
+| Status | Status | Single line of text | Optional tapi direkomendasikan: untuk flag `UNCONFIRMED` (fallback 6005) |
 
 **Index yang harus dibuat:**
 

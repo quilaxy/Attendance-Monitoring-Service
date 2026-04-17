@@ -497,7 +497,14 @@ namespace EventLogOutEmployeeService
                     using var statusPatchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                         $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
                     { Content = statusPatchContent };
-                    await client.SendAsync(statusPatchRequest);
+                    var statusPatchResponse = await client.SendAsync(statusPatchRequest);
+                    if (!statusPatchResponse.IsSuccessStatusCode)
+                    {
+                        string body = await statusPatchResponse.Content.ReadAsStringAsync();
+                        throw new InvalidOperationException(
+                            $"Failed to update summary Status for key '{summaryKey}' (item {itemId}). " +
+                            $"Status={statusPatchResponse.StatusCode} Body={body}");
+                    }
                 }
 
                 // Tulis ke cache: row sudah confirmed ada di SharePoint

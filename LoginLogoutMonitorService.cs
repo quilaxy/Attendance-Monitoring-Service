@@ -1978,7 +1978,7 @@ namespace EventLogOutEmployeeService
 
         private async Task<bool> TryProcessFallbackLoginFrom6005Async(DateTime eventTime, string computerName, bool writeRawRecord)
         {
-            if (!ShouldAllow6005Fallback(eventTime, computerName))
+            if (!await ShouldAllow6005FallbackAsync(eventTime, computerName))
                 return false;
 
             string? resolvedUsername = null;
@@ -2123,16 +2123,16 @@ namespace EventLogOutEmployeeService
             return true;
         }
 
-        private bool ShouldAllow6005Fallback(DateTime eventTime, string computerName)
+        private async Task<bool> ShouldAllow6005FallbackAsync(DateTime eventTime, string computerName)
         {
             string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-            if (HasAny4624ForComputerWorkDate(computerName, workDate, eventTime))
+            if (await HasAny4624ForComputerWorkDateAsync(computerName, workDate, eventTime))
                 return false;
 
             return IsSecurityLogUnavailableOrLikelyCleared(eventTime, computerName);
         }
 
-        private bool HasAny4624ForComputerWorkDate(string computerName, string workDate, DateTime eventTime)
+        private async Task<bool> HasAny4624ForComputerWorkDateAsync(string computerName, string workDate, DateTime eventTime)
         {
             string key = BuildDeviceWorkDateKey(computerName, workDate);
 
@@ -2142,19 +2142,9 @@ namespace EventLogOutEmployeeService
                     return true;
             }
 
-            try
-            {
-                string? fromQueue = eventQueue
-                    .FindMostRecent4624UsernameForComputerAsync(computerName, eventTime)
-                    .GetAwaiter()
-                    .GetResult();
-                if (!string.IsNullOrWhiteSpace(fromQueue))
-                    return true;
-            }
-            catch
-            {
-                // ignored
-            }
+            string? fromQueue = await eventQueue.FindMostRecent4624UsernameForComputerAsync(computerName, eventTime);
+            if (!string.IsNullOrWhiteSpace(fromQueue))
+                return true;
 
             return false;
         }
@@ -2257,14 +2247,13 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                var firstItems = await eventQueue.FindFirst4624ForComputerWorkDateAsync(
-                    Environment.MachineName,
-                    DateTime.Now.ToString("yyyy-MM-dd"),
-                    cancellationToken);
-
-                if (firstItems.HasValue && IsValidUsername(firstItems.Value.Username))
+                List<QueuedAttendanceEvent> items = await eventQueue.GetAllAsync(cancellationToken);
+                foreach (var item in items)
                 {
-                    RegisterFirst4624Logon(Environment.MachineName, firstItems.Value.Username, firstItems.Value.EventTime);
+                    if (item.EventId != 4624 || string.IsNullOrWhiteSpace(item.Username) || !IsValidUsername(item.Username))
+                        continue;
+
+                    RegisterFirst4624Logon(item.ComputerName, item.Username, item.EventTime);
                 }
             }
             catch (Exception ex)

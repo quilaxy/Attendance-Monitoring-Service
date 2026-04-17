@@ -333,6 +333,19 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        public async Task<List<QueuedAttendanceEvent>> GetAllAsync(CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                return SortQueue(await ReadAllInternalAsync());
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
         public async Task<string?> FindMostRecentUsernameForComputerAsync(string computerName, DateTime beforeTimeUtc, CancellationToken cancellationToken = default)
         {
             await fileLock.WaitAsync(cancellationToken);
