@@ -26,6 +26,7 @@ namespace EventLogOutEmployeeService
 
         // ── Static shared state ───────────────────────────────────────────────────
         private static bool _hasWaitedForNetwork = false;
+        private static Task? _networkWarmupTask;
         private static readonly object _networkWaitLock = new object();
         private static DateTime _lastShutdownEventTime = DateTime.MinValue;
         private static DateTime _lastSleepEventTime = DateTime.MinValue;
@@ -147,6 +148,7 @@ namespace EventLogOutEmployeeService
         public async Task<string?> GetAccessTokenAsync(DateTime eventTime, int eventId)
         {
             bool isShutdownEvent = IsShutdownEventId(eventId);
+            Task? networkWarmupTask = null;
 
             lock (_networkWaitLock)
             {
@@ -156,18 +158,26 @@ namespace EventLogOutEmployeeService
                 {
                     if (isShutdownEvent || inShutdownWindow)
                     {
-                        _hasWaitedForNetwork = true;
                     }
                     else
                     {
                         SafeWriteEventLog("Application",
                             "[TOKEN] Waiting 30s for network on fresh boot...",
                             EventLogEntryType.Information, 4010);
-                        Thread.Sleep(30000);
-                        _hasWaitedForNetwork = true;
+                        _networkWarmupTask ??= Task.Delay(TimeSpan.FromSeconds(30));
+                        networkWarmupTask = _networkWarmupTask;
                     }
+
+                    _hasWaitedForNetwork = true;
+                }
+                else if (_networkWarmupTask != null && !_networkWarmupTask.IsCompleted)
+                {
+                    networkWarmupTask = _networkWarmupTask;
                 }
             }
+
+            if (networkWarmupTask != null)
+                await networkWarmupTask;
 
             string authority = $"https://login.microsoftonline.com/{_tenantId}/oauth2/v2.0/token";
             int maxRetries = 3;
@@ -764,23 +774,87 @@ namespace EventLogOutEmployeeService
             HttpClient client, string listId, string dateField, DateTime cutoffDate)
         {
             int deletedCount = 0;
+            int totalFetched = 0;
 
-            string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items" +
-                         $"?$expand=fields&$select=id,fields&$top=5000";
+            string? url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items" +
+                          $"?$expand=fields&$select=id,fields&$top=5000";
 
-            var response = await client.GetAsync(url);
-            if (!response.IsSuccessStatusCode)
+            while (!string.IsNullOrWhiteSpace(url))
             {
-                SafeWriteEventLog("Application",
-                    $"[CLEANUP] Failed to fetch items from listId='{listId}' — " +
-                    $"HTTP {(int)response.StatusCode}",
-                    EventLogEntryType.Warning, 5004);
-                return 0;
+                var response = await client.GetAsync(url);
+                if (!response.IsSuccessStatusCode)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[CLEANUP] Failed to fetch items from listId='{listId}' — " +
+                        $"HTTP {(int)response.StatusCode}",
+                        EventLogEntryType.Warning, 5004);
+                    SafeWriteEventLog("Application",
+                        $"[CLEANUP] listId='{listId}' partial progress: fetched={totalFetched}, deleted={deletedCount}.",
+                        EventLogEntryType.Warning, 5005);
+                    return deletedCount;
+                }
+
+                var result = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
+                var items = result?["value"] as JArray;
+                if (items != null)
+                {
+                    totalFetched += items.Count;
+                    foreach (JToken item in items)
+                    {
+                        try
+                        {
+                            var itemFields = item["fields"] as JObject;
+                            string? dateValue = itemFields?[dateField]?.ToString();
+                            if (string.IsNullOrWhiteSpace(dateValue))
+                                continue;
+
+                            if (!DateTime.TryParse(dateValue, out DateTime parsed))
+                                continue;
+
+                            if (parsed >= cutoffDate)
+                                continue;
+
+                            string? itemId = item["id"]?.ToString();
+                            if (string.IsNullOrWhiteSpace(itemId))
+                                continue;
+
+                            var deleteResponse = await client.DeleteAsync(
+                                $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items/{itemId}");
+
+                            if (deleteResponse.IsSuccessStatusCode)
+                            {
+                                deletedCount++;
+                            }
+                            else if (deleteResponse.StatusCode == System.Net.HttpStatusCode.NotFound)
+                            {
+                                // 404 = sudah dihapus PC lain duluan — normal kalau cleanup jalan bersamaan
+                            }
+                            else
+                            {
+                                SafeWriteEventLog("Application",
+                                    $"[CLEANUP] Failed to delete itemId='{itemId}' from listId='{listId}' — " +
+                                    $"HTTP {(int)deleteResponse.StatusCode}",
+                                    EventLogEntryType.Warning, 5005);
+                            }
+
+                            await Task.Delay(200);
+                        }
+                        catch (Exception ex)
+                        {
+                            string? itemId = item["id"]?.ToString() ?? "(unknown)";
+                            SafeWriteEventLog("Application",
+                                $"[CLEANUP] Exception deleting itemId='{itemId}' from listId='{listId}': " +
+                                $"{ex.GetType().Name}: {ex.Message}",
+                                EventLogEntryType.Warning, 5005);
+                            // continue deleting remaining items
+                        }
+                    }
+                }
+
+                url = result?["@odata.nextLink"]?.ToString();
             }
 
-            var result = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
-            var items = result?["value"] as JArray;
-            if (items == null || items.Count == 0)
+            if (totalFetched == 0)
             {
                 SafeWriteEventLog("Application",
                     $"[CLEANUP] listId='{listId}' — no items found, nothing to delete.",
@@ -789,60 +863,9 @@ namespace EventLogOutEmployeeService
             }
 
             SafeWriteEventLog("Application",
-                $"[CLEANUP] listId='{listId}' — {items.Count} total items fetched, " +
-                $"scanning for {dateField} < {cutoffDate:yyyy-MM-dd}",
+                $"[CLEANUP] listId='{listId}' — {totalFetched} total items fetched, " +
+                $"scanned for {dateField} < {cutoffDate:yyyy-MM-dd}",
                 EventLogEntryType.Information, 5001);
-
-            foreach (JToken item in items)
-            {
-                try
-                {
-                    var itemFields = item["fields"] as JObject;
-                    string? dateValue = itemFields?[dateField]?.ToString();
-                    if (string.IsNullOrWhiteSpace(dateValue))
-                        continue;
-
-                    if (!DateTime.TryParse(dateValue, out DateTime parsed))
-                        continue;
-
-                    if (parsed >= cutoffDate)
-                        continue;
-
-                    string? itemId = item["id"]?.ToString();
-                    if (string.IsNullOrWhiteSpace(itemId))
-                        continue;
-
-                    var deleteResponse = await client.DeleteAsync(
-                        $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items/{itemId}");
-
-                    if (deleteResponse.IsSuccessStatusCode)
-                    {
-                        deletedCount++;
-                    }
-                    else if (deleteResponse.StatusCode == System.Net.HttpStatusCode.NotFound)
-                    {
-                        // 404 = sudah dihapus PC lain duluan — normal kalau cleanup jalan bersamaan
-                    }
-                    else
-                    {
-                        SafeWriteEventLog("Application",
-                            $"[CLEANUP] Failed to delete itemId='{itemId}' from listId='{listId}' — " +
-                            $"HTTP {(int)deleteResponse.StatusCode}",
-                            EventLogEntryType.Warning, 5005);
-                    }
-
-                    await Task.Delay(200);
-                }
-                catch (Exception ex)
-                {
-                    string? itemId = item["id"]?.ToString() ?? "(unknown)";
-                    SafeWriteEventLog("Application",
-                        $"[CLEANUP] Exception deleting itemId='{itemId}' from listId='{listId}': " +
-                        $"{ex.GetType().Name}: {ex.Message}",
-                        EventLogEntryType.Warning, 5005);
-                    // continue deleting remaining items
-                }
-            }
 
             return deletedCount;
         }
