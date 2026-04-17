@@ -381,10 +381,10 @@ namespace EventLogOutEmployeeService
         // ── Summary list — Login ──────────────────────────────────────────────────
 
         /// <summary>
-        /// Creates (or keeps existing) a daily summary row for the given user+computer+workDate.
+        /// Creates (or keeps existing) a daily summary row for the given user+workDate.
         ///
         /// Rules:
-        ///   • Only ONE summary row per (ComputerName, Username, WorkDate).
+        ///   • Only ONE summary row per (Username, WorkDate).
         ///   • If the row already exists, do NOT update LoginTime — we always keep the earliest
         ///     login recorded. The earliest login was set when the row was first created.
         ///   • If the row does not exist, create it now.
@@ -397,7 +397,7 @@ namespace EventLogOutEmployeeService
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
             string workDate    = loginTime.ToLocalTime().ToString("yyyy-MM-dd");
-            string summaryKey  = BuildSummaryKey(computerName, username, workDate);
+            string summaryKey  = BuildSummaryKey(username, workDate);
             DateTime expectedTimeOut = loginTime.AddHours(9);
 
             SafeWriteEventLog("Application",
@@ -694,7 +694,8 @@ namespace EventLogOutEmployeeService
             {
                 ["ShutdownTime"] = ToUtcString(shutdownTime),
                 ["ClockOut"] = ToLocalTimeString(shutdownTime),
-                ["ShutdownType"] = shutdownTypeStr
+                ["ShutdownType"] = shutdownTypeStr,
+                ["ComputerName"] = computerName
             };
 
             string patchJson = patchBody.ToString(Newtonsoft.Json.Formatting.None);
@@ -937,7 +938,7 @@ namespace EventLogOutEmployeeService
         {
             // Prefer same-day summary row. Pakai retry karena shutdown bisa di-dispatch
             // sebelum login row ter-index di SharePoint (eventual consistency).
-            string todayKey = BuildSummaryKey(computerName, username, shutdownTime.ToLocalTime().ToString("yyyy-MM-dd"));
+            string todayKey = BuildSummaryKey(username, shutdownTime.ToLocalTime().ToString("yyyy-MM-dd"));
 
             // Kalau key ada di cache, row pasti ada — tapi tetap fetch untuk ambil itemId dan fields.
             // Pakai retry penuh kalau tidak di cache, retry lebih agresif kalau di cache
@@ -960,7 +961,7 @@ namespace EventLogOutEmployeeService
                 return todayItems[0];
 
             // Fallback: previous-day row for overnight sessions.
-            string yesterdayKey = BuildSummaryKey(computerName, username, shutdownTime.ToLocalTime().AddDays(-1).ToString("yyyy-MM-dd"));
+            string yesterdayKey = BuildSummaryKey(username, shutdownTime.ToLocalTime().AddDays(-1).ToString("yyyy-MM-dd"));
             bool yesterdayInCache = summaryCache != null && await summaryCache.ContainsAsync(yesterdayKey);
             var yesterdayItems = yesterdayInCache
                 ? await FindSummaryItemAsync(client, yesterdayKey)
@@ -987,23 +988,21 @@ namespace EventLogOutEmployeeService
 
         private async Task<JArray?> FindSummaryItemAsync(HttpClient client, string summaryKey)
         {
-            // summaryKey format: "ComputerName\Username\yyyy-MM-dd"
+            // summaryKey format: "Username\yyyy-MM-dd"
             // Tidak bisa filter by Title langsung karena backslash (\) di OData filter
-            // menyebabkan HTTP 400. Ganti ke filter Username + ComputerName + WorkDate.
+            // menyebabkan HTTP 400. Ganti ke filter Username + WorkDate.
             string[] parts = summaryKey.Split('\\');
-            if (parts.Length < 3)
+            if (parts.Length < 2)
             {
                 SafeWriteEventLog("Application",
                     $"[DBG-Summary] FindSummaryItemAsync: invalid summaryKey format: {summaryKey}",
                     EventLogEntryType.Warning, 3020);
                 return null;
             }
-            string computerName = parts[0];
-            string username     = parts[1];
-            string workDate     = parts[2];
+            string username = parts[0];
+            string workDate = parts[1];
 
             string filter = $"fields/Username eq '{EscapeODataLiteral(username)}' and " +
-                            $"fields/ComputerName eq '{EscapeODataLiteral(computerName)}' and " +
                             $"fields/WorkDate eq '{EscapeODataLiteral(workDate)}'";
 
             string findUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items" +
@@ -1108,8 +1107,8 @@ namespace EventLogOutEmployeeService
             return false;
         }
 
-        private static string BuildSummaryKey(string computerName, string username, string workDate)
-            => $"{computerName}\\{username}\\{workDate}";
+        private static string BuildSummaryKey(string username, string workDate)
+            => $"{username}\\{workDate}";
 
         private static string EscapeODataLiteral(string value)
             => value.Replace("'", "''");
