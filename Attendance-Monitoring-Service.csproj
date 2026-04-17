@@ -30,7 +30,9 @@
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </None>
 
-    <None Remove="appsettings-template.json" />
+      <None Remove="appsettings-template.json" />
+      <Content Remove="appsettings-template.json" />
+      <EmbeddedResource Remove="appsettings-template.json" />
   </ItemGroup>
 
 </Project>
