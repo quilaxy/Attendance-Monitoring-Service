@@ -194,6 +194,7 @@ List ini menyimpan **satu row per user per hari** — jam masuk pertama dan jam 
 | ExpectedTimeOut | ExpectedTimeOut | Date and Time | Buat baru — aktifkan **Include Time** |
 | ShutdownTime | ShutdownTime | Date and Time | Buat baru — aktifkan **Include Time** |
 | ShutdownType | ShutdownType | Single line of text | Buat baru |
+| Status | Status | Single line of text | Optional tapi direkomendasikan: untuk flag `UNCONFIRMED` (fallback 6005) |
 
 **Index yang harus dibuat:**
 
@@ -281,6 +282,11 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
     "SiteId": "contoso.sharepoint.com,xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx,yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy",
     "ListId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
     "SummaryListId": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+  },
+  "AppSettings": {
+    "VerboseLogging": false,
+    "QueueAlertThreshold": 500,
+    "DispatchBackoffSeconds": [30, 60, 120, 300, 600]
   }
 }
 ```
@@ -293,6 +299,9 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
 | `SharePointSettings:SiteId` | ID dari response Graph API di step 2.2 |
 | `SharePointSettings:ListId` | ID raw list (`AttendanceLog`) dari step 2.5 |
 | `SharePointSettings:SummaryListId` | ID summary list (`AttendanceSummary`) dari step 2.5 — opsional, jika dikosongkan fitur Summary tidak aktif |
+| `AppSettings:VerboseLogging` | `true` untuk debug log detail, `false` untuk log essential |
+| `AppSettings:QueueAlertThreshold` | Batas pending queue untuk high-water alert |
+| `AppSettings:DispatchBackoffSeconds[]` | Jadwal retry dispatch (default: 30,60,120,300,600 detik; setelah itu tetap interval terakhir) |
 
 ---
 
@@ -740,24 +749,19 @@ Fast Startup (6006 tidak muncul) → timer 10 detik habis
 
 ```
 while not cancelled:
-  Peek item pertama dari queue
+  Peek item ready pertama dari queue
   TryDispatchQueuedEventAsync(item)
   
   if success:
     Remove item dari queue
   else:
-    retryCount[queueId]++
-    if retryCount >= 5 AND raw sudah berhasil AND summary belum:
-      Log warning 1029
-      Mark summary dispatched
-      Remove dari queue   ← agar queue tidak stuck
-    else:
-      Delay 10 detik, retry
+    retryCount++
+    nextRetryAt = now + backoff(retryCount)
+    Persist retry state ke file queue item
 ```
 
-**Anti-stuck mechanism:** Kalau summary dispatch gagal terus-menerus, setelah 5 kali gagal item di-skip dari queue. Raw list tidak terpengaruh.
-
-Retry counter disimpan in-memory `Dictionary<string, int>` — reset saat service restart (intentional: give fresh chance setelah restart).
+Backoff default: `30s → 60s → 120s → 300s → 600s`, lalu tetap `600s`.
+State retry (`DispatchRetryCount`, `NextRetryAtUtc`) disimpan di file queue item (persisten lintas restart).
 
 ---
 
@@ -954,15 +958,32 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
 
 ## 19. Username Resolution (System Events)
 
-System events (1074, 6006, 6008, 41) tidak selalu menyertakan username. Fallback chain:
+### 19.1 Event 1074 (Shutdown/Restart Initiated)
 
-| Urutan | Source | Kondisi |
-|--------|--------|---------|
-| 1 | `GetUserFromSystem1074Message` | Hanya untuk 1074 — parse dari message field |
-| 2 | `TryResolve1074StateFor6006` | Hanya untuk 6006 — pair dengan 1074 dalam 60 detik |
-| 3 | `lastActiveUser` | In-memory, diupdate setiap 4624 login |
-| 4 | `GetMostRecentUser` | Scan Security log 12 jam ke belakang, max 500 entries |
-| 5 | Drop event | Jika username tetap tidak ditemukan |
+1. Parse username dari message 1074.
+2. Jika username termasuk system trigger (exact list atau keyword contains), lakukan fallback ke **first Event 4624** (earliest timestamp) untuk **device + workDate yang sama** dari:
+   - in-memory first-logon index, lalu
+   - pending queue files (`queue\\pending\\*.json`).
+3. Jika fallback berhasil:
+   - `Username` diisi resolved user,
+   - metadata queue diisi `ResolvedUsername`, `OriginalUsername`, `IsFallback=true`, `FallbackSource=FirstLogon4624`.
+4. Jika tidak ada 4624 yang cocok → event 1074 di-drop dan alasan ditulis ke Application Event Log.
+
+### 19.2 Event 6005 (Fallback Login saat Security log unavailable/cleared)
+
+6005 fallback hanya dipakai jika konteks menunjukkan Security log unavailable/cleared **dan** tidak ada 4624 untuk device+workDate.
+
+Urutan resolusi username:
+1. Most recent 4624 dari in-memory/queue pending untuk device+workDate.
+2. Jika tidak ada, query SharePoint berdasarkan device.
+3. Jika tetap tidak ada dan jaringan sedang unavailable:
+   - event 6005 tetap dipersist ke queue dengan `Status=UNCONFIRMED`,
+   - `FallbackSource=Event6005_Pending`,
+   - `PendingUsernameResolution=true` untuk dicoba ulang pada siklus dispatch berikutnya.
+
+Jika resolve berhasil:
+- `FallbackSource` = `Event6005_PreviousLog` atau `Event6005_SharePoint`
+- Summary login row dibuat/diupdate sebagai `UNCONFIRMED` (ClockOut tetap kosong sampai shutdown valid masuk).
 
 ---
 
