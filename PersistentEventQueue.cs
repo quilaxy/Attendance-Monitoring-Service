@@ -425,6 +425,37 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        public async Task<(string Username, DateTime EventTime)?> FindFirst4624ForComputerWorkDateAfterAsync(
+            string computerName,
+            string workDate,
+            DateTime notBeforeUtc,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                var first = items
+                    .Where(x =>
+                        x.EventId == 4624 &&
+                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                        x.EventTime >= notBeforeUtc &&
+                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
+                        !string.IsNullOrWhiteSpace(x.Username))
+                    .OrderBy(x => x.EventTime)
+                    .FirstOrDefault();
+
+                if (first == null)
+                    return null;
+
+                return (first.Username, first.EventTime);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
         private static bool ShouldReplaceExistingLogin(QueuedAttendanceEvent existing, QueuedAttendanceEvent incoming)
         {
             if (incoming.EventTime < existing.EventTime)
