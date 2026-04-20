@@ -2478,6 +2478,12 @@ namespace EventLogOutEmployeeService
                     return (null, null);
                 }
 
+                SafeWriteEventLog("Application",
+                    $"[DBG-6006] TryResolve: PRIMARY<=60s missed, evaluating FALLBACK60-120s " +
+                    $"latestCandidate username='{fallbackCandidate.Username}' candidateTime={fallbackCandidate.EventTime:O} " +
+                    $"6006Time={eventTime:O}",
+                    EventLogEntryType.Information, 2011);
+
                 bool restartIndicationInFallbackRange = false;
                 for (int i = 0; i < last1074States.Count; i++)
                 {
@@ -2495,15 +2501,16 @@ namespace EventLogOutEmployeeService
                 if (restartIndicationInFallbackRange)
                 {
                     SafeWriteEventLog("Application",
-                        $"[DBG-6006] TryResolve: FALLBACK 60-120s skipped due to restart indication. " +
+                        $"[DBG-6006] TryResolve: FALLBACK60-120s used=false (restart indication found). " +
                         $"candidateTime={fallbackCandidate.EventTime:O} 6006Time={eventTime:O}",
                         EventLogEntryType.Information, 2011);
                     return (null, null);
                 }
 
                 SafeWriteEventLog("Application",
-                    $"[DBG-6006] TryResolve: matched FALLBACK60-120s username='{fallbackCandidate.Username}' " +
-                    $"diff={fallbackDiffSeconds:F1}s 1074Type='{fallbackCandidate.ShutdownType}'",
+                    $"[DBG-6006] TryResolve: FALLBACK60-120s used=true username='{fallbackCandidate.Username}' " +
+                    $"diff={fallbackDiffSeconds:F1}s 1074Type='{fallbackCandidate.ShutdownType}' " +
+                    $"(PRIMARY<=60s had no match)",
                     EventLogEntryType.Information, 2012);
 
                 bool isRestartFallback = IsRestartShutdownType(fallbackCandidate.ShutdownType);
