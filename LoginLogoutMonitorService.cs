@@ -2401,11 +2401,7 @@ namespace EventLogOutEmployeeService
                 last1074States.Add(new Last1074State(username, eventTime, shutdownType));
 
                 DateTime pruneBefore = eventTime - last1074RetentionWindow;
-                for (int i = last1074States.Count - 1; i >= 0; i--)
-                {
-                    if (last1074States[i].EventTime < pruneBefore)
-                        last1074States.RemoveAt(i);
-                }
+                last1074States.RemoveAll(x => x.EventTime < pruneBefore);
             }
         }
 
@@ -2446,6 +2442,8 @@ namespace EventLogOutEmployeeService
                             primaryCandidate = candidate;
                             primaryDiffSeconds = diffSeconds;
                         }
+                        // This state is already a primary candidate (<=60s),
+                        // so it must not be treated as fallback (60-120s).
                         continue;
                     }
 
