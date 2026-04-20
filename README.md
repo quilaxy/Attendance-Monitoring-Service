@@ -305,7 +305,7 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
 | `AppSettings:VerboseLogging` | `true` untuk debug log detail, `false` untuk log essential |
 | `QUEUE_ALERT_THRESHOLD` (environment variable) | Batas pending queue untuk high-water alert (default: 500) |
 | `DISPATCH_BACKOFF_SECONDS` (environment variable) | Jadwal retry dispatch format CSV, contoh `30,60,120,300,600` |
-| `STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES` (environment variable) | Ambang gap startup→first 4624 untuk izinkan fallback 6005 (default: 90) |
+| `STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES` (environment variable) | Batas maksimum gap (menit) startup→first 4624; jika gap melebihi ambang ini fallback 6005 diizinkan (default: 90) |
 
 ---
 

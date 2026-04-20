@@ -780,8 +780,11 @@ namespace EventLogOutEmployeeService
                 if (int.TryParse(raw, out int parsed) && parsed > 0)
                     return parsed;
             }
-            catch
+            catch (Exception ex)
             {
+                SafeWriteEventLog("Application",
+                    $"[CONFIG] Failed to read env '{key}' as int. Using fallback={fallback}. Error={ex.Message}",
+                    EventLogEntryType.Warning, 2030);
             }
 
             return fallback;
@@ -805,8 +808,11 @@ namespace EventLogOutEmployeeService
 
                 return values.Count > 0 ? values.ToArray() : fallback;
             }
-            catch
+            catch (Exception ex)
             {
+                SafeWriteEventLog("Application",
+                    $"[CONFIG] Failed to read env '{key}' as int list. Using fallback. Error={ex.Message}",
+                    EventLogEntryType.Warning, 2031);
                 return fallback;
             }
         }
@@ -2097,13 +2103,13 @@ namespace EventLogOutEmployeeService
 
             if (string.IsNullOrWhiteSpace(resolvedUsername))
             {
-                var fromQueue = await eventQueue.FindFirst4624ForComputerWorkDateAfterAsync(
+                var first4624AfterFromQueue = await eventQueue.FindFirst4624ForComputerWorkDateAfterAsync(
                     item.ComputerName,
                     workDate,
                     item.EventTime);
-                if (fromQueue.HasValue && IsValidUsername(fromQueue.Value.Username))
+                if (first4624AfterFromQueue.HasValue && IsValidUsername(first4624AfterFromQueue.Value.Username))
                 {
-                    resolvedUsername = fromQueue.Value.Username;
+                    resolvedUsername = first4624AfterFromQueue.Value.Username;
                     fallbackSource = "Event6005_First4624After";
                 }
             }
@@ -2171,7 +2177,14 @@ namespace EventLogOutEmployeeService
                 {
                     TimeSpan gap = first4624.Value.EventTime - startupAnchorUtc;
                     if (gap < TimeSpan.Zero)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-6005] Startup anchor is later than first 4624. " +
+                            $"computer={computerName} workDate={workDate} startup={startupAnchorUtc:O} " +
+                            $"first4624={first4624.Value.EventTime:O}",
+                            EventLogEntryType.Warning, 2032);
                         gap = TimeSpan.Zero;
+                    }
 
                     if (gap <= startupToFirst4624MaxGapForDirectUse)
                     {
