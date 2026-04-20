@@ -1045,12 +1045,14 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                if (item.EventId == 6005 && item.PendingUsernameResolution)
+                if (item.PendingUsernameResolution)
                 {
-                    bool resolved = await TryResolvePending6005UsernameAsync(item);
+                    bool resolved = item.EventId == 6005
+                        ? await TryResolvePending6005UsernameAsync(item)
+                        : await TryResolvePendingSystemUsernameAsync(item);
                     if (!resolved)
                     {
-                        item.LastDispatchError ??= "6005 username is still unresolved";
+                        item.LastDispatchError ??= $"{item.EventId} username is still unresolved";
                         return false;
                     }
                 }
@@ -1346,12 +1348,62 @@ namespace EventLogOutEmployeeService
 
                 string? username = GetUsernameFromEvent(eventMessage, eventId);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
+                {
+                    if (eventId == 4647)
+                    {
+                        await ProcessEvent(
+                            4647,
+                            "__UNRESOLVED__",
+                            eventTime,
+                            computerName,
+                            "Security",
+                            logonType,
+                            null,
+                            writeRawRecord,
+                            usernameResolutionSource: "FallbackSecurity_Pending",
+                            originalUsername: username,
+                            fallbackSource: "Event4647_Pending",
+                            isFallback: true,
+                            resolvedUsername: null,
+                            status: "UNCONFIRMED",
+                            pendingUsernameResolution: true);
+
+                        SafeWriteEventLog("Application",
+                            $"[DBG-4647] Username unresolved at {eventTime:O} on {computerName} — queued as pending.",
+                            EventLogEntryType.Information, 2026);
+                    }
                     return;
+                }
 
                 string? sid = GetUserSidFromSecurityEvent(eventMessage, eventId);
                 username = ResolveUsernameBySid(username, sid);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
+                {
+                    if (eventId == 4647)
+                    {
+                        await ProcessEvent(
+                            4647,
+                            "__UNRESOLVED__",
+                            eventTime,
+                            computerName,
+                            "Security",
+                            logonType,
+                            null,
+                            writeRawRecord,
+                            usernameResolutionSource: "FallbackSecurity_Pending",
+                            originalUsername: null,
+                            fallbackSource: "Event4647_Pending",
+                            isFallback: true,
+                            resolvedUsername: null,
+                            status: "UNCONFIRMED",
+                            pendingUsernameResolution: true);
+
+                        SafeWriteEventLog("Application",
+                            $"[DBG-4647] SID resolution failed at {eventTime:O} on {computerName} — queued as pending.",
+                            EventLogEntryType.Information, 2026);
+                    }
                     return;
+                }
 
                 if (eventId == 4624)
                 {
@@ -1480,16 +1532,57 @@ namespace EventLogOutEmployeeService
                         }
                         else
                         {
+                            string? queueRecent4624 = await eventQueue.FindMostRecent4624UsernameForComputerAsync(computerName, eventTime);
+                            if (!string.IsNullOrWhiteSpace(queueRecent4624) && IsValidUsername(queueRecent4624))
+                            {
+                                username = queueRecent4624;
+                                usernameResolutionSource = "Fallback4624Queue";
+                                resolvedUsername = queueRecent4624;
+                                isFallback = true;
+                                fallbackSource = "Event1074_Queue4624";
+                                SafeWriteEventLog("Application",
+                                    $"[DBG-1074] Fallback resolved username='{username}' from nearest queue 4624 " +
+                                    $"(original='{originalUsername ?? "(null)"}', computer='{computerName}')",
+                                    EventLogEntryType.Information, 2013);
+                            }
+                        }
+
+                        if (string.IsNullOrWhiteSpace(username) || !IsValidUsername(username))
+                        {
+                            var sharePointLookup = await sharePointIntegration.Value.GetLatestUsernameByComputerWithStatusAsync(computerName, eventTime);
+                            string? fromSharePoint = sharePointLookup.Username;
+                            if (!string.IsNullOrWhiteSpace(fromSharePoint) && IsValidUsername(fromSharePoint))
+                            {
+                                username = fromSharePoint;
+                                usernameResolutionSource = "FallbackSharePoint";
+                                resolvedUsername = fromSharePoint;
+                                isFallback = true;
+                                fallbackSource = "Event1074_SharePoint";
+                                SafeWriteEventLog("Application",
+                                    $"[DBG-1074] Fallback resolved username='{username}' from SharePoint latest by computer " +
+                                    $"(original='{originalUsername ?? "(null)"}', computer='{computerName}')",
+                                    EventLogEntryType.Information, 2013);
+                            }
+                        }
+
+                        if (string.IsNullOrWhiteSpace(username) || !IsValidUsername(username))
+                        {
+                            username = "__UNRESOLVED__";
+                            usernameResolutionSource = "FallbackSystem_Pending";
+                            resolvedUsername = null;
+                            isFallback = true;
+                            fallbackSource = "Event1074_Pending";
+                            status = "UNCONFIRMED";
+                            pendingUsernameResolution = true;
                             SafeWriteEventLog("Application",
-                                $"[DBG-1074] DROPPING 1074 at {eventTime:O} on {computerName} — " +
-                                $"username='{originalUsername ?? "(null)"}' and no valid 4624 fallback found.",
+                                $"[DBG-1074] Username unresolved at {eventTime:O} on {computerName} — queued as pending.",
                                 EventLogEntryType.Warning, 2008);
-                            return;
                         }
                     }
                 }
 
-                if (eventId == 1074 && !string.IsNullOrEmpty(username))
+                if (eventId == 1074 && !string.IsNullOrEmpty(username) &&
+                    !pendingUsernameResolution && IsValidUsername(username))
                 {
                     string shutdownType = ParseShutdownType(eventMessage);
                     StoreLast1074State(username, eventTime, shutdownType);
@@ -1532,13 +1625,20 @@ namespace EventLogOutEmployeeService
                         EventLogEntryType.Information, 2007);
 
                     username = fromLog;
-                    if (string.IsNullOrEmpty(username))
-                    {
-                        SafeWriteEventLog("Application",
-                            $"[DBG-{eventId}] DROPPING event at {eventTime:O} — no username could be resolved.",
-                            EventLogEntryType.Warning, 2008);
-                        return;
-                    }
+                }
+
+                if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
+                {
+                    username = "__UNRESOLVED__";
+                    pendingUsernameResolution = true;
+                    status ??= "UNCONFIRMED";
+                    isFallback = true;
+                    resolvedUsername = null;
+                    usernameResolutionSource = "FallbackSystem_Pending";
+                    fallbackSource ??= BuildPendingFallbackSource(eventId);
+                    SafeWriteEventLog("Application",
+                        $"[DBG-{eventId}] Username unresolved at {eventTime:O} — queued as pending ({fallbackSource}).",
+                        EventLogEntryType.Warning, 2008);
                 }
 
                 if (eventId == 42)
@@ -2152,6 +2252,82 @@ namespace EventLogOutEmployeeService
             item.ResolvedUsername = resolvedUsername;
             item.IsFallback = true;
             item.UsernameResolutionSource = "Fallback6005";
+            item.FallbackSource = fallbackSource;
+            item.Status = "UNCONFIRMED";
+            item.PendingUsernameResolution = false;
+            item.LastDispatchError = null;
+            await eventQueue.ReplaceAsync(item);
+            return true;
+        }
+
+        private async Task<bool> TryResolvePendingSystemUsernameAsync(QueuedAttendanceEvent item)
+        {
+            if (!item.PendingUsernameResolution)
+                return true;
+
+            if (!SupportsPendingSystemResolution(item.EventId))
+                return true;
+
+            string? resolvedUsername = null;
+            string? fallbackSource = null;
+            bool networkUnavailable = false;
+
+            var first4624 = await ResolveFirst4624ForWorkDateAsync(
+                item.ComputerName,
+                item.EventTime,
+                requireAfterEventTime: false);
+            if (first4624.HasValue && IsValidUsername(first4624.Value.Username))
+            {
+                resolvedUsername = first4624.Value.Username;
+                fallbackSource = $"Event{item.EventId}_First4624";
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                var fromQueue = await eventQueue.FindMostRecent4624UsernameForComputerAsync(item.ComputerName, item.EventTime);
+                if (!string.IsNullOrWhiteSpace(fromQueue) && IsValidUsername(fromQueue))
+                {
+                    resolvedUsername = fromQueue;
+                    fallbackSource = $"Event{item.EventId}_Queue4624";
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                var sharePointLookup = await sharePointIntegration.Value.GetLatestUsernameByComputerWithStatusAsync(
+                    item.ComputerName, item.EventTime);
+                string? fromSharePoint = sharePointLookup.Username;
+                networkUnavailable = sharePointLookup.NetworkUnavailable;
+                if (!string.IsNullOrWhiteSpace(fromSharePoint) && IsValidUsername(fromSharePoint))
+                {
+                    resolvedUsername = fromSharePoint;
+                    fallbackSource = $"Event{item.EventId}_SharePoint";
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                item.PendingUsernameResolution = true;
+                item.Username = "__UNRESOLVED__";
+                item.ResolvedUsername = null;
+                item.IsFallback = true;
+                item.UsernameResolutionSource = "FallbackSystem_Pending";
+                item.FallbackSource = BuildPendingFallbackSource(item.EventId);
+                item.Status = "UNCONFIRMED";
+                item.LastDispatchError = networkUnavailable
+                    ? $"{item.EventId} username unresolved due to network unavailable"
+                    : $"{item.EventId} username unresolved";
+                await eventQueue.ReplaceAsync(item);
+                return false;
+            }
+
+            lock (knownLoginLock)
+                lastKnownLoginByComputer[item.ComputerName] = (resolvedUsername, item.EventTime);
+
+            item.Username = resolvedUsername;
+            item.ResolvedUsername = resolvedUsername;
+            item.IsFallback = true;
+            item.UsernameResolutionSource = "FallbackSystemResolved";
             item.FallbackSource = fallbackSource;
             item.Status = "UNCONFIRMED";
             item.PendingUsernameResolution = false;
@@ -2806,6 +2982,15 @@ namespace EventLogOutEmployeeService
 
             return false;
         }
+
+        private static bool SupportsPendingSystemResolution(int eventId)
+        {
+            return eventId == 1074 || eventId == 6006 || eventId == 4647 ||
+                   eventId == 42 || eventId == 6008 || eventId == 41;
+        }
+
+        private static string BuildPendingFallbackSource(int eventId)
+            => $"Event{eventId}_Pending";
 
         private bool IsValidUsername(string username)
         {

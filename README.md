@@ -968,13 +968,20 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
 ### 19.1 Event 1074 (Shutdown/Restart Initiated)
 
 1. Parse username dari message 1074.
-2. Jika username termasuk system trigger (exact list atau keyword contains), lakukan fallback ke **first Event 4624** (earliest timestamp) untuk **device + workDate yang sama** dari:
+2. Jika username termasuk system trigger (exact list atau keyword contains), lakukan fallback berurutan:
+   - **first Event 4624** (earliest timestamp) untuk **device + workDate yang sama** dari:
    - in-memory first-logon index, lalu
    - pending queue files (`queue\\pending\\*.json`).
+   - **most recent 4624** dari queue untuk computer yang sama.
+   - **latest username by computer** dari SharePoint.
 3. Jika fallback berhasil:
    - `Username` diisi resolved user,
-   - metadata queue diisi `ResolvedUsername`, `OriginalUsername`, `IsFallback=true`, `FallbackSource=FirstLogon4624`.
-4. Jika tidak ada 4624 yang cocok → event 1074 di-drop dan alasan ditulis ke Application Event Log.
+   - metadata queue diisi `ResolvedUsername`, `OriginalUsername`, `IsFallback=true`, `FallbackSource` sesuai sumber (`FirstLogon4624`, `Event1074_Queue4624`, atau `Event1074_SharePoint`).
+4. Jika semua fallback gagal, event **tidak di-drop**:
+   - queue tetap menyimpan event dengan `Username=__UNRESOLVED__`,
+   - `Status=UNCONFIRMED`,
+   - `FallbackSource=Event1074_Pending`,
+   - `PendingUsernameResolution=true` untuk retry resolve saat dispatch berikutnya.
 
 ### 19.2 Event 6005 (Fallback Login saat Security log unavailable/cleared)
 
@@ -994,6 +1001,16 @@ Urutan resolusi username:
 Jika resolve berhasil:
 - `FallbackSource` = `Event6005_PreviousLog`, `Event6005_First4624After`, atau `Event6005_SharePoint`
 - Summary login row dibuat/diupdate sebagai `UNCONFIRMED` (ClockOut tetap kosong sampai shutdown valid masuk).
+
+### 19.3 Pending-first policy untuk system/logout events (1074/6006/4647/42)
+
+- Prinsip utama: **lebih baik pending daripada salah user/jam**.
+- Jika username untuk event 1074/6006/4647/42 belum valid saat ingest:
+  - event tetap masuk queue sebagai `UNCONFIRMED`,
+  - `PendingUsernameResolution=true`,
+  - `FallbackSource` diset eksplisit (`Event1074_Pending`, `Event6006_Pending`, `Event4647_Pending`, `Event42_Pending`).
+- Saat dispatch, pending item dicoba resolve ulang berurutan: first 4624 (device+workDate) → queue 4624 terdekat → SharePoint latest username by computer.
+- Event `42` tetap **tidak menulis Summary shutdown** (hanya raw signal), walaupun boleh tersimpan sebagai pending.
 
 ---
 
