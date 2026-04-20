@@ -2281,66 +2281,75 @@ namespace EventLogOutEmployeeService
 
             try
             {
-                EventLog secLog = securityEventLog ?? new EventLog("Security");
-                int total = secLog.Entries.Count;
-                if (total == 0)
-                    return null;
-
-                DateTime dayStartUtc = eventTime.ToLocalTime().Date.ToUniversalTime();
-                DateTime dayEndUtc = dayStartUtc.AddDays(1);
-                int scanned = 0;
-                (string Username, DateTime EventTime)? best = null;
-
-                for (int i = total - 1; i >= 0 && scanned < 6000; i--)
+                EventLog? ownedSecLog = null;
+                EventLog secLog = securityEventLog ?? (ownedSecLog = new EventLog("Security"));
+                try
                 {
-                    scanned++;
-                    EventLogEntry entry = secLog.Entries[i];
-                    if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
-                        continue;
+                    int total = secLog.Entries.Count;
+                    if (total == 0)
+                        return null;
 
-                    DateTime t = entry.TimeGenerated.ToUniversalTime();
-                    if (t < dayStartUtc)
-                        break;
-                    if (t >= dayEndUtc)
-                        continue;
-                    if (requireAfterEventTime && t < eventTime)
-                        continue;
+                    DateTime dayStartUtc = eventTime.ToLocalTime().Date.ToUniversalTime();
+                    DateTime dayEndUtc = dayStartUtc.AddDays(1);
+                    (string Username, DateTime EventTime)? best = null;
 
-                    if (GetNormalizedEventId(entry) != 4624)
-                        continue;
-
-                    string message = entry.Message ?? string.Empty;
-                    int lt = ParseLogonType(message);
-                    if (!IsRelevantLogonType(lt) || IsAdminSplitTokenLogin(message))
-                        continue;
-
-                    string? username = GetUsernameFromEvent(message, 4624);
-                    if (string.IsNullOrWhiteSpace(username))
-                        continue;
-
-                    string? sid = GetUserSidFromSecurityEvent(message, 4624);
-                    username = ResolveUsernameBySid(username, sid);
-                    if (!IsValidUsername(username))
-                        continue;
-
-                    if (!best.HasValue || t < best.Value.EventTime)
-                        best = (username, t);
-                }
-
-                if (best.HasValue)
-                {
-                    lock (firstLogonLock)
+                    for (int i = total - 1; i >= 0; i--)
                     {
-                        if (!firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var existing) ||
-                            best.Value.EventTime < existing.EventTime)
-                            firstLogon4624ByDeviceWorkDate[key] = best.Value;
-                    }
-                }
+                        EventLogEntry entry = secLog.Entries[i];
+                        if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
+                            continue;
 
-                return best;
+                        DateTime t = entry.TimeGenerated.ToUniversalTime();
+                        if (t < dayStartUtc)
+                            break;
+                        if (t >= dayEndUtc)
+                            continue;
+                        if (requireAfterEventTime && t < eventTime)
+                            continue;
+
+                        if (GetNormalizedEventId(entry) != 4624)
+                            continue;
+
+                        string message = entry.Message ?? string.Empty;
+                        int lt = ParseLogonType(message);
+                        if (!IsRelevantLogonType(lt) || IsAdminSplitTokenLogin(message))
+                            continue;
+
+                        string? username = GetUsernameFromEvent(message, 4624);
+                        if (string.IsNullOrWhiteSpace(username))
+                            continue;
+
+                        string? sid = GetUserSidFromSecurityEvent(message, 4624);
+                        username = ResolveUsernameBySid(username, sid);
+                        if (!IsValidUsername(username))
+                            continue;
+
+                        if (!best.HasValue || t < best.Value.EventTime)
+                            best = (username, t);
+                    }
+
+                    if (best.HasValue)
+                    {
+                        lock (firstLogonLock)
+                        {
+                            if (!firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var existing) ||
+                                best.Value.EventTime < existing.EventTime)
+                                firstLogon4624ByDeviceWorkDate[key] = best.Value;
+                        }
+                    }
+
+                    return best;
+                }
+                finally
+                {
+                    ownedSecLog?.Dispose();
+                }
             }
-            catch
+            catch (Exception ex)
             {
+                SafeWriteEventLog("Application",
+                    $"[DBG-4624] Failed to resolve first 4624 for {computerName} at {eventTime:O}: {ex.Message}",
+                    EventLogEntryType.Warning, 2028);
                 return null;
             }
         }
@@ -2372,45 +2381,54 @@ namespace EventLogOutEmployeeService
             startupAnchorUtc = default;
             try
             {
-                EventLog sysLog = systemEventLog ?? new EventLog("System");
-                int total = sysLog.Entries.Count;
-                if (total == 0)
-                    return false;
-
-                DateTime dayStartUtc = eventTime.ToLocalTime().Date.ToUniversalTime();
-                DateTime dayEndUtc = dayStartUtc.AddDays(1);
-                DateTime? earliest = null;
-                int scanned = 0;
-
-                for (int i = total - 1; i >= 0 && scanned < 6000; i--)
+                EventLog? ownedSysLog = null;
+                EventLog sysLog = systemEventLog ?? (ownedSysLog = new EventLog("System"));
+                try
                 {
-                    scanned++;
-                    EventLogEntry entry = sysLog.Entries[i];
-                    if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
-                        continue;
+                    int total = sysLog.Entries.Count;
+                    if (total == 0)
+                        return false;
 
-                    DateTime t = entry.TimeGenerated.ToUniversalTime();
-                    if (t < dayStartUtc)
-                        break;
-                    if (t >= dayEndUtc)
-                        continue;
+                    DateTime dayStartUtc = eventTime.ToLocalTime().Date.ToUniversalTime();
+                    DateTime dayEndUtc = dayStartUtc.AddDays(1);
+                    DateTime? earliest = null;
 
-                    int eventId = GetNormalizedEventId(entry);
-                    if (!IsStartupAnchorEventId(eventId))
-                        continue;
+                    for (int i = total - 1; i >= 0; i--)
+                    {
+                        EventLogEntry entry = sysLog.Entries[i];
+                        if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
+                            continue;
 
-                    if (!earliest.HasValue || t < earliest.Value)
-                        earliest = t;
+                        DateTime t = entry.TimeGenerated.ToUniversalTime();
+                        if (t < dayStartUtc)
+                            break;
+                        if (t >= dayEndUtc)
+                            continue;
+
+                        int eventId = GetNormalizedEventId(entry);
+                        if (!IsStartupAnchorEventId(eventId))
+                            continue;
+
+                        if (!earliest.HasValue || t < earliest.Value)
+                            earliest = t;
+                    }
+
+                    if (!earliest.HasValue)
+                        return false;
+
+                    startupAnchorUtc = earliest.Value;
+                    return true;
                 }
-
-                if (!earliest.HasValue)
-                    return false;
-
-                startupAnchorUtc = earliest.Value;
-                return true;
+                finally
+                {
+                    ownedSysLog?.Dispose();
+                }
             }
-            catch
+            catch (Exception ex)
             {
+                SafeWriteEventLog("Application",
+                    $"[DBG-6005] Failed to scan startup anchor for {computerName} at {eventTime:O}: {ex.Message}",
+                    EventLogEntryType.Warning, 2029);
                 return false;
             }
         }
