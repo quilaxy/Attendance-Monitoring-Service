@@ -289,9 +289,7 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
     "SummaryListId": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
   },
   "AppSettings": {
-    "VerboseLogging": false,
-    "QueueAlertThreshold": 500,
-    "DispatchBackoffSeconds": [30, 60, 120, 300, 600]
+    "VerboseLogging": false
   }
 }
 ```
@@ -305,8 +303,9 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
 | `SharePointSettings:ListId` | ID raw list (`AttendanceLog`) dari step 2.5 |
 | `SharePointSettings:SummaryListId` | ID summary list (`AttendanceSummary`) dari step 2.5 — opsional, jika dikosongkan fitur Summary tidak aktif |
 | `AppSettings:VerboseLogging` | `true` untuk debug log detail, `false` untuk log essential |
-| `AppSettings:QueueAlertThreshold` | Batas pending queue untuk high-water alert |
-| `AppSettings:DispatchBackoffSeconds[]` | Jadwal retry dispatch (default: 30,60,120,300,600 detik; setelah itu tetap interval terakhir) |
+| `QUEUE_ALERT_THRESHOLD` (environment variable) | Batas pending queue untuk high-water alert (default: 500) |
+| `DISPATCH_BACKOFF_SECONDS` (environment variable) | Jadwal retry dispatch format CSV, contoh `30,60,120,300,600` |
+| `STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES` (environment variable) | Batas maksimum gap (menit) startup→first 4624; jika gap melebihi ambang ini fallback 6005 diizinkan (default: 90) |
 
 ---
 
@@ -979,18 +978,21 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
 
 ### 19.2 Event 6005 (Fallback Login saat Security log unavailable/cleared)
 
-6005 fallback hanya dipakai jika konteks menunjukkan Security log unavailable/cleared **dan** tidak ada 4624 untuk device+workDate.
+6005 fallback dipakai jika:
+- Security log unavailable/cleared, **atau**
+- sudah ada first 4624 namun gap dari startup anchor device ke first 4624 melebihi `STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES` (anomali login terlambat).
 
 Urutan resolusi username:
 1. Most recent 4624 dari in-memory/queue pending untuk device+workDate.
 2. Jika tidak ada, query SharePoint berdasarkan device.
-3. Jika tetap tidak ada dan jaringan sedang unavailable:
+3. Jika tetap tidak ada:
    - event 6005 tetap dipersist ke queue dengan `Status=UNCONFIRMED`,
    - `FallbackSource=Event6005_Pending`,
    - `PendingUsernameResolution=true` untuk dicoba ulang pada siklus dispatch berikutnya.
+4. Saat 4624 valid akhirnya muncul (misalnya service log baru normal siang hari), pending 6005 di-resolve dari first 4624 setelah 6005 (`FallbackSource=Event6005_First4624After`) lalu summary login dikirim/update.
 
 Jika resolve berhasil:
-- `FallbackSource` = `Event6005_PreviousLog` atau `Event6005_SharePoint`
+- `FallbackSource` = `Event6005_PreviousLog`, `Event6005_First4624After`, atau `Event6005_SharePoint`
 - Summary login row dibuat/diupdate sebagai `UNCONFIRMED` (ClockOut tetap kosong sampai shutdown valid masuk).
 
 ---

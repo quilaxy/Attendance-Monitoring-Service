@@ -26,6 +26,7 @@ namespace EventLogOutEmployeeService
         private readonly object checkpointWriteLock = new object();
         private readonly object knownLoginLock = new object();
         private readonly object firstLogonLock = new object();
+        private readonly object startupAnchorLock = new object();
         private int activeDispatchCount = 0;
         private DateTime serviceStartTime;
         private volatile bool replayInProgress = false;
@@ -45,7 +46,10 @@ namespace EventLogOutEmployeeService
             new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, (string Username, DateTime EventTime)> firstLogon4624ByDeviceWorkDate =
             new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> startupAnchorByDeviceWorkDate =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private int queueAlertThreshold = 500;
+        private TimeSpan startupToFirst4624MaxGapForDirectUse = TimeSpan.FromMinutes(90);
         private bool queueThresholdAlerted = false;
         private int[] dispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
         private HashSet<string> systemFallbackTriggerAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -759,28 +763,56 @@ namespace EventLogOutEmployeeService
 
             // Baca VerboseLogging dari AppSettings — default false (production mode)
             VerboseLogging = config.GetValue<bool>("AppSettings:VerboseLogging", defaultValue: false);
-            queueAlertThreshold = Math.Max(1, config.GetValue<int>("AppSettings:QueueAlertThreshold", defaultValue: 500));
-            dispatchBackoffSeconds = ReadIntListSetting(
-                config, "AppSettings:DispatchBackoffSeconds", new[] { 30, 60, 120, 300, 600 });
+            queueAlertThreshold = Math.Max(1, ReadIntFromEnvironment("QUEUE_ALERT_THRESHOLD", 500));
+            int startupGapMinutes = ReadIntFromEnvironment("STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES", 90);
+            startupToFirst4624MaxGapForDirectUse = TimeSpan.FromMinutes(Math.Max(1, startupGapMinutes));
+            dispatchBackoffSeconds = ReadIntListFromEnvironment(
+                "DISPATCH_BACKOFF_SECONDS", new[] { 30, 60, 120, 300, 600 });
 
             return config;
         }
 
-        private static int[] ReadIntListSetting(IConfiguration config, string keyPath, int[] fallback)
+        private static int ReadIntFromEnvironment(string key, int fallback)
         {
             try
             {
+                string? raw = Environment.GetEnvironmentVariable(key);
+                if (int.TryParse(raw, out int parsed) && parsed > 0)
+                    return parsed;
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[CONFIG] Failed to read env '{key}' as int. Using fallback={fallback}. Error={ex.Message}",
+                    EventLogEntryType.Warning, 2030);
+            }
+
+            return fallback;
+        }
+
+        private static int[] ReadIntListFromEnvironment(string key, int[] fallback)
+        {
+            try
+            {
+                string? raw = Environment.GetEnvironmentVariable(key);
+                if (string.IsNullOrWhiteSpace(raw))
+                    return fallback;
+
                 var values = new List<int>();
-                foreach (var child in config.GetSection(keyPath).GetChildren())
+                string[] tokens = raw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (string token in tokens)
                 {
-                    if (int.TryParse(child.Value, out int n) && n > 0)
+                    if (int.TryParse(token, out int n) && n > 0)
                         values.Add(n);
                 }
 
                 return values.Count > 0 ? values.ToArray() : fallback;
             }
-            catch
+            catch (Exception ex)
             {
+                SafeWriteEventLog("Application",
+                    $"[CONFIG] Failed to read env '{key}' as int list. Using fallback. Error={ex.Message}",
+                    EventLogEntryType.Warning, 2031);
                 return fallback;
             }
         }
@@ -2002,31 +2034,28 @@ namespace EventLogOutEmployeeService
 
             if (string.IsNullOrWhiteSpace(resolvedUsername))
             {
-                if (isNetworkUnavailable)
-                {
-                    await ProcessEvent(
-                        6005,
-                        "__UNRESOLVED__",
-                        eventTime,
-                        computerName,
-                        "System",
-                        0,
-                        null,
-                        writeRawRecord,
-                        usernameResolutionSource: "Fallback6005_Pending",
-                        originalUsername: null,
-                        fallbackSource: "Event6005_Pending",
-                        isFallback: true,
-                        resolvedUsername: null,
-                        status: "UNCONFIRMED",
-                        pendingUsernameResolution: true);
-                    return true;
-                }
+                await ProcessEvent(
+                    6005,
+                    "__UNRESOLVED__",
+                    eventTime,
+                    computerName,
+                    "System",
+                    0,
+                    null,
+                    writeRawRecord,
+                    usernameResolutionSource: "Fallback6005_Pending",
+                    originalUsername: null,
+                    fallbackSource: "Event6005_Pending",
+                    isFallback: true,
+                    resolvedUsername: null,
+                    status: "UNCONFIRMED",
+                    pendingUsernameResolution: true);
 
                 SafeWriteEventLog("Application",
-                    $"[DBG-6005] DROPPING fallback login at {eventTime:O} on {computerName} — username could not be resolved.",
-                    EventLogEntryType.Warning, 2008);
-                return false;
+                    $"[DBG-6005] Fallback login queued as pending at {eventTime:O} on {computerName}. " +
+                    $"reason={(isNetworkUnavailable ? "network unavailable" : "username not yet resolvable")}",
+                    EventLogEntryType.Information, 2026);
+                return true;
             }
 
             lock (knownLoginLock)
@@ -2057,15 +2086,42 @@ namespace EventLogOutEmployeeService
             if (item.EventId != 6005 || !item.PendingUsernameResolution)
                 return true;
 
-            string? resolvedUsername = await eventQueue.FindMostRecent4624UsernameForComputerAsync(item.ComputerName, item.EventTime);
+            string workDate = item.EventTime.ToLocalTime().ToString("yyyy-MM-dd");
+            string? resolvedUsername = null;
             string? fallbackSource = null;
             bool networkUnavailable = false;
 
-            if (!string.IsNullOrWhiteSpace(resolvedUsername) && IsValidUsername(resolvedUsername))
+            var firstAfter = await ResolveFirst4624ForWorkDateAsync(
+                item.ComputerName,
+                item.EventTime,
+                requireAfterEventTime: true);
+            if (firstAfter.HasValue && IsValidUsername(firstAfter.Value.Username))
             {
-                fallbackSource = "Event6005_PreviousLog";
+                resolvedUsername = firstAfter.Value.Username;
+                fallbackSource = "Event6005_First4624After";
             }
-            else
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                var first4624AfterFromQueue = await eventQueue.FindFirst4624ForComputerWorkDateAfterAsync(
+                    item.ComputerName,
+                    workDate,
+                    item.EventTime);
+                if (first4624AfterFromQueue.HasValue && IsValidUsername(first4624AfterFromQueue.Value.Username))
+                {
+                    resolvedUsername = first4624AfterFromQueue.Value.Username;
+                    fallbackSource = "Event6005_First4624After";
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                resolvedUsername = await eventQueue.FindMostRecent4624UsernameForComputerAsync(item.ComputerName, item.EventTime);
+                if (!string.IsNullOrWhiteSpace(resolvedUsername) && IsValidUsername(resolvedUsername))
+                    fallbackSource = "Event6005_PreviousLog";
+            }
+
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
             {
                 var sharePointLookup = await sharePointIntegration.Value.GetLatestUsernameByComputerWithStatusAsync(
                     item.ComputerName, item.EventTime);
@@ -2110,27 +2166,54 @@ namespace EventLogOutEmployeeService
                 return false;
 
             string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-            if (await HasAny4624ForComputerWorkDateAsync(computerName, workDate, eventTime))
-                return false;
+            var first4624 = await ResolveFirst4624ForWorkDateAsync(
+                computerName,
+                eventTime,
+                requireAfterEventTime: false);
 
-            return IsSecurityLogUnavailableOrLikelyCleared(eventTime, computerName);
-        }
-
-        private async Task<bool> HasAny4624ForComputerWorkDateAsync(string computerName, string workDate, DateTime eventTime)
-        {
-            string key = BuildDeviceWorkDateKey(computerName, workDate);
-
-            lock (firstLogonLock)
+            if (first4624.HasValue)
             {
-                if (firstLogon4624ByDeviceWorkDate.ContainsKey(key))
+                if (TryGetStartupAnchorForWorkDate(computerName, eventTime, out DateTime startupAnchorUtc))
+                {
+                    TimeSpan gap = first4624.Value.EventTime - startupAnchorUtc;
+                    if (gap < TimeSpan.Zero)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-6005] Startup anchor is later than first 4624. " +
+                            $"computer={computerName} workDate={workDate} startup={startupAnchorUtc:O} " +
+                            $"first4624={first4624.Value.EventTime:O}",
+                            EventLogEntryType.Warning, 2032);
+                        gap = TimeSpan.Zero;
+                    }
+
+                    if (gap <= startupToFirst4624MaxGapForDirectUse)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-6005] SKIP fallback: startup→first4624 gap within threshold. " +
+                            $"computer={computerName} workDate={workDate} startup={startupAnchorUtc:O} " +
+                            $"first4624={first4624.Value.EventTime:O} gapMin={gap.TotalMinutes:F1} " +
+                            $"thresholdMin={startupToFirst4624MaxGapForDirectUse.TotalMinutes:F1}",
+                            EventLogEntryType.Information, 2024);
+                        return false;
+                    }
+
+                    SafeWriteEventLog("Application",
+                        $"[DBG-6005] ALLOW fallback: startup→first4624 gap exceeds threshold. " +
+                        $"computer={computerName} workDate={workDate} startup={startupAnchorUtc:O} " +
+                        $"first4624={first4624.Value.EventTime:O} gapMin={gap.TotalMinutes:F1} " +
+                        $"thresholdMin={startupToFirst4624MaxGapForDirectUse.TotalMinutes:F1}",
+                        EventLogEntryType.Information, 2025);
                     return true;
+                }
+
+                SafeWriteEventLog("Application",
+                    $"[DBG-6005] SKIP fallback: first 4624 already available and startup anchor not found. " +
+                    $"computer={computerName} workDate={workDate} first4624={first4624.Value.EventTime:O}",
+                    EventLogEntryType.Information, 2027);
+                return false;
             }
 
-            string? fromQueue = await eventQueue.FindMostRecent4624UsernameForComputerAsync(computerName, eventTime);
-            if (!string.IsNullOrWhiteSpace(fromQueue))
-                return true;
-
-            return false;
+            return IsSecurityLogUnavailableOrLikelyCleared(eventTime, computerName);
         }
 
         private bool IsSecurityLogUnavailableOrLikelyCleared(DateTime eventTime, string computerName)
@@ -2191,26 +2274,200 @@ namespace EventLogOutEmployeeService
 
         private async Task<string?> ResolveFirst4624UsernameForWorkDateAsync(string computerName, DateTime eventTime)
         {
+            var first = await ResolveFirst4624ForWorkDateAsync(
+                computerName,
+                eventTime,
+                requireAfterEventTime: false);
+            return first?.Username;
+        }
+
+        private async Task<(string Username, DateTime EventTime)?> ResolveFirst4624ForWorkDateAsync(
+            string computerName,
+            DateTime eventTime,
+            bool requireAfterEventTime)
+        {
             string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
             string key = BuildDeviceWorkDateKey(computerName, workDate);
 
             lock (firstLogonLock)
             {
                 if (firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var fromMemory) &&
-                    !string.IsNullOrWhiteSpace(fromMemory.Username))
-                    return fromMemory.Username;
+                    !string.IsNullOrWhiteSpace(fromMemory.Username) &&
+                    IsValidUsername(fromMemory.Username) &&
+                    (!requireAfterEventTime || fromMemory.EventTime >= eventTime))
+                    return fromMemory;
             }
 
-            var firstFromQueue = await eventQueue.FindFirst4624ForComputerWorkDateAsync(computerName, workDate);
+            var firstFromQueue = requireAfterEventTime
+                ? await eventQueue.FindFirst4624ForComputerWorkDateAfterAsync(computerName, workDate, eventTime)
+                : await eventQueue.FindFirst4624ForComputerWorkDateAsync(computerName, workDate);
             if (firstFromQueue.HasValue && IsValidUsername(firstFromQueue.Value.Username))
             {
                 lock (firstLogonLock)
-                    firstLogon4624ByDeviceWorkDate[key] = firstFromQueue.Value;
-                return firstFromQueue.Value.Username;
+                {
+                    if (!firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var existing) ||
+                        firstFromQueue.Value.EventTime < existing.EventTime)
+                        firstLogon4624ByDeviceWorkDate[key] = firstFromQueue.Value;
+                }
+                return firstFromQueue.Value;
             }
 
-            return null;
+            try
+            {
+                EventLog? ownedSecLog = null;
+                EventLog secLog = securityEventLog ?? (ownedSecLog = new EventLog("Security"));
+                try
+                {
+                    int total = secLog.Entries.Count;
+                    if (total == 0)
+                        return null;
+
+                    DateTime dayStartUtc = eventTime.ToLocalTime().Date.ToUniversalTime();
+                    DateTime dayEndUtc = dayStartUtc.AddDays(1);
+                    (string Username, DateTime EventTime)? best = null;
+
+                    for (int i = total - 1; i >= 0; i--)
+                    {
+                        EventLogEntry entry = secLog.Entries[i];
+                        if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        DateTime t = entry.TimeGenerated.ToUniversalTime();
+                        if (t < dayStartUtc)
+                            break;
+                        if (t >= dayEndUtc)
+                            continue;
+                        if (requireAfterEventTime && t < eventTime)
+                            continue;
+
+                        if (GetNormalizedEventId(entry) != 4624)
+                            continue;
+
+                        string message = entry.Message ?? string.Empty;
+                        int lt = ParseLogonType(message);
+                        if (!IsRelevantLogonType(lt) || IsAdminSplitTokenLogin(message))
+                            continue;
+
+                        string? username = GetUsernameFromEvent(message, 4624);
+                        if (string.IsNullOrWhiteSpace(username))
+                            continue;
+
+                        string? sid = GetUserSidFromSecurityEvent(message, 4624);
+                        username = ResolveUsernameBySid(username, sid);
+                        if (!IsValidUsername(username))
+                            continue;
+
+                        if (!best.HasValue || t < best.Value.EventTime)
+                            best = (username, t);
+                    }
+
+                    if (best.HasValue)
+                    {
+                        lock (firstLogonLock)
+                        {
+                            if (!firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var existing) ||
+                                best.Value.EventTime < existing.EventTime)
+                                firstLogon4624ByDeviceWorkDate[key] = best.Value;
+                        }
+                    }
+
+                    return best;
+                }
+                finally
+                {
+                    ownedSecLog?.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-4624] Failed to resolve first 4624 for {computerName} at {eventTime:O}: {ex.Message}",
+                    EventLogEntryType.Warning, 2028);
+                return null;
+            }
         }
+
+        private bool TryGetStartupAnchorForWorkDate(string computerName, DateTime eventTime, out DateTime startupAnchorUtc)
+        {
+            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
+            string key = BuildDeviceWorkDateKey(computerName, workDate);
+
+            lock (startupAnchorLock)
+            {
+                if (startupAnchorByDeviceWorkDate.TryGetValue(key, out startupAnchorUtc))
+                    return true;
+            }
+
+            if (TryScanStartupAnchorForWorkDate(computerName, eventTime, out startupAnchorUtc))
+            {
+                lock (startupAnchorLock)
+                    startupAnchorByDeviceWorkDate[key] = startupAnchorUtc;
+                return true;
+            }
+
+            startupAnchorUtc = default;
+            return false;
+        }
+
+        private bool TryScanStartupAnchorForWorkDate(string computerName, DateTime eventTime, out DateTime startupAnchorUtc)
+        {
+            startupAnchorUtc = default;
+            try
+            {
+                EventLog? ownedSysLog = null;
+                EventLog sysLog = systemEventLog ?? (ownedSysLog = new EventLog("System"));
+                try
+                {
+                    int total = sysLog.Entries.Count;
+                    if (total == 0)
+                        return false;
+
+                    DateTime dayStartUtc = eventTime.ToLocalTime().Date.ToUniversalTime();
+                    DateTime dayEndUtc = dayStartUtc.AddDays(1);
+                    DateTime? earliest = null;
+
+                    for (int i = total - 1; i >= 0; i--)
+                    {
+                        EventLogEntry entry = sysLog.Entries[i];
+                        if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        DateTime t = entry.TimeGenerated.ToUniversalTime();
+                        if (t < dayStartUtc)
+                            break;
+                        if (t >= dayEndUtc)
+                            continue;
+
+                        int eventId = GetNormalizedEventId(entry);
+                        if (!IsStartupAnchorEventId(eventId))
+                            continue;
+
+                        if (!earliest.HasValue || t < earliest.Value)
+                            earliest = t;
+                    }
+
+                    if (!earliest.HasValue)
+                        return false;
+
+                    startupAnchorUtc = earliest.Value;
+                    return true;
+                }
+                finally
+                {
+                    ownedSysLog?.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-6005] Failed to scan startup anchor for {computerName} at {eventTime:O}: {ex.Message}",
+                    EventLogEntryType.Warning, 2029);
+                return false;
+            }
+        }
+
+        private static bool IsStartupAnchorEventId(int eventId)
+            => eventId == 12 || eventId == 6005 || eventId == 6009;
 
         private void RegisterFirst4624Logon(string computerName, string username, DateTime eventTime)
         {
