@@ -35,9 +35,10 @@ namespace EventLogOutEmployeeService
 
         // Shared 1074 state for resolving adjacent 6006 events.
         private static readonly object last1074Lock = new object();
-        private static string? last1074Username;
-        private static DateTime last1074EventTime = DateTime.MinValue;
-        private static string? last1074ShutdownType;
+        private static readonly List<Last1074State> last1074States = new List<Last1074State>();
+        private static readonly TimeSpan primary1074PairWindow = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan fallback1074PairWindow = TimeSpan.FromSeconds(120);
+        private static readonly TimeSpan last1074RetentionWindow = TimeSpan.FromMinutes(5);
         private readonly Dictionary<string, string> sidUsernameCache =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, (string Username, DateTime EventTime)> lastKnownLoginByComputer =
@@ -82,6 +83,20 @@ namespace EventLogOutEmployeeService
             new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
 
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
+
+        private sealed class Last1074State
+        {
+            public Last1074State(string username, DateTime eventTime, string shutdownType)
+            {
+                Username = username;
+                EventTime = eventTime;
+                ShutdownType = shutdownType;
+            }
+
+            public string Username { get; }
+            public DateTime EventTime { get; }
+            public string ShutdownType { get; }
+        }
 
         /// <summary>
         /// Kalau false, hanya log essential (error, warning, lifecycle) yang ditulis.
@@ -2383,14 +2398,16 @@ namespace EventLogOutEmployeeService
 
             lock (last1074Lock)
             {
-                last1074Username = username;
-                last1074EventTime = eventTime;
-                last1074ShutdownType = shutdownType;
+                last1074States.Add(new Last1074State(username, eventTime, shutdownType));
+
+                DateTime pruneBefore = eventTime - last1074RetentionWindow;
+                last1074States.RemoveAll(x => x.EventTime < pruneBefore);
             }
         }
 
         /// <summary>
-        /// Tries to find a 1074 event within 60 seconds before the given 6006 event time.
+        /// Tries to find a 1074 event before the given 6006 event time.
+        /// Priority: <=60s window first. Fallback: >60s and <=120s only when primary fails.
         /// Returns (username, shutdownType) if a matching 1074 exists, or (null, null) if not.
         /// shutdownType will be null if the paired 1074 was a Restart (not a real power-off).
         /// </summary>
@@ -2398,7 +2415,7 @@ namespace EventLogOutEmployeeService
         {
             lock (last1074Lock)
             {
-                if (string.IsNullOrWhiteSpace(last1074Username))
+                if (last1074States.Count == 0)
                 {
                     SafeWriteEventLog("Application",
                         $"[DBG-6006] TryResolve: no prior 1074 state in memory.",
@@ -2406,29 +2423,97 @@ namespace EventLogOutEmployeeService
                     return (null, null);
                 }
 
-                double diffSeconds = Math.Abs((eventTime - last1074EventTime).TotalSeconds);
-                // Windows shutdown: 6006 is usually within a few seconds of 1074,
-                // but slow shutdowns (pending app close, etc.) can take up to 60s.
-                if (diffSeconds > 60)
+                Last1074State? primaryCandidate = null;
+                Last1074State? fallbackCandidate = null;
+                double primaryDiffSeconds = double.MaxValue;
+                double fallbackDiffSeconds = double.MaxValue;
+
+                for (int i = 0; i < last1074States.Count; i++)
+                {
+                    Last1074State candidate = last1074States[i];
+                    if (candidate.EventTime > eventTime)
+                        continue;
+
+                    double diffSeconds = (eventTime - candidate.EventTime).TotalSeconds;
+                    if (diffSeconds <= primary1074PairWindow.TotalSeconds)
+                    {
+                        if (primaryCandidate == null || candidate.EventTime > primaryCandidate.EventTime)
+                        {
+                            primaryCandidate = candidate;
+                            primaryDiffSeconds = diffSeconds;
+                        }
+                    }
+                    else if (diffSeconds <= fallback1074PairWindow.TotalSeconds)
+                    {
+                        if (fallbackCandidate == null || candidate.EventTime > fallbackCandidate.EventTime)
+                        {
+                            fallbackCandidate = candidate;
+                            fallbackDiffSeconds = diffSeconds;
+                        }
+                    }
+                }
+
+                if (primaryCandidate != null)
+                {
+                    bool isRestartPrimary = IsRestartShutdownType(primaryCandidate.ShutdownType);
+                    string? confirmedPrimaryShutdownType = isRestartPrimary ? null : primaryCandidate.ShutdownType;
+
+                    SafeWriteEventLog("Application",
+                        $"[DBG-6006] TryResolve: matched PRIMARY<=60s username='{primaryCandidate.Username}' " +
+                        $"diff={primaryDiffSeconds:F1}s 1074Type='{primaryCandidate.ShutdownType}' isRestart={isRestartPrimary}",
+                        EventLogEntryType.Information, 2012);
+
+                    return (primaryCandidate.Username, confirmedPrimaryShutdownType);
+                }
+
+                if (fallbackCandidate == null)
                 {
                     SafeWriteEventLog("Application",
-                        $"[DBG-6006] TryResolve: diff={diffSeconds:F0}s exceeds 60s window. " +
-                        $"last1074Time={last1074EventTime:O} 6006Time={eventTime:O}",
+                        $"[DBG-6006] TryResolve: no 1074 candidate in <=120s window before 6006. 6006Time={eventTime:O}",
                         EventLogEntryType.Information, 2011);
                     return (null, null);
                 }
 
-                // If the paired 1074 was a Restart, we have a username but no confirmed shutdown type.
-                // Return username but null shutdownType so caller knows this is unconfirmed.
-                bool isRestart = IsRestartShutdownType(last1074ShutdownType);
-                string? confirmedShutdownType = isRestart ? null : last1074ShutdownType;
+                SafeWriteEventLog("Application",
+                    $"[DBG-6006] TryResolve: PRIMARY<=60s missed, evaluating FALLBACK60-120s " +
+                    $"latestCandidate username='{fallbackCandidate.Username}' candidateTime={fallbackCandidate.EventTime:O} " +
+                    $"6006Time={eventTime:O}",
+                    EventLogEntryType.Information, 2011);
+
+                bool restartIndicationInFallbackRange = false;
+                for (int i = 0; i < last1074States.Count; i++)
+                {
+                    Last1074State candidate = last1074States[i];
+                    // Only inspect 1074 states that happened from the selected fallback candidate
+                    // up to this 6006 event; any restart in this interval invalidates fallback pairing.
+                    if (candidate.EventTime < fallbackCandidate.EventTime || candidate.EventTime > eventTime)
+                        continue;
+
+                    if (IsRestartShutdownType(candidate.ShutdownType))
+                    {
+                        restartIndicationInFallbackRange = true;
+                        break;
+                    }
+                }
+
+                if (restartIndicationInFallbackRange)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-6006] TryResolve: FALLBACK60-120s used=false (restart indication found). " +
+                        $"candidateTime={fallbackCandidate.EventTime:O} 6006Time={eventTime:O}",
+                        EventLogEntryType.Information, 2011);
+                    return (null, null);
+                }
 
                 SafeWriteEventLog("Application",
-                    $"[DBG-6006] TryResolve: matched username='{last1074Username}' diff={diffSeconds:F1}s " +
-                    $"1074Type='{last1074ShutdownType}' isRestart={isRestart}",
+                    $"[DBG-6006] TryResolve: FALLBACK60-120s used=true username='{fallbackCandidate.Username}' " +
+                    $"diff={fallbackDiffSeconds:F1}s 1074Type='{fallbackCandidate.ShutdownType}' " +
+                    $"(PRIMARY<=60s had no match)",
                     EventLogEntryType.Information, 2012);
 
-                return (last1074Username, confirmedShutdownType);
+                bool isRestartFallback = IsRestartShutdownType(fallbackCandidate.ShutdownType);
+                string? confirmedFallbackShutdownType = isRestartFallback ? null : fallbackCandidate.ShutdownType;
+                return (fallbackCandidate.Username, confirmedFallbackShutdownType);
             }
         }
 

@@ -464,8 +464,8 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 2007 | Info | DBG-eventId: GetMostRecentUser result |
 | 2008 | Warning | DBG-eventId: DROPPING event — no username resolved |
 | 2010 | Info | DBG-6006: TryResolve — no prior 1074 state in memory |
-| 2011 | Info | DBG-6006: TryResolve — diff > 60 detik |
-| 2012 | Info | DBG-6006: TryResolve — matched username + diff |
+| 2011 | Info | DBG-6006: TryResolve — tidak ada kandidat <=120 detik / fallback skip karena indikasi restart |
+| 2012 | Info | DBG-6006: TryResolve — matched PRIMARY<=60s atau FALLBACK60-120s |
 | 2020 | Info | DBG-1074: broad fallback matched candidate |
 | 2021 | Warning | DBG-1074: GetUserFromSystem1074Message exception |
 
@@ -662,7 +662,7 @@ Dengan extend `replayFrom - 30 detik` untuk system events, 1074 selalu masuk rep
 | Alasan | Penjelasan |
 |--------|-----------|
 | Security events dulu | 4624 mengisi `lastActiveUser` yang dibutuhkan system events |
-| 1074 sebelum 6006 | `TryResolve1074StateFor6006` butuh `last1074Username` di memory |
+| 1074 sebelum 6006 | `TryResolve1074StateFor6006` butuh state 1074 terbaru di memory |
 | Sort ascending | Memastikan 1074 → 6006 diproses sesuai urutan kronologis |
 
 ### 10.4 Live Event Filter
@@ -866,7 +866,10 @@ Priority menentukan event mana yang boleh overwrite `ShutdownTime` di Summary. H
 | 0 | 6006 | Tidak ada paired 1074 (unconfirmed) | ❌ tidak ditulis ke Summary |
 | 0 | 42 | Sleep | ❌ tidak ditulis ke Summary |
 
-**1074 ↔ 6006 pairing window:** 60 detik. Jika dalam 60 detik setelah 1074 ada 6006, keduanya dipasangkan.
+**1074 ↔ 6006 pairing window:**
+- Priority utama: pasangan 1074→6006 dalam **<=60 detik**.
+- Fallback: jika pairing utama gagal, service coba pasangan **>60 sampai <=120 detik**.
+- Guard fallback: hanya ambil kandidat 1074 terbaru sebelum 6006, dan fallback di-skip jika ada indikasi restart pada rentang kandidat→6006.
 
 **Shutdown Group & Priority:**
 
