@@ -711,6 +711,8 @@ Path: `queue\\pending\\*.json`
 
 Queue di-persist ke disk sehingga event yang belum di-dispatch ke SharePoint tidak hilang kalau service restart / crash.
 
+Item pending yang belum berhasil di-dispatch lebih dari **7 hari** akan dihapus otomatis dari queue.
+
 ### 12.2 Shutdown Group
 
 Event 4647, 1074, dan 6006 yang terjadi dalam satu rangkaian shutdown dikelompokkan dalam satu **ShutdownGroup**. Tujuannya agar summary hanya di-dispatch oleh event dengan priority tertinggi di group — mencegah race condition antar event dalam rangkaian yang sama.

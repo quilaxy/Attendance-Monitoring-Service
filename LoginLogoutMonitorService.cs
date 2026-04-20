@@ -87,6 +87,7 @@ namespace EventLogOutEmployeeService
             new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
 
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
+        private static readonly TimeSpan PendingQueueRetention = TimeSpan.FromDays(7);
 
         private sealed class Last1074State
         {
@@ -949,6 +950,15 @@ namespace EventLogOutEmployeeService
                         continue;
                     }
 
+                    if (IsPendingQueueItemExpired(next, nowUtc))
+                    {
+                        await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
+                        SafeWriteEventLog("Application",
+                            $"[QUEUE] Expired pending item removed: queueId={next.QueueId} eventId={next.EventId} eventTime={next.EventTime:O}",
+                            EventLogEntryType.Warning, 1047);
+                        continue;
+                    }
+
                     Interlocked.Increment(ref activeDispatchCount);
                     bool sent;
                     try
@@ -997,6 +1007,15 @@ namespace EventLogOutEmployeeService
         {
             int index = Math.Clamp(retryCount - 1, 0, dispatchBackoffSeconds.Length - 1);
             return TimeSpan.FromSeconds(dispatchBackoffSeconds[index]);
+        }
+
+        private static bool IsPendingQueueItemExpired(QueuedAttendanceEvent item, DateTime nowUtc)
+        {
+            DateTime eventTimeUtc = item.EventTime.Kind == DateTimeKind.Unspecified
+                ? DateTime.SpecifyKind(item.EventTime, DateTimeKind.Utc)
+                : item.EventTime.ToUniversalTime();
+
+            return nowUtc - eventTimeUtc > PendingQueueRetention;
         }
 
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
@@ -1829,6 +1848,15 @@ namespace EventLogOutEmployeeService
                     var next = await eventQueue.PeekNextReadyAsync(DateTime.UtcNow, cancellationToken);
                     if (next == null)
                         break;
+
+                    if (IsPendingQueueItemExpired(next, DateTime.UtcNow))
+                    {
+                        await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
+                        SafeWriteEventLog("Application",
+                            $"[QUEUE] Expired pending item removed on startup: queueId={next.QueueId} eventId={next.EventId} eventTime={next.EventTime:O}",
+                            EventLogEntryType.Warning, 1047);
+                        continue;
+                    }
 
                     bool sent = await TryDispatchQueuedEventAsync(next);
                     if (sent)
