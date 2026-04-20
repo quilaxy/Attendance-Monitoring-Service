@@ -2439,9 +2439,6 @@ namespace EventLogOutEmployeeService
                         continue;
 
                     double diffSeconds = (eventTime - candidate.EventTime).TotalSeconds;
-                    if (diffSeconds < 0)
-                        continue;
-
                     if (diffSeconds <= primary1074PairWindow.TotalSeconds)
                     {
                         if (primaryCandidate == null || candidate.EventTime > primaryCandidate.EventTime)
@@ -2511,7 +2508,9 @@ namespace EventLogOutEmployeeService
                     $"diff={fallbackDiffSeconds:F1}s 1074Type='{fallbackCandidate.ShutdownType}'",
                     EventLogEntryType.Information, 2012);
 
-                return (fallbackCandidate.Username, fallbackCandidate.ShutdownType);
+                bool isRestartFallback = IsRestartShutdownType(fallbackCandidate.ShutdownType);
+                string? confirmedFallbackShutdownType = isRestartFallback ? null : fallbackCandidate.ShutdownType;
+                return (fallbackCandidate.Username, confirmedFallbackShutdownType);
             }
         }
 
