@@ -1581,8 +1581,8 @@ namespace EventLogOutEmployeeService
                     }
                 }
 
-                if (eventId == 1074 && !string.IsNullOrEmpty(username) &&
-                    !pendingUsernameResolution && IsValidUsername(username))
+                if (eventId == 1074 && !pendingUsernameResolution &&
+                    !string.IsNullOrWhiteSpace(username) && IsValidUsername(username))
                 {
                     string shutdownType = ParseShutdownType(eventMessage);
                     StoreLast1074State(username, eventTime, shutdownType);

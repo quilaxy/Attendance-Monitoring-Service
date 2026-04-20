@@ -1002,15 +1002,15 @@ Jika resolve berhasil:
 - `FallbackSource` = `Event6005_PreviousLog`, `Event6005_First4624After`, atau `Event6005_SharePoint`
 - Summary login row dibuat/diupdate sebagai `UNCONFIRMED` (ClockOut tetap kosong sampai shutdown valid masuk).
 
-### 19.3 Pending-first policy untuk system/logout events (1074/6006/4647/42)
+### 19.3 Pending-first policy untuk system/logout events (1074/6006/4647/42/6008/41)
 
 - Prinsip utama: **lebih baik pending daripada salah user/jam**.
-- Jika username untuk event 1074/6006/4647/42 belum valid saat ingest:
+- Jika username untuk event 1074/6006/4647/42/6008/41 belum valid saat ingest:
   - event tetap masuk queue sebagai `UNCONFIRMED`,
   - `PendingUsernameResolution=true`,
-  - `FallbackSource` diset eksplisit (`Event1074_Pending`, `Event6006_Pending`, `Event4647_Pending`, `Event42_Pending`).
+  - `FallbackSource` diset eksplisit (`Event1074_Pending`, `Event6006_Pending`, `Event4647_Pending`, `Event42_Pending`, `Event6008_Pending`, `Event41_Pending`).
 - Saat dispatch, pending item dicoba resolve ulang berurutan: first 4624 (device+workDate) → queue 4624 terdekat → SharePoint latest username by computer.
-- Event `42` tetap **tidak menulis Summary shutdown** (hanya raw signal), walaupun boleh tersimpan sebagai pending.
+- Event `42` tetap **tidak menulis Summary shutdown** (hanya raw signal), walaupun dapat tersimpan sebagai pending.
 
 ---
 
