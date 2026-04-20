@@ -289,10 +289,7 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
     "SummaryListId": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
   },
   "AppSettings": {
-    "VerboseLogging": false,
-    "QueueAlertThreshold": 500,
-    "DispatchBackoffSeconds": [30, 60, 120, 300, 600],
-    "StartupToFirst4624MaxGapMinutes": 90
+    "VerboseLogging": false
   }
 }
 ```
@@ -306,9 +303,9 @@ Setelah semua langkah di atas, isi `appsettings.json` yang ada di folder publish
 | `SharePointSettings:ListId` | ID raw list (`AttendanceLog`) dari step 2.5 |
 | `SharePointSettings:SummaryListId` | ID summary list (`AttendanceSummary`) dari step 2.5 — opsional, jika dikosongkan fitur Summary tidak aktif |
 | `AppSettings:VerboseLogging` | `true` untuk debug log detail, `false` untuk log essential |
-| `AppSettings:QueueAlertThreshold` | Batas pending queue untuk high-water alert |
-| `AppSettings:DispatchBackoffSeconds[]` | Jadwal retry dispatch (default: 30,60,120,300,600 detik; setelah itu tetap interval terakhir) |
-| `AppSettings:StartupToFirst4624MaxGapMinutes` | Ambang gap startup→first 4624. Jika gap lebih besar dari ini, 6005 fallback boleh dipakai sebagai kandidat login awal |
+| `QUEUE_ALERT_THRESHOLD` (environment variable) | Batas pending queue untuk high-water alert (default: 500) |
+| `DISPATCH_BACKOFF_SECONDS` (environment variable) | Jadwal retry dispatch format CSV, contoh `30,60,120,300,600` |
+| `STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES` (environment variable) | Ambang gap startup→first 4624 untuk izinkan fallback 6005 (default: 90) |
 
 ---
 
@@ -983,7 +980,7 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
 
 6005 fallback dipakai jika:
 - Security log unavailable/cleared, **atau**
-- sudah ada first 4624 namun gap dari startup anchor device ke first 4624 melebihi `AppSettings:StartupToFirst4624MaxGapMinutes` (anomali login terlambat).
+- sudah ada first 4624 namun gap dari startup anchor device ke first 4624 melebihi `STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES` (anomali login terlambat).
 
 Urutan resolusi username:
 1. Most recent 4624 dari in-memory/queue pending untuk device+workDate.

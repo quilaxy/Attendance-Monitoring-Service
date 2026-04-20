@@ -763,23 +763,43 @@ namespace EventLogOutEmployeeService
 
             // Baca VerboseLogging dari AppSettings — default false (production mode)
             VerboseLogging = config.GetValue<bool>("AppSettings:VerboseLogging", defaultValue: false);
-            queueAlertThreshold = Math.Max(1, config.GetValue<int>("AppSettings:QueueAlertThreshold", defaultValue: 500));
-            int startupGapMinutes = config.GetValue<int>("AppSettings:StartupToFirst4624MaxGapMinutes", defaultValue: 90);
+            queueAlertThreshold = Math.Max(1, ReadIntFromEnvironment("QUEUE_ALERT_THRESHOLD", 500));
+            int startupGapMinutes = ReadIntFromEnvironment("STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES", 90);
             startupToFirst4624MaxGapForDirectUse = TimeSpan.FromMinutes(Math.Max(1, startupGapMinutes));
-            dispatchBackoffSeconds = ReadIntListSetting(
-                config, "AppSettings:DispatchBackoffSeconds", new[] { 30, 60, 120, 300, 600 });
+            dispatchBackoffSeconds = ReadIntListFromEnvironment(
+                "DISPATCH_BACKOFF_SECONDS", new[] { 30, 60, 120, 300, 600 });
 
             return config;
         }
 
-        private static int[] ReadIntListSetting(IConfiguration config, string keyPath, int[] fallback)
+        private static int ReadIntFromEnvironment(string key, int fallback)
         {
             try
             {
+                string? raw = Environment.GetEnvironmentVariable(key);
+                if (int.TryParse(raw, out int parsed) && parsed > 0)
+                    return parsed;
+            }
+            catch
+            {
+            }
+
+            return fallback;
+        }
+
+        private static int[] ReadIntListFromEnvironment(string key, int[] fallback)
+        {
+            try
+            {
+                string? raw = Environment.GetEnvironmentVariable(key);
+                if (string.IsNullOrWhiteSpace(raw))
+                    return fallback;
+
                 var values = new List<int>();
-                foreach (var child in config.GetSection(keyPath).GetChildren())
+                string[] tokens = raw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (string token in tokens)
                 {
-                    if (int.TryParse(child.Value, out int n) && n > 0)
+                    if (int.TryParse(token, out int n) && n > 0)
                         values.Add(n);
                 }
 
