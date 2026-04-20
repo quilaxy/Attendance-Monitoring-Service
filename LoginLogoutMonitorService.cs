@@ -2442,12 +2442,8 @@ namespace EventLogOutEmployeeService
                             primaryCandidate = candidate;
                             primaryDiffSeconds = diffSeconds;
                         }
-                        // This state is already a primary candidate (<=60s),
-                        // so it must not be treated as fallback (60-120s).
-                        continue;
                     }
-
-                    if (diffSeconds <= fallback1074PairWindow.TotalSeconds)
+                    else if (diffSeconds <= fallback1074PairWindow.TotalSeconds)
                     {
                         if (fallbackCandidate == null || candidate.EventTime > fallbackCandidate.EventTime)
                         {
@@ -2488,6 +2484,8 @@ namespace EventLogOutEmployeeService
                 for (int i = 0; i < last1074States.Count; i++)
                 {
                     Last1074State candidate = last1074States[i];
+                    // Only inspect 1074 states that happened from the selected fallback candidate
+                    // up to this 6006 event; any restart in this interval invalidates fallback pairing.
                     if (candidate.EventTime < fallbackCandidate.EventTime || candidate.EventTime > eventTime)
                         continue;
 
