@@ -76,7 +76,7 @@ try {
     Set-ItemProperty -Path $RegistryKeyPath -Name $RegistryValueName -Value $TargetVersion -Type String
 }
 catch {
-    Write-Warning "Unable to update registry marker '$RegistryKeyPath\\$RegistryValueName'. $_"
+    Write-Warning "Unable to update registry marker '$RegistryKeyPath\$RegistryValueName'. $_"
 }
 
 if ($serviceExists -and $serviceWasRunning) {
@@ -85,7 +85,8 @@ if ($serviceExists -and $serviceWasRunning) {
         (Get-Service -Name $ServiceName -ErrorAction Stop).WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
     }
     catch {
-        Write-Warning "Failed to start updated service '$ServiceName'. Attempting rollback. $_"
+        Write-Warning "Failed to start updated service '$ServiceName'. $_"
+        Write-Host "Attempting rollback to previous executable."
 
         if (-not (Test-Path -LiteralPath $backupExePath)) {
             Write-Error "Rollback failed because backup executable does not exist: $backupExePath"
@@ -102,7 +103,7 @@ if ($serviceExists -and $serviceWasRunning) {
             exit $ExitCodeRollbackFailed
         }
 
-        Write-Error "Updated service failed to start, rollback restored previous executable."
+        Write-Warning "Updated service failed to start, rollback restored previous executable."
         exit $ExitCodeStartFailed
     }
 }
