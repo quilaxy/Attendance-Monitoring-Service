@@ -581,9 +581,10 @@ namespace EventLogOutEmployeeService
         ///   • Priority (higher wins): 6006 > 1074-Shutdown > 4647 > 6008/41.
         ///     A lower-priority event never overwrites a higher-priority one.
         ///   • For same priority: keep the LATEST timestamp (most recent shutdown).
-        ///   • 4647 (User Logout) is accepted only when the logout time is within
-        ///     2 hours before or after expectedTimeOut — mid-day logouts are ignored.
-        ///   • 1074 Restart is excluded (not a final shutdown).
+        ///   • Tidak ada validasi jam khusus (expected timeout/session guardrail).
+        ///     Event shutdown valid akan langsung diproses, lalu aturan latest/priority
+        ///     menentukan apakah overwrite diperlukan.
+        ///   • 1074 Restart tetap dikecualikan (bukan final shutdown).
         /// </summary>
         public async Task TryUpdateDailySummaryShutdownAsync(
             string accessToken, string username, string computerName,
@@ -629,9 +630,8 @@ namespace EventLogOutEmployeeService
             if (!IsValidShutdownCandidate(eventId, eventType, shutdownTime, loginTime, expectedTimeOut))
             {
                 SafeWriteEventLog("Application",
-                    $"[DBG-Summary] TryUpdateShutdown: SKIP — IsValidShutdownCandidate=false " +
-                    $"eventId={eventId} eventType='{eventType}' shutdownTime={shutdownTime:O} " +
-                    $"loginTime={loginTime?.ToString("O") ?? "(null)"} expectedTimeOut={expectedTimeOut?.ToString("O") ?? "(null)"}",
+                    $"[DBG-Summary] TryUpdateShutdown: SKIP — restart event is excluded " +
+                    $"eventId={eventId} eventType='{eventType}' shutdownTime={shutdownTime:O}",
                     EventLogEntryType.Information, 3013);
                 return;
             }
@@ -958,7 +958,7 @@ namespace EventLogOutEmployeeService
             }
 
             if (todayItems != null && todayItems.Count > 0)
-                return todayItems[0];
+                return SelectCanonicalSummaryRow(todayItems);
 
             // Fallback: previous-day row for overnight sessions.
             string yesterdayKey = BuildSummaryKey(username, shutdownTime.ToLocalTime().AddDays(-1).ToString("yyyy-MM-dd"));
@@ -973,17 +973,38 @@ namespace EventLogOutEmployeeService
             if (yesterdayItems == null || yesterdayItems.Count == 0)
                 return null;
 
-            var item = yesterdayItems[0];
-            var fields = item?["fields"] as JObject;
-            DateTime? loginTime = ParseFieldDateTime(fields, "LoginTime");
-            if (!loginTime.HasValue)
-                return null;
+            return SelectCanonicalSummaryRow(yesterdayItems);
+        }
 
-            // Accept overnight session up to 20h after login.
-            if (shutdownTime >= loginTime.Value && shutdownTime <= loginTime.Value.AddHours(20))
-                return item;
+        /// <summary>
+        /// Pilih row canonical untuk user+workDate: LoginTime paling awal (lintas device).
+        /// Jika LoginTime null, row itu hanya dipilih kalau belum ada kandidat lebih baik.
+        /// </summary>
+        private static JToken? SelectCanonicalSummaryRow(JArray items)
+        {
+            JToken? canonical = null;
+            DateTime? canonicalLogin = null;
 
-            return null;
+            foreach (var candidate in items)
+            {
+                var fields = candidate["fields"] as JObject;
+                DateTime? cLogin = ParseFieldDateTime(fields, "LoginTime");
+
+                if (canonical == null)
+                {
+                    canonical = candidate;
+                    canonicalLogin = cLogin;
+                    continue;
+                }
+
+                if (cLogin.HasValue && (!canonicalLogin.HasValue || cLogin.Value < canonicalLogin.Value))
+                {
+                    canonical = candidate;
+                    canonicalLogin = cLogin;
+                }
+            }
+
+            return canonical;
         }
 
         private async Task<JArray?> FindSummaryItemAsync(HttpClient client, string summaryKey)
@@ -1136,13 +1157,7 @@ namespace EventLogOutEmployeeService
         ///
         /// Rules:
         ///   • 1074 Restart → never written to Summary (not a real end-of-day).
-        ///   • Semua shutdown lain (4647, 6006, 6008, 41, 1074 non-restart) diterima
-        ///     selama masuk dalam session guardrail:
-        ///     - shutdownTime >= loginTime  (tidak boleh sebelum login)
-        ///     - shutdownTime <= loginTime + 20 jam  (batas sesi wajar)
-        ///   • Tidak ada batasan ±5 jam dari ExpectedTimeOut — shutdown jam 09:00
-        ///     tetap diterima. Kalau nanti ada shutdown yang lebih baru (jam 17:00),
-        ///     new session logic di TryUpdateDailySummaryShutdownAsync akan overwrite.
+        ///   • Selain restart, shutdown event selalu dianggap valid (tanpa validasi waktu).
         /// </summary>
         private static bool IsValidShutdownCandidate(
             int eventId, string eventType,
@@ -1152,16 +1167,6 @@ namespace EventLogOutEmployeeService
             // 1074 Restart bukan final shutdown — skip
             if (eventId == 1074 && IsRestartEventType(eventType))
                 return false;
-
-            // Session guardrail: shutdown harus terjadi setelah login dan dalam 20 jam
-            if (loginTime.HasValue)
-            {
-                if (shutdownTime < loginTime.Value)
-                    return false;
-
-                if (shutdownTime > loginTime.Value.AddHours(20))
-                    return false;
-            }
 
             return true;
         }
