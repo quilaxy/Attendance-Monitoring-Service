@@ -1,7 +1,7 @@
 # Attendance Monitoring Service — Technical Documentation
 
 > **Stack:** .NET 8, Windows Service, SharePoint (Microsoft Graph API)  
-> **Last updated:** 2026-03-13
+> **Last updated:** 2026-04-21
 
 ---
 
@@ -79,6 +79,54 @@ C:\ProgramData\Attendance-Monitoring-Service\
   ├── queue\pending\*.json        ← hapus
   └── summary-cache.json          ← hapus
 ```
+
+### 1.5 Remote Update via Intune (Win32 App)
+
+Folder deployment update tersedia di repository:
+
+```
+deployment\intune\update.ps1
+deployment\intune\detect-update.ps1
+```
+
+Script `update.ps1` melakukan:
+
+- stop service lama (jika ada dan sedang running)
+- backup EXE existing (`.bak`)
+- replace EXE dengan paket baru
+- start kembali service
+- rollback otomatis ke EXE backup jika service gagal start
+- set registry marker versi: `HKLM\SOFTWARE\Attendance-Monitoring-Service\InstalledVersion`
+
+#### Step-by-step
+
+1. Publish EXE versi terbaru dan salin ke folder paket Intune, berdampingan dengan `update.ps1`.
+2. Buat paket `.intunewin` pakai Microsoft Win32 Content Prep Tool.
+3. Upload ke Intune: **Apps > Windows > Add > Win32 app**.
+4. Set **Install command**:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\update.ps1 -TargetVersion "1.2.3"
+```
+
+5. (Opsional) set uninstall command sesuai kebutuhan internal.
+6. Set **Detection rule** berbasis script:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\detect-update.ps1 -TargetVersion "1.2.3"
+```
+
+`detect-update.ps1` akan return sukses jika salah satu cocok:
+
+- file version EXE target sama dengan `TargetVersion`, atau
+- registry marker `InstalledVersion` sama dengan `TargetVersion`
+
+7. Set **Requirements** (OS version + architecture) sesuai fleet device.
+8. Assign ke group pilot (3–5 device) sebagai **Required**.
+9. Jika pilot sukses, assign ke group 40 device.
+10. Monitor status di Intune (**Installed / Failed / Not applicable**), lalu retry yang gagal.
+
+Untuk update berikutnya, cukup naikkan EXE + `TargetVersion` pada install/detection command.
 
 ---
 
