@@ -958,7 +958,7 @@ namespace EventLogOutEmployeeService
             }
 
             if (todayItems != null && todayItems.Count > 0)
-                return todayItems[0];
+                return SelectCanonicalSummaryRow(todayItems);
 
             // Fallback: previous-day row for overnight sessions.
             string yesterdayKey = BuildSummaryKey(username, shutdownTime.ToLocalTime().AddDays(-1).ToString("yyyy-MM-dd"));
@@ -973,17 +973,38 @@ namespace EventLogOutEmployeeService
             if (yesterdayItems == null || yesterdayItems.Count == 0)
                 return null;
 
-            var item = yesterdayItems[0];
-            var fields = item?["fields"] as JObject;
-            DateTime? loginTime = ParseFieldDateTime(fields, "LoginTime");
-            if (!loginTime.HasValue)
-                return null;
+            return SelectCanonicalSummaryRow(yesterdayItems);
+        }
 
-            // Accept overnight session up to 20h after login.
-            if (shutdownTime >= loginTime.Value && shutdownTime <= loginTime.Value.AddHours(20))
-                return item;
+        /// <summary>
+        /// Pilih row canonical untuk user+workDate: LoginTime paling awal (lintas device).
+        /// Jika LoginTime null, row itu hanya dipilih kalau belum ada kandidat lebih baik.
+        /// </summary>
+        private static JToken? SelectCanonicalSummaryRow(JArray items)
+        {
+            JToken? canonical = null;
+            DateTime? canonicalLogin = null;
 
-            return null;
+            foreach (var candidate in items)
+            {
+                var fields = candidate["fields"] as JObject;
+                DateTime? cLogin = ParseFieldDateTime(fields, "LoginTime");
+
+                if (canonical == null)
+                {
+                    canonical = candidate;
+                    canonicalLogin = cLogin;
+                    continue;
+                }
+
+                if (cLogin.HasValue && (!canonicalLogin.HasValue || cLogin.Value < canonicalLogin.Value))
+                {
+                    canonical = candidate;
+                    canonicalLogin = cLogin;
+                }
+            }
+
+            return canonical;
         }
 
         private async Task<JArray?> FindSummaryItemAsync(HttpClient client, string summaryKey)
