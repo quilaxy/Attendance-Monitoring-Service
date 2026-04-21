@@ -1024,6 +1024,7 @@ Entry lebih dari 7 hari otomatis dihapus oleh `CleanupOldEntriesAsync`, dipanggi
    - pending queue files (`queue\\pending\\*.json`).
    - **most recent 4624** dari queue untuk computer yang sama.
    - **latest username by computer** dari SharePoint.
+   - Nilai non-user seperti `system32`, `syswow64`, atau token path/proses (`*.exe`) dianggap invalid dan tidak dipakai sebagai username final.
 3. Jika fallback berhasil:
    - `Username` diisi resolved user,
    - metadata queue diisi `ResolvedUsername`, `OriginalUsername`, `IsFallback=true`, `FallbackSource` sesuai sumber (`FirstLogon4624`, `Event1074_Queue4624`, atau `Event1074_SharePoint`).

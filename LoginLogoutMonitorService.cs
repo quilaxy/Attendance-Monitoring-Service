@@ -3022,20 +3022,23 @@ namespace EventLogOutEmployeeService
 
         private bool IsValidUsername(string username)
         {
-            if (string.IsNullOrWhiteSpace(username))
+            string normalized = NormalizeDisplayUsername(username);
+            if (string.IsNullOrWhiteSpace(normalized))
                 return false;
 
             var invalidNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
                 "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "NETWORK SERVICE",
-                "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator"
+                "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator",
+                "system32", "syswow64"
             };
 
-            if (invalidNames.Contains(username)) return false;
-            if (username.EndsWith("$")) return false;
+            if (invalidNames.Contains(normalized)) return false;
+            if (normalized.EndsWith("$")) return false;
+            if (normalized.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return false;
 
             foreach (var prefix in new[] { "DWM-", "UMFD-", "NT Service" })
-                if (username.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                if (normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                     return false;
 
             return true;
