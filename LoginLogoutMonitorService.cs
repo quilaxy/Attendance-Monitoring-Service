@@ -86,6 +86,11 @@ namespace EventLogOutEmployeeService
         private readonly SummaryCache summaryCache =
             new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
 
+        // Opsi 3: simpan raw security event ke disk sebelum diproses,
+        // sehingga kalau Security log ter-rotate/clear sebelum replay, data tidak hilang.
+        private readonly RawEventStore rawEventStore =
+            new RawEventStore(Path.Combine(DataDirectory, "rawevents"));
+
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
         private static readonly TimeSpan PendingQueueRetention = TimeSpan.FromDays(7);
 
@@ -335,6 +340,11 @@ namespace EventLogOutEmployeeService
                 {
                     // Security events first so lastActiveUser is populated before system events run.
                     ReplaySecurityEvents(replayFrom, replayTo);
+
+                    // Opsi 3: Replay dari RawEventStore sebagai fallback tambahan.
+                    // Ini menangkap 4624/4647 yang sudah hilang dari Security log tapi
+                    // sempat disimpan ke rawevents\ saat terjadi.
+                    ReplayFromRawStore(replayFrom.Value, replayTo);
 
                     // System events: extend replayFrom 30 detik lebih awal agar 1074 yang terjadi
                     // tepat sebelum checkpoint window tetap ter-load ke memory sebelum 6006 di-replay.
@@ -721,6 +731,137 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        /// <summary>
+        /// Opsi 3: Replay 4624/4647 yang tersimpan di RawEventStore untuk window replayFrom–replayTo.
+        /// Ini fallback kalau Security log sudah ter-rotate/clear sebelum ReplaySecurityEvents bisa baca.
+        /// DedupWindow di EnqueueIfNotDuplicateAsync akan otomatis skip event yang sudah ada di queue.
+        /// </summary>
+        private void ReplayFromRawStore(DateTime replayFrom, DateTime replayTo)
+        {
+            try
+            {
+                // Scan semua tanggal dalam window (biasanya 1-2 hari)
+                DateTime localFrom = replayFrom.ToLocalTime().Date;
+                DateTime localTo   = replayTo.ToLocalTime().Date;
+
+                int totalProcessed = 0;
+
+                for (DateTime date = localFrom; date <= localTo; date = date.AddDays(1))
+                {
+                    // Kumpulkan semua computer yang ada di rawevents untuk tanggal ini
+                    string dateDir = Path.Combine(
+                        Path.Combine(
+                            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                            "Attendance-Monitoring-Service", "rawevents"),
+                        date.ToString("yyyyMMdd"));
+
+                    if (!Directory.Exists(dateDir))
+                        continue;
+
+                    foreach (string computerDir in Directory.GetDirectories(dateDir))
+                    {
+                        string computerName = Path.GetFileName(computerDir);
+                        var events4624 = rawEventStore.GetEventsForDate(computerName, date, 4624);
+                        var events4647 = rawEventStore.GetEventsForDate(computerName, date, 4647);
+
+                        var allEvents = events4624.Concat(events4647)
+                            .Where(e => e.EventTimeUtc >= replayFrom && e.EventTimeUtc <= replayTo)
+                            .OrderBy(e => e.EventTimeUtc)
+                            .ToList();
+
+                        foreach (var raw in allEvents)
+                        {
+                            try
+                            {
+                                ProcessRawSecurityEventAsync(raw, writeRawRecord: true)
+                                    .GetAwaiter().GetResult();
+                                totalProcessed++;
+                            }
+                            catch (Exception ex)
+                            {
+                                SafeWriteEventLog("Application",
+                                    $"[RAW-REPLAY] Error processing raw event id={raw.EventId} " +
+                                    $"computer={raw.ComputerName} time={raw.EventTimeUtc:O}: {ex.Message}",
+                                    EventLogEntryType.Warning, 1036);
+                            }
+                        }
+                    }
+                }
+
+                if (totalProcessed > 0)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RAW-REPLAY] Replayed {totalProcessed} raw security events from RawEventStore " +
+                        $"({replayFrom:O} – {replayTo:O})",
+                        EventLogEntryType.Information, 1036);
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[RAW-REPLAY] Error in ReplayFromRawStore: {ex.Message}",
+                    EventLogEntryType.Warning, 1036);
+            }
+        }
+
+        /// <summary>
+        /// Process sebuah RawSecurityEvent (dari RawEventStore) seperti halnya ProcessSecurityEntryAsync,
+        /// tapi tanpa perlu EventLogEntry — pakai data yang sudah di-extract saat save.
+        /// </summary>
+        private async Task ProcessRawSecurityEventAsync(RawSecurityEvent raw, bool writeRawRecord)
+        {
+            try
+            {
+                int eventId      = raw.EventId;
+                DateTime eventTime = raw.EventTimeUtc;
+                string computerName = raw.ComputerName;
+                int logonType    = raw.LogonType;
+
+                if (eventId == 4624 && !IsRelevantLogonType(logonType))
+                    return;
+
+                string? username = raw.Username;
+                string? sid      = raw.Sid;
+
+                if (!string.IsNullOrEmpty(username))
+                    username = ResolveUsernameBySid(username, sid);
+
+                if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
+                {
+                    if (eventId == 4647)
+                    {
+                        await ProcessEvent(
+                            4647, "__UNRESOLVED__", eventTime, computerName,
+                            "Security", logonType, null, writeRawRecord,
+                            usernameResolutionSource: "FallbackSecurity_Pending",
+                            originalUsername: username,
+                            fallbackSource: "Event4647_Pending",
+                            isFallback: true, resolvedUsername: null,
+                            status: "UNCONFIRMED", pendingUsernameResolution: true);
+                    }
+                    return;
+                }
+
+                if (eventId == 4624)
+                {
+                    lock (userLock)
+                        lastActiveUser = username;
+                    lock (knownLoginLock)
+                        lastKnownLoginByComputer[computerName] = (username, eventTime);
+                    RegisterFirst4624Logon(computerName, username, eventTime);
+                }
+
+                await ProcessEvent(eventId, username, eventTime, computerName,
+                    "Security", logonType, null, writeRawRecord);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"Error in ProcessRawSecurityEventAsync: {ex.Message}",
+                    EventLogEntryType.Warning, 1009);
+            }
+        }
+
         // ─── Configuration ───────────────────────────────────────────────────────
 
         private IConfiguration LoadConfiguration(string baseDirectory)
@@ -1040,8 +1181,17 @@ namespace EventLogOutEmployeeService
                 item.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))
                 return false;
 
-            return item.EventId == 1074 || item.EventId == 6006 ||
-                   item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41;
+            if (item.EventId == 1074 || item.EventId == 6006 ||
+                item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41)
+                return true;
+
+            // FIX [BUG-2+3]: Event 42 (Sleep/Modern Standby) sebagai last-resort shutdown.
+            // Hanya masuk summary kalau belum ada ShutdownTime sama sekali (IsLastResort42 flag).
+            // Validasi wake (apakah 42 ini shutdown final) dilakukan di TryDispatchQueuedEventAsync.
+            if (item.EventId == 42)
+                return item.IsLastResort42;
+
+            return false;
         }
 
         /// <summary>
@@ -1057,6 +1207,7 @@ namespace EventLogOutEmployeeService
             if (eventId == 4647) return 2;
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
+            if (eventId == 42)   return 0; // last resort — hanya kalau tidak ada event lain
             return 0;
         }
 
@@ -1090,6 +1241,26 @@ namespace EventLogOutEmployeeService
                 bool needsRaw     = item.WriteRawRecord && !item.RawRecordDispatched;
                 bool needsSummary = ShouldProcessSummary(item) && !item.SummaryDispatched;
 
+                // FIX [BUG-2+3]: Evaluasi apakah event 42 layak jadi last-resort ShutdownTime.
+                // Dilakukan di sini (saat dispatch, bukan enqueue) karena kita perlu cek
+                // apakah ada event shutdown "lebih baik" yang sudah masuk queue setelahnya.
+                if (item.EventId == 42 && !item.IsLastResort42 && !item.SummaryDispatched)
+                {
+                    bool shouldUse42 = await ShouldUseEvent42AsLastResortAsync(item);
+                    if (shouldUse42)
+                    {
+                        item.IsLastResort42 = true;
+                        await eventQueue.ReplaceAsync(item);
+                        // Re-evaluate needsSummary setelah flag di-set
+                        needsSummary = ShouldProcessSummary(item) && !item.SummaryDispatched;
+                        SafeWriteEventLog("Application",
+                            $"[DISPATCH] Event 42 promoted to last-resort shutdown: " +
+                            $"queueId={item.QueueId} user={item.Username} computer={item.ComputerName} " +
+                            $"time={item.EventTime:O}",
+                            EventLogEntryType.Information, 4011);
+                    }
+                }
+
                 // Shutdown group hold: tahan summary dispatch untuk 4647/1074/6006 sampai
                 // group lengkap (ada 6006) atau timer 10 detik habis.
                 // Raw tetap dispatch langsung — group hanya berlaku untuk summary.
@@ -1111,15 +1282,31 @@ namespace EventLogOutEmployeeService
                     }
                     else if (!isThis6006 && has6006InGroup)
                     {
-                        // 6006 sudah ada di group — event ini (4647/1074) tidak perlu kirim summary,
-                        // biarkan 6006 yang kirim dengan priority tertinggi.
-                        needsSummary = false;
-                        SafeWriteEventLog("Application",
-                            $"[DISPATCH] Shutdown group: 6006 already in group, skipping summary for " +
-                            $"queueId={item.QueueId} eventId={item.EventId}",
-                            EventLogEntryType.Information, 4009);
-                        await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
-                        item.SummaryDispatched = true;
+                        // FIX [BUG-1]: Cek apakah 6006 di group adalah confirmed (paired 1074 shutdown).
+                        // Kalau 6006 hanya unconfirmed (Fast Startup/restart), 4647 tetap boleh
+                        // dispatch summary — jangan skip, karena unconfirmed 6006 tidak update summary.
+                        bool confirmedExists = await eventQueue.GroupHasConfirmed6006Async(item.ShutdownGroupId);
+                        if (confirmedExists)
+                        {
+                            // Confirmed 6006 ada di group → 6006 yang akan kirim summary dengan priority tertinggi.
+                            needsSummary = false;
+                            SafeWriteEventLog("Application",
+                                $"[DISPATCH] Shutdown group: confirmed 6006 in group, skipping summary for " +
+                                $"queueId={item.QueueId} eventId={item.EventId}",
+                                EventLogEntryType.Information, 4009);
+                            await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
+                            item.SummaryDispatched = true;
+                        }
+                        else
+                        {
+                            // 6006 di group hanya unconfirmed → tidak update summary.
+                            // Biarkan 4647 (atau event prioritas tertinggi lain) yang dispatch.
+                            SafeWriteEventLog("Application",
+                                $"[DISPATCH] Shutdown group: only unconfirmed 6006 in group, " +
+                                $"allowing {item.EventId} to dispatch summary. " +
+                                $"queueId={item.QueueId} groupId={item.ShutdownGroupId}",
+                                EventLogEntryType.Information, 4009);
+                        }
                     }
                     else if (timerExpired && !has6006InGroup && !isThis6006)
                     {
@@ -1251,6 +1438,7 @@ namespace EventLogOutEmployeeService
                         await Task.Delay(randomDelay, cancellationToken);
                         await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
                         await summaryCache.CleanupOldEntriesAsync(cancellationToken);
+                        rawEventStore.CleanupOldDates(); // Opsi 3: cleanup rawevents folder
                     }
 
                     await Task.Delay(nextRun - DateTime.Now, cancellationToken);
@@ -1259,6 +1447,7 @@ namespace EventLogOutEmployeeService
                     await Task.Delay(scheduledDelay, cancellationToken);
                     await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
                     await summaryCache.CleanupOldEntriesAsync(cancellationToken);
+                    rawEventStore.CleanupOldDates(); // Opsi 3: cleanup rawevents folder
                 }
                 catch (TaskCanceledException) { break; }
                 catch (Exception ex)
@@ -1281,6 +1470,10 @@ namespace EventLogOutEmployeeService
             EventLogEntry entry = e.Entry;
             if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime()))
                 return;
+
+            // Opsi 3: simpan raw event ke disk SEBELUM diproses, agar tidak hilang
+            // kalau Security log ter-rotate/clear sebelum service sempat replay.
+            _ = Task.Run(() => SaveRawSecurityEventAsync(entry));
 
             _ = Task.Run(async () =>
             {
@@ -1829,6 +2022,68 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        // ─── Opsi 3: Raw Event Store helpers ────────────────────────────────────────
+
+        /// <summary>
+        /// Simpan raw security event ke RawEventStore sebelum diproses.
+        /// Hanya simpan event ID yang relevan (4624, 4647).
+        /// Message excerpt dibatasi ke section yang diperlukan saja untuk hemat disk.
+        /// </summary>
+        private async Task SaveRawSecurityEventAsync(EventLogEntry entry)
+        {
+            try
+            {
+                int eventId = GetNormalizedEventId(entry);
+                if (eventId != 4624 && eventId != 4647)
+                    return;
+
+                // Untuk 4624: ambil section "New Logon:" saja
+                // Untuk 4647: ambil section "Subject:" saja
+                string? excerpt = null;
+                string? message = entry.Message;
+                if (message != null)
+                {
+                    string anchor = eventId == 4624 ? "New Logon:" : "Subject:";
+                    int idx = message.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
+                    if (idx >= 0)
+                    {
+                        // Ambil max 600 char dari anchor untuk dapat Account Name + Security ID
+                        int len = Math.Min(600, message.Length - idx);
+                        excerpt = message.Substring(idx, len);
+                    }
+                }
+
+                string? username = message != null ? GetUsernameFromEvent(message, eventId) : null;
+                string? sid      = message != null ? GetUserSidFromSecurityEvent(message, eventId) : null;
+                int logonType    = (eventId == 4624 && message != null) ? ParseLogonType(message) : 0;
+
+                var raw = new RawSecurityEvent
+                {
+                    EventId        = eventId,
+                    ComputerName   = entry.MachineName,
+                    EventTimeUtc   = entry.TimeGenerated.ToUniversalTime(),
+                    LogonType      = logonType,
+                    Username       = username,
+                    Sid            = sid,
+                    MessageExcerpt = excerpt,
+                    Source         = "Security"
+                };
+
+                await rawEventStore.SaveAsync(raw);
+            }
+            catch { /* jangan crash service */ }
+        }
+
+        /// <summary>
+        /// Replay raw security events dari RawEventStore untuk workDate tertentu.
+        /// Dipanggil sebagai fallback di ResolveFirst4624ForWorkDateAsync dan
+        /// IsSecurityLogUnavailableOrLikelyCleared kalau Security log lokal kosong.
+        /// </summary>
+        private List<RawSecurityEvent> GetRawEventsFromStore(string computerName, DateTime localDate, int eventId)
+        {
+            return rawEventStore.GetEventsForDate(computerName, localDate, eventId);
+        }
+
         // ─── Helpers ─────────────────────────────────────────────────────────────
 
         private async Task RetryPendingQueueOnStartupAsync(CancellationToken cancellationToken)
@@ -2209,6 +2464,87 @@ namespace EventLogOutEmployeeService
             return true;
         }
 
+        /// <summary>
+        /// Tentukan apakah event 42 (Sleep) boleh dipakai sebagai last-resort ShutdownTime.
+        ///
+        /// Rules:
+        ///   1. Tidak ada event shutdown "lebih baik" di queue untuk user+computer+workDate ini
+        ///      (1074, 6006-confirmed, 4647, 6008, 41). Kalau ada, biarkan mereka yang update summary.
+        ///   2. Tidak ada wake event (4624/6005) setelah 42 ini di workDate yang sama.
+        ///      Kalau ada wake setelah 42 → 42 bukan sleep final → skip.
+        ///   3. Username sudah resolved (bukan __UNRESOLVED__).
+        ///   4. Timestamp 42 masuk akal: setelah login time (tidak sebelum jam kerja).
+        /// </summary>
+        private async Task<bool> ShouldUseEvent42AsLastResortAsync(QueuedAttendanceEvent item)
+        {
+            if (item.EventId != 42)
+                return false;
+
+            // Syarat 3: username harus resolved
+            if (string.IsNullOrWhiteSpace(item.Username) ||
+                item.Username == "__UNRESOLVED__" ||
+                !IsValidUsername(item.Username))
+                return false;
+
+            string workDate = item.EventTime.ToLocalTime().ToString("yyyy-MM-dd");
+
+            // Syarat 1: cek apakah ada event shutdown lebih baik di queue
+            var allItems = await eventQueue.GetAllAsync();
+            bool hasBetterShutdown = allItems.Any(x =>
+                x.QueueId != item.QueueId &&
+                x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
+                x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
+                x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
+                (x.EventId == 1074 || x.EventId == 4647 || x.EventId == 6008 || x.EventId == 41 ||
+                 (x.EventId == 6006 && !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))));
+
+            if (hasBetterShutdown)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-42] Skip last-resort: better shutdown event exists in queue. " +
+                    $"computer={item.ComputerName} user={item.Username} date={workDate}",
+                    EventLogEntryType.Information, 2032);
+                return false;
+            }
+
+            // Syarat 2: tidak ada wake event setelah 42 ini
+            bool hasWakeAfter = await eventQueue.HasWakeEventAfterAsync(
+                item.ComputerName, item.EventTime, workDate);
+            if (hasWakeAfter)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-42] Skip last-resort: wake event found after sleep at {item.EventTime:O}. " +
+                    $"computer={item.ComputerName} user={item.Username}",
+                    EventLogEntryType.Information, 2032);
+                return false;
+            }
+
+            // Syarat 4: cek juga di Security log / RawEventStore apakah ada 4624 setelah 42
+            bool hasRawWakeAfter = false;
+            try
+            {
+                var rawAfter = GetRawEventsFromStore(
+                    item.ComputerName, item.EventTime.ToLocalTime().Date, 4624);
+                hasRawWakeAfter = rawAfter.Any(r => r.EventTimeUtc > item.EventTime);
+            }
+            catch { /* ignore */ }
+
+            if (hasRawWakeAfter)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-42] Skip last-resort: raw 4624 found after sleep in RawEventStore. " +
+                    $"computer={item.ComputerName} user={item.Username} sleepTime={item.EventTime:O}",
+                    EventLogEntryType.Information, 2032);
+                return false;
+            }
+
+            SafeWriteEventLog("Application",
+                $"[DBG-42] Promoting to last-resort shutdown: no better event, no wake after. " +
+                $"computer={item.ComputerName} user={item.Username} sleepTime={item.EventTime:O}",
+                EventLogEntryType.Information, 2032);
+            return true;
+        }
+
         private async Task<bool> TryResolvePending6005UsernameAsync(QueuedAttendanceEvent item)
         {
             if (item.EventId != 6005 || !item.PendingUsernameResolution)
@@ -2285,6 +2621,11 @@ namespace EventLogOutEmployeeService
             item.PendingUsernameResolution = false;
             item.LastDispatchError = null;
             await eventQueue.ReplaceAsync(item);
+
+            // FIX [BUG-5]: Propagate username ke firstLogon4624 index agar event
+            // berikutnya (1074/6006) bisa resolve username via ResolveFirst4624UsernameForWorkDateAsync.
+            RegisterFirst4624Logon(item.ComputerName, resolvedUsername, item.EventTime);
+
             return true;
         }
 
@@ -2468,6 +2809,28 @@ namespace EventLogOutEmployeeService
                 if (hasLogClearedSignal)
                     return true;
 
+                // FIX [BUG-4]: Kalau tidak ada 4624 hari ini di Security log tapi ada event lain
+                // hari ini (oldestSeen masih hari ini), cek RawEventStore sebagai tiebreaker.
+                // Kasus ini terjadi saat log rotation membuang 4624 pagi tapi entry lain masih ada.
+                // Kalau RawEventStore punya 4624 hari ini → log cleared/rotated → allow fallback.
+                if (oldestSeen <= workDateStartUtc)
+                {
+                    // oldestSeen sebelum workDate → log punya history hari ini, 4624 memang tidak ada
+                    return false;
+                }
+
+                // oldestSeen setelah workDate start → log tidak punya entry dari awal hari ini.
+                // Cek RawEventStore: kalau ada 4624 tersimpan di sana, berarti log cleared.
+                var rawToday = GetRawEventsFromStore(computerName, workDateStartLocal, 4624);
+                if (rawToday.Count > 0)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-6005] RawEventStore has {rawToday.Count} 4624 for {computerName} " +
+                        $"on {workDateStartLocal:yyyy-MM-dd} but Security log missing → treating as cleared.",
+                        EventLogEntryType.Information, 2027);
+                    return true;
+                }
+
                 return oldestSeen > workDateStartUtc;
             }
             catch
@@ -2572,6 +2935,50 @@ namespace EventLogOutEmployeeService
                             if (!firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var existing) ||
                                 best.Value.EventTime < existing.EventTime)
                                 firstLogon4624ByDeviceWorkDate[key] = best.Value;
+                        }
+                    }
+
+                    // Opsi 3 fallback: selalu bandingkan dengan RawEventStore, tidak hanya kalau
+                    // Security log kosong. Kasus partial rotation: 4624 jam 08:00 sudah ter-rotate
+                    // tapi 4624 jam 11:00 masih ada → best dari Security log = 11:00, padahal
+                    // RawEventStore masih punya yang 08:00. Tanpa perbandingan ini, login pertama
+                    // yang benar (08:00) tidak pernah terpilih.
+                    {
+                        var rawEvents = GetRawEventsFromStore(computerName, eventTime.ToLocalTime().Date, 4624);
+                        bool rawImproved = false;
+                        foreach (var raw in rawEvents)
+                        {
+                            if (requireAfterEventTime && raw.EventTimeUtc < eventTime)
+                                continue;
+                            if (!IsRelevantLogonType(raw.LogonType))
+                                continue;
+
+                            string? rawUser = raw.Username;
+                            if (!string.IsNullOrWhiteSpace(rawUser))
+                                rawUser = ResolveUsernameBySid(rawUser, raw.Sid);
+                            if (string.IsNullOrWhiteSpace(rawUser) || !IsValidUsername(rawUser))
+                                continue;
+
+                            // Ambil kalau lebih awal dari best saat ini (dari Security log maupun sebelumnya)
+                            if (!best.HasValue || raw.EventTimeUtc < best.Value.EventTime)
+                            {
+                                best = (rawUser, raw.EventTimeUtc);
+                                rawImproved = true;
+                            }
+                        }
+
+                        if (rawImproved && best.HasValue)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[DBG-4624] RawEventStore found earlier first 4624 for {computerName}: " +
+                                $"user={best.Value.Username} time={best.Value.EventTime:O}",
+                                EventLogEntryType.Information, 2028);
+                            lock (firstLogonLock)
+                            {
+                                if (!firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var existing) ||
+                                    best.Value.EventTime < existing.EventTime)
+                                    firstLogon4624ByDeviceWorkDate[key] = best.Value;
+                            }
                         }
                     }
 

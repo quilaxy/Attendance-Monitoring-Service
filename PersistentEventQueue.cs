@@ -9,6 +9,144 @@ using Newtonsoft.Json;
 
 namespace EventLogOutEmployeeService
 {
+    // ── Opsi 3: Raw Event Store ───────────────────────────────────────────────────
+    // Menyimpan raw event (4624/4647/6005) ke disk segera saat EntryWritten fire,
+    // SEBELUM diproses ke queue. Tujuan: kalau Security log di-rotate/clear sebelum
+    // service sempat replay, data tetap ada di sini dan bisa di-ingest ulang.
+    //
+    // Format file: rawevents\{yyyyMMdd}\{computerName}\{eventId}_{ticks}.json
+    // Retention: 7 hari (dibersihkan bersamaan cleanup SharePoint).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    public class RawSecurityEvent
+    {
+        public int    EventId      { get; set; }
+        public string ComputerName { get; set; } = string.Empty;
+        public DateTime EventTimeUtc { get; set; }
+        public int    LogonType    { get; set; }
+        public string? Username    { get; set; }
+        public string? Sid         { get; set; }
+        /// <summary>Subset message yang dibutuhkan untuk re-process: section "New Logon:" atau "Subject:"</summary>
+        public string? MessageExcerpt { get; set; }
+        public string  Source       { get; set; } = "Security";
+    }
+
+    public class RawEventStore
+    {
+        private readonly string baseDirectory;
+        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(7);
+        private readonly SemaphoreSlim writeLock = new SemaphoreSlim(1, 1);
+
+        public RawEventStore(string baseDirectory)
+        {
+            this.baseDirectory = baseDirectory;
+            Directory.CreateDirectory(baseDirectory);
+        }
+
+        /// <summary>
+        /// Simpan raw event ke disk secara fire-and-forget. Tidak throw.
+        /// Dipanggil dari OnSecurityEventWritten dan OnSystemEventWritten SEBELUM ProcessEntry.
+        /// </summary>
+        public async Task SaveAsync(RawSecurityEvent evt)
+        {
+            try
+            {
+                await writeLock.WaitAsync();
+                try
+                {
+                    string dir = Path.Combine(
+                        baseDirectory,
+                        evt.EventTimeUtc.ToLocalTime().ToString("yyyyMMdd"),
+                        SanitizeName(evt.ComputerName));
+                    Directory.CreateDirectory(dir);
+
+                    // Nama file unik: eventId + ticks untuk sort kronologis
+                    string fileName = $"{evt.EventId}_{evt.EventTimeUtc.Ticks}.json";
+                    string filePath = Path.Combine(dir, fileName);
+
+                    // Idempotent — kalau sudah ada (replay), skip
+                    if (File.Exists(filePath))
+                        return;
+
+                    string content = JsonConvert.SerializeObject(evt, Formatting.Indented);
+                    string tempPath = filePath + ".tmp";
+                    await File.WriteAllTextAsync(tempPath, content);
+                    File.Move(tempPath, filePath, overwrite: false);
+                }
+                finally
+                {
+                    writeLock.Release();
+                }
+            }
+            catch { /* fire-and-forget, jangan crash service */ }
+        }
+
+        /// <summary>
+        /// Ambil semua raw event 4624 untuk device + workDate tertentu, sorted ascending.
+        /// Dipakai sebagai fallback kalau Security log lokal sudah ter-rotate.
+        /// </summary>
+        public List<RawSecurityEvent> GetEventsForDate(string computerName, DateTime localDate, int eventId)
+        {
+            var result = new List<RawSecurityEvent>();
+            try
+            {
+                string dir = Path.Combine(
+                    baseDirectory,
+                    localDate.ToString("yyyyMMdd"),
+                    SanitizeName(computerName));
+
+                if (!Directory.Exists(dir))
+                    return result;
+
+                string prefix = $"{eventId}_";
+                foreach (string file in Directory.GetFiles(dir, $"{prefix}*.json", SearchOption.TopDirectoryOnly))
+                {
+                    try
+                    {
+                        string content = File.ReadAllText(file);
+                        var evt = JsonConvert.DeserializeObject<RawSecurityEvent>(content);
+                        if (evt != null)
+                            result.Add(evt);
+                    }
+                    catch { /* skip corrupt file */ }
+                }
+
+                result.Sort((a, b) => a.EventTimeUtc.CompareTo(b.EventTimeUtc));
+            }
+            catch { /* silent fail */ }
+            return result;
+        }
+
+        /// <summary>
+        /// Cleanup folder lebih dari RetentionWindow (7 hari).
+        /// </summary>
+        public void CleanupOldDates()
+        {
+            try
+            {
+                DateTime cutoff = DateTime.Today.Subtract(RetentionWindow);
+                foreach (string dateDir in Directory.GetDirectories(baseDirectory))
+                {
+                    string dirName = Path.GetFileName(dateDir);
+                    if (DateTime.TryParseExact(dirName, "yyyyMMdd",
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out DateTime dirDate))
+                    {
+                        if (dirDate.Date < cutoff.Date)
+                        {
+                            try { Directory.Delete(dateDir, recursive: true); }
+                            catch { /* skip if locked */ }
+                        }
+                    }
+                }
+            }
+            catch { /* silent fail */ }
+        }
+
+        private static string SanitizeName(string name)
+            => string.Concat(name.Split(Path.GetInvalidFileNameChars())).ToUpperInvariant();
+    }
+
     public class QueuedAttendanceEvent
     {
         public string QueueId { get; set; } = string.Empty;
@@ -43,6 +181,14 @@ namespace EventLogOutEmployeeService
         public int DispatchRetryCount { get; set; } = 0;
         public DateTime? NextRetryAtUtc { get; set; }
         public string? LastDispatchError { get; set; }
+
+        /// <summary>
+        /// True kalau event 42 (Sleep) ini dipakai sebagai last-resort ShutdownTime
+        /// karena tidak ada 1074/6006/4647/6008/41 di hari yang sama.
+        /// Di-set saat dispatch, bukan saat enqueue — karena saat enqueue belum tentu diketahui
+        /// apakah event lain akan muncul kemudian.
+        /// </summary>
+        public bool IsLastResort42 { get; set; } = false;
     }
 
     public class PersistentEventQueue
@@ -170,6 +316,56 @@ namespace EventLogOutEmployeeService
                     x.EventId == 6006 &&
                     x.ShutdownGroupId == groupId &&
                     !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase));
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Cek apakah group punya 6006 yang CONFIRMED (paired 1074 shutdown, bukan restart).
+        /// Kalau 6006 di group hanya unconfirmed, 4647 tetap boleh dispatch summary.
+        /// </summary>
+        public async Task<bool> GroupHasConfirmed6006Async(string groupId, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                return items.Any(x =>
+                    x.EventId == 6006 &&
+                    x.ShutdownGroupId == groupId &&
+                    !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) &&
+                    !x.EventType.Contains("restart", StringComparison.OrdinalIgnoreCase) &&
+                    !x.EventType.Contains("reboot", StringComparison.OrdinalIgnoreCase));
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Cek apakah ada event login/wake (4624, 6005) setelah waktu tertentu untuk device ini
+        /// di workDate yang sama. Dipakai untuk validasi event 42 sebagai last-resort shutdown.
+        /// Kalau ada wake setelah 42, berarti 42 bukan shutdown final.
+        /// </summary>
+        public async Task<bool> HasWakeEventAfterAsync(
+            string computerName,
+            DateTime afterTimeUtc,
+            string workDate,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                return items.Any(x =>
+                    (x.EventId == 4624 || x.EventId == 6005) &&
+                    x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                    x.EventTime > afterTimeUtc &&
+                    x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate);
             }
             finally
             {

@@ -1168,6 +1168,8 @@ namespace EventLogOutEmployeeService
             if (eventId == 1074 && IsRestartEventType(eventType))
                 return false;
 
+            // Event 42 (Sleep) hanya boleh masuk kalau sudah lolos ShouldUseEvent42AsLastResortAsync.
+            // Di sini selalu dianggap valid — guard sudah dilakukan di sisi service sebelum dispatch.
             return true;
         }
 
@@ -1189,6 +1191,10 @@ namespace EventLogOutEmployeeService
             if (eventId == 4647) return 2;
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
+            // Event 42 last-resort: priority -1 sehingga ANY event lain selalu overwrite.
+            // isNewSession check di TryUpdateDailySummaryShutdownAsync tetap berlaku —
+            // 42 dari sesi yang lebih baru tetap overwrite shutdown lama.
+            if (eventId == 42)   return -1;
             return 0;
         }
 
