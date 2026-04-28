@@ -464,24 +464,35 @@ namespace EventLogOutEmployeeService
                     $"[DBG-Summary] UpsertLogin: row exists itemId={itemId} storedLogin={storedLogin?.ToString("O") ?? "(null)"} incoming={loginTime:O} totalFound={existingItems.Count}",
                     EventLogEntryType.Information, 3002);
 
-                // Update ke loginTime yang lebih awal kalau perlu
-                if (storedLogin.HasValue && loginTime < storedLogin.Value && !string.IsNullOrWhiteSpace(itemId))
+                // Update ke loginTime yang lebih awal kalau perlu,
+                // sekaligus update LoginDevice kalau belum terisi.
+                string? storedLoginDevice = fields?["LoginDevice"]?.ToString();
+                bool needsEarlierLogin = storedLogin.HasValue && loginTime < storedLogin.Value && !string.IsNullOrWhiteSpace(itemId);
+                bool needsLoginDevice  = string.IsNullOrWhiteSpace(storedLoginDevice) && !string.IsNullOrWhiteSpace(itemId);
+
+                if (needsEarlierLogin || needsLoginDevice)
                 {
                     SafeWriteEventLog("Application",
-                        $"[DBG-Summary] UpsertLogin: updating to earlier loginTime={loginTime:O}",
+                        $"[DBG-Summary] UpsertLogin: patching — earlierLogin={needsEarlierLogin} loginDevice={needsLoginDevice} " +
+                        $"loginTime={loginTime:O} device={computerName}",
                         EventLogEntryType.Information, 3003);
 
-                    var updateData = new
+                    var loginPatch = new JObject();
+                    if (needsEarlierLogin)
                     {
-                        fields = new
-                        {
-                            LoginTime        = ToUtcString(loginTime),
-                            ExpectedTimeOut  = ToUtcString(loginTime.AddHours(9)),
-                            ClockIn          = ToLocalTimeString(loginTime),
-                            ExpectedClockOut = ToLocalTimeString(loginTime.AddHours(9))
-                        }
-                    };
-                    var patchContent = new StringContent(JsonConvert.SerializeObject(updateData), Encoding.UTF8, "application/json");
+                        loginPatch["LoginTime"]        = ToUtcString(loginTime);
+                        loginPatch["ExpectedTimeOut"]  = ToUtcString(loginTime.AddHours(9));
+                        loginPatch["ClockIn"]          = ToLocalTimeString(loginTime);
+                        loginPatch["ExpectedClockOut"] = ToLocalTimeString(loginTime.AddHours(9));
+                        loginPatch["LoginDevice"]      = computerName;
+                    }
+                    else if (needsLoginDevice)
+                    {
+                        loginPatch["LoginDevice"] = computerName;
+                    }
+
+                    var patchContent = new StringContent(
+                        loginPatch.ToString(Newtonsoft.Json.Formatting.None), Encoding.UTF8, "application/json");
                     using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                         $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
                     { Content = patchContent };
@@ -490,7 +501,7 @@ namespace EventLogOutEmployeeService
                     {
                         string body = await patchResponse.Content.ReadAsStringAsync();
                         throw new InvalidOperationException(
-                            $"Failed to update earlier LoginTime for summary key '{summaryKey}' (item {itemId}). Status={patchResponse.StatusCode} Body={body}");
+                            $"Failed to update LoginTime/LoginDevice for summary key '{summaryKey}' (item {itemId}). Status={patchResponse.StatusCode} Body={body}");
                     }
                 }
 
@@ -531,16 +542,16 @@ namespace EventLogOutEmployeeService
 
             var fieldsData = new JObject
             {
-                ["Title"] = summaryKey,
-                ["Username"] = username,
-                ["ComputerName"] = computerName,
-                ["WorkDate"] = workDate,
-                ["LoginTime"] = ToUtcString(loginTime),
-                ["ExpectedTimeOut"] = ToUtcString(expectedTimeOut),
-                ["ClockIn"] = ToLocalTimeString(loginTime),
+                ["Title"]            = summaryKey,
+                ["Username"]         = username,
+                ["WorkDate"]         = workDate,
+                ["LoginTime"]        = ToUtcString(loginTime),
+                ["ExpectedTimeOut"]  = ToUtcString(expectedTimeOut),
+                ["ClockIn"]          = ToLocalTimeString(loginTime),
                 ["ExpectedClockOut"] = ToLocalTimeString(expectedTimeOut),
-                ["ClockOut"] = null,
-                ["ShutdownType"] = string.Empty
+                ["LoginDevice"]      = computerName,
+                ["ClockOut"]         = null,
+                ["ShutdownType"]     = string.Empty
             };
             if (!string.IsNullOrWhiteSpace(status))
                 fieldsData["Status"] = status;
@@ -693,9 +704,9 @@ namespace EventLogOutEmployeeService
             var patchBody = new JObject
             {
                 ["ShutdownTime"] = ToUtcString(shutdownTime),
-                ["ClockOut"] = ToLocalTimeString(shutdownTime),
+                ["ClockOut"]     = ToLocalTimeString(shutdownTime),
                 ["ShutdownType"] = shutdownTypeStr,
-                ["ComputerName"] = computerName
+                ["LogoutDevice"] = computerName   // device yang shutdown, bisa beda dengan LoginDevice
             };
 
             string patchJson = patchBody.ToString(Newtonsoft.Json.Formatting.None);
