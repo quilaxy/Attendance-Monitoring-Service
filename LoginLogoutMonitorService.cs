@@ -588,15 +588,21 @@ namespace EventLogOutEmployeeService
             1018, 1019, 1020, 1021, 1022, 1025,
             // Replay progress
             1030, 1031, 1032, 1033, 1034,
+            // RawEventStore replay detail
+            1036,
             // Live event skip & duplicate skip — normal behavior, bukan error
             1016, 1037, 1038,
             // Debug system event parsing — semua [DBG-*]
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
+            // Debug RawEventStore fallback — [DBG-4624], [DBG-6005], [DBG-GetMRU], [DBG-42]
+            2027, 2028, 2030, 2031, 2032,
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
             3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
             // Dispatch detail
             4002, 4003, 4004, 4005, 4008, 4009, 4010,
+            // Event 42 last-resort promotion
+            4011,
             // RAW insert success detail
             4020, 4021, 4022, 4025,
             // Cleanup progress detail
@@ -673,6 +679,12 @@ namespace EventLogOutEmployeeService
                     $"ReplaySecurityEvents: processing EventId={eventId} at {time:O}",
                     EventLogEntryType.Information, 1033);
 
+                // Opt 3: simpan raw event ke RawEventStore selama replay startup,
+                // bukan hanya saat live (OnSecurityEventWritten).
+                // Tanpa ini, kalau 4624 pagi ketahuan saat replay (bukan live) dan Security log
+                // kemudian ter-rotate sebelum besok, data hilang lagi dari RawEventStore.
+                _ = Task.Run(() => SaveRawSecurityEventAsync(entry));
+
                 ProcessSecurityEntryAsync(entry, writeRawRecord: true).GetAwaiter().GetResult();
             }
         }
@@ -740,29 +752,29 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                // Scan semua tanggal dalam window (biasanya 1-2 hari)
                 DateTime localFrom = replayFrom.ToLocalTime().Date;
                 DateTime localTo   = replayTo.ToLocalTime().Date;
-
                 int totalProcessed = 0;
 
                 for (DateTime date = localFrom; date <= localTo; date = date.AddDays(1))
                 {
-                    // Kumpulkan semua computer yang ada di rawevents untuk tanggal ini
-                    string dateDir = Path.Combine(
-                        Path.Combine(
-                            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                            "Attendance-Monitoring-Service", "rawevents"),
-                        date.ToString("yyyyMMdd"));
-
+                    // Fix 1: pakai rawEventStore.GetDateDirectory() bukan hardcoded ProgramData path
+                    string dateDir = rawEventStore.GetDateDirectory(date);
                     if (!Directory.Exists(dateDir))
                         continue;
 
                     foreach (string computerDir in Directory.GetDirectories(dateDir))
                     {
-                        string computerName = Path.GetFileName(computerDir);
-                        var events4624 = rawEventStore.GetEventsForDate(computerName, date, 4624);
-                        var events4647 = rawEventStore.GetEventsForDate(computerName, date, 4647);
+                        // Fix 2: computerName dari folder name adalah sanitized (uppercase).
+                        // RawSecurityEvent.ComputerName di dalam JSON menyimpan nama asli.
+                        // Kita pakai folder name hanya sebagai selector untuk GetEventsForDate
+                        // — di dalam method itu SanitizeName dipanggil ulang pada parameter,
+                        // jadi kita pass nama asli dari event JSON, bukan folder name.
+                        // Tapi untuk GetEventsForDate kita perlu folder name agar path match.
+                        string sanitizedName = Path.GetFileName(computerDir);
+
+                        var events4624 = rawEventStore.GetEventsForDateBySanitizedName(sanitizedName, date, 4624);
+                        var events4647 = rawEventStore.GetEventsForDateBySanitizedName(sanitizedName, date, 4647);
 
                         var allEvents = events4624.Concat(events4647)
                             .Where(e => e.EventTimeUtc >= replayFrom && e.EventTimeUtc <= replayTo)
@@ -771,6 +783,12 @@ namespace EventLogOutEmployeeService
 
                         foreach (var raw in allEvents)
                         {
+                            // Fix 6: skip kalau event ini sudah fully dispatched di queue
+                            // (beyond DedupWindow 30 detik — tidak akan terdedup otomatis).
+                            // Cek berdasarkan EventId + ComputerName + EventTime exact match.
+                            if (IsAlreadyFullyDispatchedInQueue(raw))
+                                continue;
+
                             try
                             {
                                 ProcessRawSecurityEventAsync(raw, writeRawRecord: true)
@@ -801,6 +819,30 @@ namespace EventLogOutEmployeeService
                 SafeWriteEventLog("Application",
                     $"[RAW-REPLAY] Error in ReplayFromRawStore: {ex.Message}",
                     EventLogEntryType.Warning, 1036);
+            }
+        }
+
+        /// <summary>
+        /// Fix 6: Cek apakah raw event sudah ada di queue sebagai fully dispatched item.
+        /// Dipakai di ReplayFromRawStore untuk skip event yang sudah diproses sebelumnya
+        /// tapi di luar DedupWindow sehingga tidak akan terdedup otomatis oleh EnqueueIfNotDuplicateAsync.
+        /// </summary>
+        private bool IsAlreadyFullyDispatchedInQueue(RawSecurityEvent raw)
+        {
+            try
+            {
+                // Sync read — ReplayFromRawStore sudah di-call dari startup thread, tidak async context
+                var allItems = eventQueue.GetAllAsync().GetAwaiter().GetResult();
+                return allItems.Any(x =>
+                    x.EventId == raw.EventId &&
+                    x.ComputerName.Equals(raw.ComputerName, StringComparison.OrdinalIgnoreCase) &&
+                    Math.Abs((x.EventTime - raw.EventTimeUtc).TotalSeconds) < 5 &&
+                    x.RawRecordDispatched &&
+                    x.SummaryDispatched);
+            }
+            catch
+            {
+                return false; // kalau gagal baca queue, safer to re-process (dedup akan handle)
             }
         }
 
@@ -860,6 +902,25 @@ namespace EventLogOutEmployeeService
                     $"Error in ProcessRawSecurityEventAsync: {ex.Message}",
                     EventLogEntryType.Warning, 1009);
             }
+        }
+
+        /// <summary>
+        /// Hitung bucket device (0 sampai intervalDays-1) untuk menentukan hari cleanup SharePoint.
+        /// Strategi: ekstrak angka di akhir nama komputer sebagai bucket utama.
+        /// Format nama komputer: KODENAMECOMPANY-PC21, KODENAMECOMPANY-LAPTOP21, dst.
+        /// Angka suffix (21, 5, dst) cenderung unik per device dan terdistribusi merata.
+        /// Fallback ke abs(hash) % intervalDays kalau tidak ada angka di akhir nama.
+        /// </summary>
+        private static int GetDeviceCleanupBucket(string machineName, int intervalDays)
+        {
+            // Ekstrak angka di akhir nama komputer: "COMPANY-PC21" → 21
+            var match = System.Text.RegularExpressions.Regex.Match(
+                machineName, @"(\d+)\s*$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (match.Success && int.TryParse(match.Groups[1].Value, out int suffix))
+                return suffix % intervalDays;
+
+            // Fallback: pakai hash dari nama komputer
+            return Math.Abs(machineName.GetHashCode()) % intervalDays;
         }
 
         // ─── Configuration ───────────────────────────────────────────────────────
@@ -1416,38 +1477,127 @@ namespace EventLogOutEmployeeService
 
         // ─── Cleanup ─────────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Cleanup task dengan strategi:
+        ///
+        /// LOCAL (RawEventStore + SummaryCache):
+        ///   Jalan setiap hari saat service startup (missedCleanup), tidak perlu koordinasi.
+        ///   Tidak ada contention — masing-masing device manage file lokalnya sendiri.
+        ///
+        /// SHAREPOINT (raw list + summary list):
+        ///   Shared resource — perlu spread agar tidak semua device query Graph API bersamaan.
+        ///   Strategi:
+        ///   1. Window cleanup: 07:00–09:00 (saat device baru nyala, bukan jam 03:00 saat mati).
+        ///   2. Slot deterministik per device: abs(MachineName.GetHashCode()) % 120 menit.
+        ///      → 100 device tersebar merata dalam 120 menit = rata-rata 1 device / 1.2 menit.
+        ///   3. Jitter hari: SharePoint cleanup hanya jalan setiap 3 hari per device.
+        ///      → Further reduce load, data lama tidak urgent dihapus hari itu juga.
+        ///   4. Guard lastSharePointCleanupDate: tidak dobel meski service restart beberapa kali.
+        /// </summary>
         private async Task CleanupOldRecordsTask(CancellationToken cancellationToken)
         {
-            int cleanupHour = 3;
-            int retentionMonths = 6;
+            const int retentionMonths     = 6;
+            const int sharePointCleanupWindowStartHour = 7;   // mulai jam 07:00
+            const int sharePointCleanupWindowMinutes   = 120; // window 2 jam (07:00–09:00)
+            const int sharePointCleanupIntervalDays    = 3;   // SharePoint cleanup setiap 3 hari
+
+            // Slot deterministik per device dalam window cleanup (0–119 menit dari jam 07:00).
+            // Pakai deviceSlotMinutes untuk spread dalam window, GetDeviceCleanupBucket untuk
+            // menentukan hari mana device ini cleanup SharePoint.
+            int deviceSlotMinutes = Math.Abs(Environment.MachineName.GetHashCode()) % sharePointCleanupWindowMinutes;
+            int deviceBucket      = GetDeviceCleanupBucket(Environment.MachineName, sharePointCleanupIntervalDays);
+
+            DateTime lastLocalCleanupDate      = DateTime.MinValue.Date;
+            DateTime lastSharePointCleanupDate = DateTime.MinValue.Date;
+
+            SafeWriteEventLog("Application",
+                $"[CLEANUP] Device slot: {sharePointCleanupWindowStartHour:D2}:{deviceSlotMinutes:D2} " +
+                $"bucket={deviceBucket}/{sharePointCleanupIntervalDays} " +
+                $"(suffix dari '{Environment.MachineName}' → cleanup tiap hari ke-{deviceBucket},{deviceBucket + sharePointCleanupIntervalDays},...). " +
+                $"SharePoint cleanup every {sharePointCleanupIntervalDays} days.",
+                EventLogEntryType.Information, 5001);
 
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
                     DateTime now = DateTime.Now;
-                    DateTime nextRun = now.Date.AddHours(cleanupHour);
 
-                    if (now.Hour >= cleanupHour)
-                        nextRun = nextRun.AddDays(1);
-
-                    bool missedCleanup = now.Hour > cleanupHour;
-                    if (missedCleanup)
+                    // ── LOCAL CLEANUP (setiap hari, saat startup) ─────────────────
+                    // Tidak perlu koordinasi — jalan segera kalau belum cleanup hari ini.
+                    if (lastLocalCleanupDate.Date < now.Date)
                     {
-                        int randomDelay = new Random(Environment.MachineName.GetHashCode()).Next(0, 300000);
-                        await Task.Delay(randomDelay, cancellationToken);
-                        await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
                         await summaryCache.CleanupOldEntriesAsync(cancellationToken);
-                        rawEventStore.CleanupOldDates(); // Opsi 3: cleanup rawevents folder
+                        rawEventStore.CleanupOldDates();
+                        lastLocalCleanupDate = now.Date;
+                        SafeWriteEventLog("Application",
+                            $"[CLEANUP] Local cleanup done (summaryCache + rawEvents) for {now.Date:yyyy-MM-dd}.",
+                            EventLogEntryType.Information, 5006);
                     }
 
-                    await Task.Delay(nextRun - DateTime.Now, cancellationToken);
+                    // ── SHAREPOINT CLEANUP (setiap 3 hari, slot deterministik) ────
+                    // Hari cleanup SharePoint untuk device ini:
+                    // now.Day % intervalDays == deviceBucket
+                    // Contoh intervalDays=3: PC21 (suffix 21, bucket=0) cleanup di hari 3,6,9,...
+                    //                        PC22 (suffix 22, bucket=1) cleanup di hari 1,4,7,...
+                    //                        PC23 (suffix 23, bucket=2) cleanup di hari 2,5,8,...
+                    bool isSharePointCleanupDay = (now.Day % sharePointCleanupIntervalDays) == deviceBucket;
 
-                    int scheduledDelay = new Random(Environment.MachineName.GetHashCode()).Next(0, 300000);
-                    await Task.Delay(scheduledDelay, cancellationToken);
-                    await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
-                    await summaryCache.CleanupOldEntriesAsync(cancellationToken);
-                    rawEventStore.CleanupOldDates(); // Opsi 3: cleanup rawevents folder
+                    // Waktu slot device: jam 07:00 + deviceSlotMinutes
+                    DateTime deviceCleanupTime = now.Date
+                        .AddHours(sharePointCleanupWindowStartHour)
+                        .AddMinutes(deviceSlotMinutes);
+
+                    bool slotReached        = now >= deviceCleanupTime;
+                    bool notYetCleanedToday = lastSharePointCleanupDate.Date < now.Date;
+
+                    if (isSharePointCleanupDay && slotReached && notYetCleanedToday)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[CLEANUP] SharePoint cleanup starting — slot={deviceCleanupTime:HH:mm} " +
+                            $"device={Environment.MachineName}",
+                            EventLogEntryType.Information, 5001);
+
+                        await sharePointIntegration.Value.CleanupOldRecordsAsync(retentionMonths);
+                        lastSharePointCleanupDate = now.Date;
+
+                        SafeWriteEventLog("Application",
+                            $"[CLEANUP] SharePoint cleanup done for {now.Date:yyyy-MM-dd}.",
+                            EventLogEntryType.Information, 5001);
+                    }
+
+                    // ── Hitung waktu tunggu ke event berikutnya ───────────────────
+                    // Kandidat: (1) slot SharePoint hari ini, (2) slot SharePoint hari cleanup berikutnya,
+                    // (3) local cleanup besok jam 00:01.
+                    DateTime nextLocalCleanup = now.Date.AddDays(1).AddMinutes(1);
+
+                    // Cari hari cleanup SharePoint berikutnya
+                    DateTime nextSharePointCleanup = deviceCleanupTime.AddDays(1); // default besok
+                    for (int d = 0; d <= sharePointCleanupIntervalDays + 1; d++)
+                    {
+                        DateTime candidate = now.Date.AddDays(d)
+                            .AddHours(sharePointCleanupWindowStartHour)
+                            .AddMinutes(deviceSlotMinutes);
+                        if (candidate > now && (candidate.Day % sharePointCleanupIntervalDays) == deviceBucket)
+                        {
+                            nextSharePointCleanup = candidate;
+                            break;
+                        }
+                    }
+
+                    DateTime nextWakeUp = new[] { nextLocalCleanup, nextSharePointCleanup }
+                        .Where(t => t > now)
+                        .DefaultIfEmpty(now.AddHours(1))
+                        .Min();
+
+                    // Maksimum tidur 1 jam agar tidak terlalu lama kalau ada drift
+                    TimeSpan sleepDuration = nextWakeUp - now;
+                    if (sleepDuration > TimeSpan.FromHours(1))
+                        sleepDuration = TimeSpan.FromHours(1);
+                    if (sleepDuration < TimeSpan.FromSeconds(30))
+                        sleepDuration = TimeSpan.FromSeconds(30);
+
+                    await Task.Delay(sleepDuration, cancellationToken);
                 }
                 catch (TaskCanceledException) { break; }
                 catch (Exception ex)
@@ -1934,6 +2084,15 @@ namespace EventLogOutEmployeeService
                     shutdownTime = eventTime;
                     shutdownType = $"{eventId} - {eventType}";
                 }
+                // Fix 7: event 42 (Sleep) juga set shutdownTime secara eksplisit.
+                // Sebelumnya null dan fallback ke EventTime saat dispatch — ini tetap benar
+                // tapi tidak konsisten. Set eksplisit di sini agar ShutdownTime tersimpan
+                // di queue file dan tidak bergantung pada fallback ?? EventTime saat dispatch.
+                else if (eventId == 42)
+                {
+                    shutdownTime = eventTime;
+                    shutdownType = $"42 - {eventType}";
+                }
 
                 var queuedEvent = new QueuedAttendanceEvent
                 {
@@ -1966,13 +2125,13 @@ namespace EventLogOutEmployeeService
                 if (eventId == 4647 || eventId == 1074 || eventId == 6006)
                 {
                     string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-                    // Group key: computer + user + tanggal + epoch menit (bukan detik) agar
-                    // event dalam 60 detik yang sama masuk group yang sama.
                     long epochMinute = (long)(eventTime - DateTime.UnixEpoch).TotalMinutes;
                     queuedEvent.ShutdownGroupId = $"shutdown_{computerName}_{username}_{workDate}_{epochMinute}";
-                    // Timer 3 detik — cukup untuk tunggu 1074/6006 yang fired hampir bersamaan,
-                    // tapi tidak terlalu lama sampai network mati saat shutdown.
-                    queuedEvent.ShutdownGroupHoldUntil = eventTime.AddSeconds(3);
+                    // Fix 5: naikkan hold window dari 3 → 12 detik.
+                    // 3 detik terlalu pendek kalau dispatch sedang backoff (network lambat)
+                    // dan event group berikutnya (1074/6006) masuk setelah backoff delay.
+                    // 12 detik masih aman saat shutdown — network biasanya bertahan 15-30 detik.
+                    queuedEvent.ShutdownGroupHoldUntil = eventTime.AddSeconds(12);
 
                     // Kalau 1074 adalah restart, tandai seluruh group sebagai restart.
                     // Ini memastikan 4647 yang mungkin sudah masuk queue duluan juga ikut di-skip summary.
@@ -2369,6 +2528,46 @@ namespace EventLogOutEmployeeService
                     EventLogEntryType.Warning, 2015);
             }
 
+            // Opt 5: fallback ke RawEventStore kalau Security log miss (rotated/cleared).
+            // Cari 4624 terbaru dalam lookback window yang sama.
+            try
+            {
+                DateTime lookbackTime = beforeTime - lookbackWindow;
+                DateTime localDate    = beforeTime.ToLocalTime().Date;
+
+                // Scan tanggal hari ini dan kemarin (kalau lookback melewati midnight)
+                var candidates = new List<RawSecurityEvent>();
+                for (DateTime d = localDate.AddDays(-1); d <= localDate; d = d.AddDays(1))
+                {
+                    var raw = rawEventStore.GetEventsForDate(computerName, d, 4624);
+                    candidates.AddRange(raw);
+                }
+
+                var best = candidates
+                    .Where(r =>
+                        r.EventTimeUtc >= lookbackTime &&
+                        r.EventTimeUtc <= beforeTime &&
+                        (!requireRelevant4624 || IsRelevantLogonType(r.LogonType)))
+                    .OrderByDescending(r => r.EventTimeUtc)
+                    .FirstOrDefault();
+
+                if (best != null)
+                {
+                    string? rawUser = best.Username;
+                    if (!string.IsNullOrWhiteSpace(rawUser))
+                        rawUser = ResolveUsernameBySid(rawUser, best.Sid);
+                    if (!string.IsNullOrWhiteSpace(rawUser) && IsValidUsername(rawUser))
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-GetMRU] RawEventStore fallback for {computerName}: " +
+                            $"user={rawUser} rawTime={best.EventTimeUtc:O}",
+                            EventLogEntryType.Information, 2031);
+                        return rawUser;
+                    }
+                }
+            }
+            catch { /* silent fail */ }
+
             return null;
         }
 
@@ -2400,6 +2599,35 @@ namespace EventLogOutEmployeeService
                 {
                     resolvedUsername = fromQueue;
                     fallbackSource = "Event6005_PreviousLog";
+                }
+            }
+
+            // Fix 4: coba RawEventStore sebelum SharePoint.
+            // Kalau Security log bersih dan queue kosong (fresh start), RawEventStore
+            // justru punya 4624 valid yang disimpan saat event terjadi — jauh lebih cepat
+            // dan lebih akurat daripada query SharePoint raw list.
+            if (string.IsNullOrWhiteSpace(resolvedUsername))
+            {
+                var rawEvents = GetRawEventsFromStore(computerName, eventTime.ToLocalTime().Date, 4624);
+                var bestRaw = rawEvents
+                    .Where(r => r.EventTimeUtc <= eventTime && IsRelevantLogonType(r.LogonType))
+                    .OrderByDescending(r => r.EventTimeUtc)
+                    .FirstOrDefault();
+
+                if (bestRaw != null)
+                {
+                    string? rawUser = bestRaw.Username;
+                    if (!string.IsNullOrWhiteSpace(rawUser))
+                        rawUser = ResolveUsernameBySid(rawUser, bestRaw.Sid);
+                    if (!string.IsNullOrWhiteSpace(rawUser) && IsValidUsername(rawUser))
+                    {
+                        resolvedUsername = rawUser;
+                        fallbackSource = "Event6005_RawStore";
+                        SafeWriteEventLog("Application",
+                            $"[DBG-6005] Resolved username from RawEventStore for {computerName}: " +
+                            $"user={resolvedUsername} rawTime={bestRaw.EventTimeUtc:O}",
+                            EventLogEntryType.Information, 2030);
+                    }
                 }
             }
 
@@ -2485,6 +2713,20 @@ namespace EventLogOutEmployeeService
                 item.Username == "__UNRESOLVED__" ||
                 !IsValidUsername(item.Username))
                 return false;
+
+            // Opt 1: jangan promote 42 terlalu cepat setelah event terjadi.
+            // Event 42, 1074, 6006, dan 4647 bisa fire hampir bersamaan (urutan tidak deterministic).
+            // Tunggu minimal 15 detik setelah event time agar event shutdown yang lebih baik
+            // sempat masuk queue sebelum kita memutuskan 42 adalah last-resort.
+            // Kalau belum 15 detik, return false — dispatch loop akan retry event ini nanti.
+            if (DateTime.UtcNow - item.EventTime.ToUniversalTime() < TimeSpan.FromSeconds(15))
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-42] Too early to promote: elapsed={( DateTime.UtcNow - item.EventTime.ToUniversalTime()).TotalSeconds:F1}s < 15s. " +
+                    $"computer={item.ComputerName} user={item.Username}",
+                    EventLogEntryType.Information, 2032);
+                return false;
+            }
 
             string workDate = item.EventTime.ToLocalTime().ToString("yyyy-MM-dd");
 

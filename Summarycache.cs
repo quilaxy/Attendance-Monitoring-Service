@@ -33,8 +33,14 @@ namespace EventLogOutEmployeeService
         private readonly string filePath;
         private readonly SemaphoreSlim fileLock = new SemaphoreSlim(1, 1);
 
-        /// <summary>Entry lebih dari ini otomatis dihapus saat cleanup.</summary>
-        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(7);
+        /// <summary>
+        /// Retention summary cache disamakan dengan retention data SharePoint (6 bulan).
+        /// Tujuan: mencegah duplikat row di SummaryListId lintas service restart.
+        /// Kalau cache dihapus sebelum data SharePoint dihapus (misal 7 hari), service restart
+        /// di hari ke-8 tidak tahu row untuk user+workDate itu sudah ada → bisa bikin duplikat.
+        /// Dengan 6 bulan: 100 user × 180 hari × ~30 byte/entry ≈ 540KB — masih sangat kecil.
+        /// </summary>
+        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(180); // ~6 bulan
 
         public SummaryCache(string filePath)
         {
@@ -83,8 +89,11 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Hapus entry yang workDate-nya lebih dari RetentionWindow (7 hari).
+        /// Hapus entry yang workDate-nya lebih dari RetentionWindow (180 hari / ~6 bulan).
         /// Dipanggil dari CleanupOldRecordsTask bersamaan dengan cleanup SharePoint.
+        /// Retention sengaja disamakan dengan SharePoint agar cache tidak expired
+        /// sebelum data SharePoint-nya sendiri dihapus — kalau cache expired duluan,
+        /// service restart bisa bikin duplikat row untuk data yang masih ada di SharePoint.
         /// </summary>
         public async Task CleanupOldEntriesAsync(CancellationToken cancellationToken = default)
         {

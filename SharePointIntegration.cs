@@ -245,9 +245,15 @@ namespace EventLogOutEmployeeService
                     return (null, true);
 
                 using var client = CreateGraphClient(accessToken, timeoutSeconds: 30);
-                string filter = $"fields/ComputerName eq '{EscapeODataLiteral(computerName)}'";
+
+                // Fix 3: tambah filter EventTime ge 30 hari lalu agar tidak return username
+                // dari bulan lalu kalau user sudah lama tidak login di device itu.
+                DateTime windowStart = referenceTime.AddDays(-30).ToUniversalTime();
+                string windowStartStr = windowStart.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                string filter = $"fields/ComputerName eq '{EscapeODataLiteral(computerName)}'" +
+                                $" and fields/EventTime ge '{windowStartStr}'";
                 string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
-                             $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=50";
+                             $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=50&$orderby=fields/EventTime desc";
 
                 var request = new HttpRequestMessage(HttpMethod.Get, url);
                 var response = await client.SendAsync(request);
@@ -262,7 +268,7 @@ namespace EventLogOutEmployeeService
                 var latest = items
                     .Select(x => new
                     {
-                        Username = x["fields"]?["Username"]?.ToString(),
+                        Username  = x["fields"]?["Username"]?.ToString(),
                         EventTime = ParseFieldDateTime(x["fields"] as JObject, "EventTime")
                     })
                     .Where(x => !string.IsNullOrWhiteSpace(x.Username) && x.EventTime.HasValue)
@@ -651,7 +657,16 @@ namespace EventLogOutEmployeeService
             int currentPriority = GetPriorityFromShutdownType(currentShutdownType);
 
             // FIX [NEW-SESSION]: Kalau shutdown baru terjadi SETELAH shutdown yang tersimpan,
-            // artinya user sudah login lagi (sesi baru) lalu shutdown lagi.
+            // Kalau belum ada ShutdownTime sama sekali, set sentinel priority -2 agar
+            // semua event shutdown valid (priority >= -1) bisa masuk.
+            // Event 42 (priority -1) tetap bisa masuk kalau currentShutdown null,
+            // tapi akan di-overwrite oleh event yang lebih baik (priority >= 0) kapanpun datang.
+            // Ini berbeda dari noExistingShutdown=true yang skip priority check sepenuhnya —
+            // di sini priority check tetap jalan, hanya baseline-nya di-set ke -2 bukan 0.
+            int effectiveCurrentPriority = currentShutdown.HasValue ? currentPriority : -2;
+
+            // isNewSession: ada ShutdownTime sebelumnya, dan incoming lebih baru.
+            // Artinya user sudah login lagi (sesi baru) lalu shutdown lagi.
             // Dalam kasus ini, abaikan priority lama — shutdown terbaru selalu lebih relevan.
             // Contoh: 6006 jam 09:00 (priority 5) lalu login jam 13:00 lalu 4647 jam 17:00 (priority 2)
             // → tanpa fix: 4647 di-skip karena priority lebih rendah, ShutdownTime tetap 09:00 ❌
@@ -662,25 +677,24 @@ namespace EventLogOutEmployeeService
                 SafeWriteEventLog("Application",
                     $"[DBG-Summary] TryUpdateShutdown: NEW SESSION detected — " +
                     $"incoming shutdownTime ({shutdownTime:O}) > existing ({currentShutdown!.Value:O}). " +
-                    $"Resetting priority comparison. new={newPriority} old={currentPriority}",
+                    $"Resetting priority comparison. new={newPriority} old={effectiveCurrentPriority}",
                     EventLogEntryType.Information, 3018);
-
                 // Sesi baru → tulis langsung tanpa cek priority lama.
-                // ShutdownTime yang lebih baru sudah pasti lebih relevan untuk absensi.
             }
             else
             {
-                // Sesi yang sama — terapkan priority system normal.
-                if (newPriority < currentPriority)
+                // Sesi yang sama — terapkan priority system normal dengan effectiveCurrentPriority.
+                if (newPriority < effectiveCurrentPriority)
                 {
                     SafeWriteEventLog("Application",
-                        $"[DBG-Summary] TryUpdateShutdown: SKIP — priority too low: new={newPriority} current={currentPriority} " +
-                        $"(existing='{currentShutdownType}')",
+                        $"[DBG-Summary] TryUpdateShutdown: SKIP — priority too low: " +
+                        $"new={newPriority} effectiveCurrent={effectiveCurrentPriority} " +
+                        $"(existing='{currentShutdownType}' currentShutdown={currentShutdown?.ToString("O") ?? "null"})",
                         EventLogEntryType.Information, 3014);
                     return;
                 }
 
-                if (newPriority == currentPriority)
+                if (newPriority == effectiveCurrentPriority)
                 {
                     if (currentShutdown.HasValue && currentShutdown.Value >= shutdownTime)
                     {
@@ -936,9 +950,9 @@ namespace EventLogOutEmployeeService
         {
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
-            3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
+            3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019, 3021, 3022, 3023,
             // Dispatch & raw detail
-            4010, 4020, 4021, 4022, 4025,
+            4010, 4011, 4020, 4021, 4022, 4025,
             // Cleanup progress
             5001, 5002, 5003,
         };

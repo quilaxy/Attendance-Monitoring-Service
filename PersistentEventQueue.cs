@@ -82,7 +82,47 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Ambil semua raw event 4624 untuk device + workDate tertentu, sorted ascending.
+        /// Fix 1: Expose path builder agar ReplayFromRawStore tidak perlu hardcode ProgramData.
+        /// </summary>
+        public string GetDateDirectory(DateTime localDate)
+            => Path.Combine(baseDirectory, localDate.ToString("yyyyMMdd"));
+
+        /// <summary>
+        /// Fix 2: Lookup langsung pakai sanitized folder name (sudah uppercase/stripped),
+        /// untuk menghindari double-sanitize saat dipanggil dari ReplayFromRawStore
+        /// yang sudah mendapat folder name dari Directory.GetDirectories.
+        /// RawSecurityEvent.ComputerName di dalam JSON tetap menyimpan nama asli.
+        /// </summary>
+        public List<RawSecurityEvent> GetEventsForDateBySanitizedName(string sanitizedName, DateTime localDate, int eventId)
+        {
+            var result = new List<RawSecurityEvent>();
+            try
+            {
+                string dir = Path.Combine(baseDirectory, localDate.ToString("yyyyMMdd"), sanitizedName);
+                if (!Directory.Exists(dir))
+                    return result;
+
+                string prefix = $"{eventId}_";
+                foreach (string file in Directory.GetFiles(dir, $"{prefix}*.json", SearchOption.TopDirectoryOnly))
+                {
+                    try
+                    {
+                        string content = File.ReadAllText(file);
+                        var evt = JsonConvert.DeserializeObject<RawSecurityEvent>(content);
+                        if (evt != null)
+                            result.Add(evt);
+                    }
+                    catch { /* skip corrupt file */ }
+                }
+
+                result.Sort((a, b) => a.EventTimeUtc.CompareTo(b.EventTimeUtc));
+            }
+            catch { /* silent fail */ }
+            return result;
+        }
+
+        /// <summary>
+        /// Ambil semua raw event untuk device + workDate tertentu, sorted ascending.
         /// Dipakai sebagai fallback kalau Security log lokal sudah ter-rotate.
         /// </summary>
         public List<RawSecurityEvent> GetEventsForDate(string computerName, DateTime localDate, int eventId)
@@ -399,6 +439,7 @@ namespace EventLogOutEmployeeService
             if (eventId == 4647) return 2;
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
+            if (eventId == 42)   return -1; // last resort, selalu di-overwrite event lain
             return 0;
         }
 
