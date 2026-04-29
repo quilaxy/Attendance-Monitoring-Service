@@ -183,6 +183,13 @@ namespace EventLogOutEmployeeService
 
         protected override void OnStart(string[] args)
         {
+            // #9: OnStart harus return dalam ~30 detik atau SCM kill service.
+            // PrimeFirstLogon dan RetryPending cepat (in-memory + local disk).
+            // ReplayMissedEvents bisa lama kalau checkpoint window besar (scan EventLog banyak entry).
+            // Solusi: jalankan semua startup work di background thread, OnStart return segera
+            // setelah setup dasar selesai. RequestAdditionalTime diperpanjang dari background.
+            RequestAdditionalTime(30_000);
+
             int maxRetries = 5;
             int currentRetry = 0;
             bool started = false;
@@ -195,7 +202,6 @@ namespace EventLogOutEmployeeService
 
                     serviceStartTime = DateTime.UtcNow;
 
-                    // Reset static network-wait flag so it re-evaluates on each service start
                     SharePointIntegration.ResetNetworkWaitFlag();
                     SharePointIntegration.SetServiceStartTime(serviceStartTime);
 
@@ -210,29 +216,44 @@ namespace EventLogOutEmployeeService
                     cancellationTokenSource = new CancellationTokenSource();
                     cancellationToken = cancellationTokenSource.Token;
 
-                    // Make sure ProgramData checkpoint files exist even after abrupt previous crash.
-                    EnsureCheckpointBootstrap();
+                    EnsurCheckpointBootstrap();
 
-                    // Startup queue-first flow:
-                    // 1) Retry pending queue items
-                    // 2) Enable listeners
-                    // 3) Replay missed events to queue
-                    PrimeFirstLogonIndexFromQueueAsync(cancellationToken.Value).GetAwaiter().GetResult();
-                    RetryPendingQueueOnStartupAsync(cancellationToken.Value).GetAwaiter().GetResult();
+                    // Startup background task — semua yang bisa lama dijalankan di sini
+                    // agar OnStart bisa return dan SCM tidak timeout.
+                    var ct = cancellationToken.Value;
+                    Thread startupThread = new Thread(() =>
+                    {
+                        try
+                        {
+                            // Minta tambahan waktu dari background — SCM akan terus menunggu
+                            // selama kita kirim RequestAdditionalTime sebelum deadline.
+                            RequestAdditionalTime(120_000);
 
-                    if (securityEventLog != null)
-                        securityEventLog.EnableRaisingEvents = true;
-                    if (systemEventLog != null)
-                        systemEventLog.EnableRaisingEvents = true;
+                            PrimeFirstLogonIndexFromQueueAsync(ct).GetAwaiter().GetResult();
+                            RetryPendingQueueOnStartupAsync(ct).GetAwaiter().GetResult();
 
-                    // Replay any events missed while service was down
-                    ReplayMissedEventsFromCheckpoint();
+                            if (securityEventLog != null)
+                                securityEventLog.EnableRaisingEvents = true;
+                            if (systemEventLog != null)
+                                systemEventLog.EnableRaisingEvents = true;
 
-                    StartCheckpointHeartbeat();
+                            ReplayMissedEventsFromCheckpoint().GetAwaiter().GetResult();
 
-                    Thread monitoringThread = new Thread(() => MonitorEvents(cancellationToken.Value));
-                    monitoringThread.IsBackground = true;
-                    monitoringThread.Start();
+                            StartCheckpointHeartbeat();
+
+                            // MonitorEvents loop (cleanup + dispatch tasks)
+                            MonitorEvents(ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[STARTUP] Background startup thread failed: {ex.Message}",
+                                EventLogEntryType.Error, 1002);
+                        }
+                    });
+                    startupThread.IsBackground = true;
+                    startupThread.Name = "StartupReplay";
+                    startupThread.Start();
 
                     started = true;
                     break;
@@ -257,6 +278,8 @@ namespace EventLogOutEmployeeService
                     EventLogEntryType.Information, 0);
             }
         }
+
+        private void EnsurCheckpointBootstrap() => EnsureCheckpointBootstrap();
 
         // ─── Crash handler ───────────────────────────────────────────────────────
 
@@ -322,7 +345,7 @@ namespace EventLogOutEmployeeService
 
         // ─── Replay missed events ────────────────────────────────────────────────
 
-        private void ReplayMissedEventsFromCheckpoint()
+        private async Task ReplayMissedEventsFromCheckpoint()
         {
             DateTime replayTo = DateTime.UtcNow;
             replayUpperBound = replayTo;
@@ -344,7 +367,7 @@ namespace EventLogOutEmployeeService
                     // Opsi 3: Replay dari RawEventStore sebagai fallback tambahan.
                     // Ini menangkap 4624/4647 yang sudah hilang dari Security log tapi
                     // sempat disimpan ke rawevents\ saat terjadi.
-                    ReplayFromRawStore(replayFrom.Value, replayTo);
+                    await ReplayFromRawStore(replayFrom.Value, replayTo);
 
                     // System events: extend replayFrom 30 detik lebih awal agar 1074 yang terjadi
                     // tepat sebelum checkpoint window tetap ter-load ke memory sebelum 6006 di-replay.
@@ -617,8 +640,11 @@ namespace EventLogOutEmployeeService
                 if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
 
-                File.WriteAllText(replayCheckpointPath,
-                    checkpoint.ToUniversalTime().ToString("O"));
+                // Tulis atomik via temp+rename agar tidak corrupted kalau process mati di tengah write.
+                string content = checkpoint.ToUniversalTime().ToString("O");
+                string tempPath = replayCheckpointPath + ".tmp";
+                File.WriteAllText(tempPath, content);
+                File.Move(tempPath, replayCheckpointPath, overwrite: true);
             }
             catch { /* ignore write failures */ }
         }
@@ -748,7 +774,7 @@ namespace EventLogOutEmployeeService
         /// Ini fallback kalau Security log sudah ter-rotate/clear sebelum ReplaySecurityEvents bisa baca.
         /// DedupWindow di EnqueueIfNotDuplicateAsync akan otomatis skip event yang sudah ada di queue.
         /// </summary>
-        private void ReplayFromRawStore(DateTime replayFrom, DateTime replayTo)
+        private async Task ReplayFromRawStore(DateTime replayFrom, DateTime replayTo)
         {
             try
             {
@@ -786,13 +812,12 @@ namespace EventLogOutEmployeeService
                             // Fix 6: skip kalau event ini sudah fully dispatched di queue
                             // (beyond DedupWindow 30 detik — tidak akan terdedup otomatis).
                             // Cek berdasarkan EventId + ComputerName + EventTime exact match.
-                            if (IsAlreadyFullyDispatchedInQueue(raw))
+                            if (await IsAlreadyFullyDispatchedInQueueAsync(raw))
                                 continue;
 
                             try
                             {
-                                ProcessRawSecurityEventAsync(raw, writeRawRecord: true)
-                                    .GetAwaiter().GetResult();
+                                await ProcessRawSecurityEventAsync(raw, writeRawRecord: true);
                                 totalProcessed++;
                             }
                             catch (Exception ex)
@@ -827,22 +852,17 @@ namespace EventLogOutEmployeeService
         /// Dipakai di ReplayFromRawStore untuk skip event yang sudah diproses sebelumnya
         /// tapi di luar DedupWindow sehingga tidak akan terdedup otomatis oleh EnqueueIfNotDuplicateAsync.
         /// </summary>
-        private bool IsAlreadyFullyDispatchedInQueue(RawSecurityEvent raw)
+        private async Task<bool> IsAlreadyFullyDispatchedInQueueAsync(RawSecurityEvent raw)
         {
+            // #2: Pakai IsFullyDispatchedAsync di queue (cache-backed), tidak ada blocking call.
             try
             {
-                // Sync read — ReplayFromRawStore sudah di-call dari startup thread, tidak async context
-                var allItems = eventQueue.GetAllAsync().GetAwaiter().GetResult();
-                return allItems.Any(x =>
-                    x.EventId == raw.EventId &&
-                    x.ComputerName.Equals(raw.ComputerName, StringComparison.OrdinalIgnoreCase) &&
-                    Math.Abs((x.EventTime - raw.EventTimeUtc).TotalSeconds) < 5 &&
-                    x.RawRecordDispatched &&
-                    x.SummaryDispatched);
+                return await eventQueue.IsFullyDispatchedAsync(
+                    raw.EventId, raw.ComputerName, raw.EventTimeUtc);
             }
             catch
             {
-                return false; // kalau gagal baca queue, safer to re-process (dedup akan handle)
+                return false;
             }
         }
 
@@ -909,7 +929,9 @@ namespace EventLogOutEmployeeService
         /// Strategi: ekstrak angka di akhir nama komputer sebagai bucket utama.
         /// Format nama komputer: KODENAMECOMPANY-PC21, KODENAMECOMPANY-LAPTOP21, dst.
         /// Angka suffix (21, 5, dst) cenderung unik per device dan terdistribusi merata.
-        /// Fallback ke abs(hash) % intervalDays kalau tidak ada angka di akhir nama.
+        /// Fallback ke stable hash (FNV-1a) kalau tidak ada angka di akhir nama.
+        /// CATATAN: String.GetHashCode() tidak deterministik lintas restart di .NET Core 2.1+
+        /// (randomized per-process). Pakai FNV-1a agar bucket sama setiap service restart.
         /// </summary>
         private static int GetDeviceCleanupBucket(string machineName, int intervalDays)
         {
@@ -919,8 +941,23 @@ namespace EventLogOutEmployeeService
             if (match.Success && int.TryParse(match.Groups[1].Value, out int suffix))
                 return suffix % intervalDays;
 
-            // Fallback: pakai hash dari nama komputer
-            return Math.Abs(machineName.GetHashCode()) % intervalDays;
+            // Fallback: FNV-1a 32-bit — stable dan deterministik lintas restart
+            return StableFnv1aHash(machineName) % intervalDays;
+        }
+
+        /// <summary>FNV-1a 32-bit hash — deterministic, tidak bergantung runtime seed.</summary>
+        private static int StableFnv1aHash(string input)
+        {
+            unchecked
+            {
+                uint hash = 2166136261u;
+                foreach (char c in input.ToUpperInvariant())
+                {
+                    hash ^= c;
+                    hash *= 16777619u;
+                }
+                return (int)(hash & 0x7FFFFFFF); // always non-negative
+            }
         }
 
         // ─── Configuration ───────────────────────────────────────────────────────
@@ -1488,7 +1525,7 @@ namespace EventLogOutEmployeeService
         ///   Shared resource — perlu spread agar tidak semua device query Graph API bersamaan.
         ///   Strategi:
         ///   1. Window cleanup: 07:00–09:00 (saat device baru nyala, bukan jam 03:00 saat mati).
-        ///   2. Slot deterministik per device: abs(MachineName.GetHashCode()) % 120 menit.
+        ///   2. Slot deterministik per device: StableFnv1aHash(MachineName) % 120 menit.
         ///      → 100 device tersebar merata dalam 120 menit = rata-rata 1 device / 1.2 menit.
         ///   3. Jitter hari: SharePoint cleanup hanya jalan setiap 3 hari per device.
         ///      → Further reduce load, data lama tidak urgent dihapus hari itu juga.
@@ -1504,7 +1541,10 @@ namespace EventLogOutEmployeeService
             // Slot deterministik per device dalam window cleanup (0–119 menit dari jam 07:00).
             // Pakai deviceSlotMinutes untuk spread dalam window, GetDeviceCleanupBucket untuk
             // menentukan hari mana device ini cleanup SharePoint.
-            int deviceSlotMinutes = Math.Abs(Environment.MachineName.GetHashCode()) % sharePointCleanupWindowMinutes;
+            // Slot deterministik per device dalam window cleanup (0–119 menit dari jam 07:00).
+            // Pakai StableFnv1aHash agar slot sama setiap service restart — GetHashCode() di .NET Core
+            // adalah randomized per-process sehingga tidak deterministik lintas restart.
+            int deviceSlotMinutes = StableFnv1aHash(Environment.MachineName) % sharePointCleanupWindowMinutes;
             int deviceBucket      = GetDeviceCleanupBucket(Environment.MachineName, sharePointCleanupIntervalDays);
 
             DateTime lastLocalCleanupDate      = DateTime.MinValue.Date;
@@ -1641,8 +1681,9 @@ namespace EventLogOutEmployeeService
             });
         }
 
-        private DateTime _lastSkipLogTime = DateTime.MinValue;
-        private int _skipLogSuppressedCount = 0;
+        private volatile int _skipLogSuppressedCount = 0;
+        // Ticks-based agar bisa diakses dengan Interlocked.Read (DateTime tidak thread-safe secara native)
+        private long _lastSkipLogTimeTicks = DateTime.MinValue.Ticks;
 
         private bool ShouldSkipLiveEntry(DateTime eventTime)
         {
@@ -1656,22 +1697,24 @@ namespace EventLogOutEmployeeService
                 }
                 else
                 {
-                    // Rate-limit log 1038 — maksimal 1x per 30 detik, sisanya di-suppress
-                    bool shouldLog = (DateTime.Now - _lastSkipLogTime).TotalSeconds >= 30;
+                    // Rate-limit log 1038 — maksimal 1x per 30 detik, sisanya di-suppress.
+                    // Pakai Interlocked agar aman dari concurrent OnSecurityEventWritten calls.
+                    long lastTicks = Interlocked.Read(ref _lastSkipLogTimeTicks);
+                    bool shouldLog = (DateTime.Now.Ticks - lastTicks) >= TimeSpan.FromSeconds(30).Ticks;
                     if (shouldLog)
                     {
-                        string suffix = _skipLogSuppressedCount > 0
-                            ? $" (+ {_skipLogSuppressedCount} suppressed)"
+                        int suppressed = Interlocked.Exchange(ref _skipLogSuppressedCount, 0);
+                        Interlocked.Exchange(ref _lastSkipLogTimeTicks, DateTime.Now.Ticks);
+                        string suffix = suppressed > 0
+                            ? $" (+ {suppressed} suppressed)"
                             : string.Empty;
                         SafeWriteEventLog("Application",
                             $"Live event skipped — older than replayUpperBound: eventTime={eventTime:O} replayUpperBound={replayUpperBound:O}{suffix}",
                             EventLogEntryType.Information, 1038);
-                        _lastSkipLogTime = DateTime.Now;
-                        _skipLogSuppressedCount = 0;
                     }
                     else
                     {
-                        _skipLogSuppressedCount++;
+                        Interlocked.Increment(ref _skipLogSuppressedCount);
                     }
                 }
                 return true;
@@ -2125,8 +2168,15 @@ namespace EventLogOutEmployeeService
                 if (eventId == 4647 || eventId == 1074 || eventId == 6006)
                 {
                     string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-                    long epochMinute = (long)(eventTime - DateTime.UnixEpoch).TotalMinutes;
-                    queuedEvent.ShutdownGroupId = $"shutdown_{computerName}_{username}_{workDate}_{epochMinute}";
+                    // #7: Pakai window 90 detik (epoch / 90) bukan 1 menit penuh (epoch / 60).
+                    // epochMinute menyebabkan collision: 1074 jam 17:00:01 dan 1074 jam 17:01:30
+                    // dari sesi berbeda masuk group yang sama karena epochMinute = (total detik / 60)
+                    // bisa sama untuk dua menit berbeda kalau ada event di detik-detik akhir menit.
+                    // 90 detik lebih dari cukup untuk menampung seluruh rangkaian 4647+1074+6006
+                    // yang biasanya fire dalam < 5 detik, tapi cukup sempit untuk hindari collision
+                    // antara dua sesi berbeda yang terjadi dalam 1 jam yang sama.
+                    long epoch90s = (long)(eventTime - DateTime.UnixEpoch).TotalSeconds / 90;
+                    queuedEvent.ShutdownGroupId = $"shutdown_{computerName}_{username}_{workDate}_{epoch90s}";
                     // Fix 5: naikkan hold window dari 3 → 12 detik.
                     // 3 detik terlalu pendek kalau dispatch sedang backoff (network lambat)
                     // dan event group berikutnya (1074/6006) masuk setelah backoff delay.
@@ -2320,7 +2370,7 @@ namespace EventLogOutEmployeeService
             try
             {
                 DateTime lookbackTime = beforeTime.AddHours(-12);
-                EventLog secLog = new EventLog("Security");
+                using EventLog secLog = new EventLog("Security");
                 int checkCount = 0;
 
                 for (int i = secLog.Entries.Count - 1; i >= 0 && checkCount < 500; i--)
@@ -2494,7 +2544,7 @@ namespace EventLogOutEmployeeService
             try
             {
                 DateTime lookbackTime = beforeTime - lookbackWindow;
-                EventLog secLog = new EventLog("Security");
+                using EventLog secLog = new EventLog("Security");
                 int checkCount = 0;
 
                 for (int i = secLog.Entries.Count - 1; i >= 0 && checkCount < 1000; i--)
@@ -3669,21 +3719,25 @@ namespace EventLogOutEmployeeService
         private static string BuildPendingFallbackSource(int eventId)
             => $"Event{eventId}_Pending";
 
-        private bool IsValidUsername(string username)
+        private static readonly HashSet<string> _invalidUsernames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "NETWORK SERVICE",
+            "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator"
+        };
+
+        private static readonly string[] _invalidUsernamePrefixes = { "DWM-", "UMFD-", "NT Service" };
+
+        // #3: IsValidUsername static — _invalidUsernames dan _invalidUsernamePrefixes sudah
+        // static readonly, method-nya juga harus static agar tidak ada implicit instance capture.
+        private static bool IsValidUsername(string username)
         {
             if (string.IsNullOrWhiteSpace(username))
                 return false;
 
-            var invalidNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "NETWORK SERVICE",
-                "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator"
-            };
-
-            if (invalidNames.Contains(username)) return false;
+            if (_invalidUsernames.Contains(username)) return false;
             if (username.EndsWith("$")) return false;
 
-            foreach (var prefix in new[] { "DWM-", "UMFD-", "NT Service" })
+            foreach (var prefix in _invalidUsernamePrefixes)
                 if (username.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                     return false;
 

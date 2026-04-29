@@ -35,7 +35,11 @@ namespace EventLogOutEmployeeService
     {
         private readonly string baseDirectory;
         private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(7);
-        private readonly SemaphoreSlim writeLock = new SemaphoreSlim(1, 1);
+        // #10: writeLock global dihilangkan.
+        // File path sudah unik per event: {eventId}_{ticks}.json
+        // File.Move (temp→final) atomic di Windows untuk same-volume.
+        // Concurrent saves ke file path yang berbeda tidak butuh serialisasi.
+        // Idempotency dijaga oleh File.Exists check sebelum write.
 
         public RawEventStore(string baseDirectory)
         {
@@ -45,40 +49,35 @@ namespace EventLogOutEmployeeService
 
         /// <summary>
         /// Simpan raw event ke disk secara fire-and-forget. Tidak throw.
-        /// Dipanggil dari OnSecurityEventWritten dan OnSystemEventWritten SEBELUM ProcessEntry.
+        /// Dipanggil dari OnSecurityEventWritten SEBELUM ProcessEntry.
         /// </summary>
         public async Task SaveAsync(RawSecurityEvent evt)
         {
             try
             {
-                await writeLock.WaitAsync();
-                try
-                {
-                    string dir = Path.Combine(
-                        baseDirectory,
-                        evt.EventTimeUtc.ToLocalTime().ToString("yyyyMMdd"),
-                        SanitizeName(evt.ComputerName));
-                    Directory.CreateDirectory(dir);
+                string dir = Path.Combine(
+                    baseDirectory,
+                    evt.EventTimeUtc.ToLocalTime().ToString("yyyyMMdd"),
+                    SanitizeName(evt.ComputerName));
+                Directory.CreateDirectory(dir);
 
-                    // Nama file unik: eventId + ticks untuk sort kronologis
-                    string fileName = $"{evt.EventId}_{evt.EventTimeUtc.Ticks}.json";
-                    string filePath = Path.Combine(dir, fileName);
+                // Nama file unik: eventId + ticks — concurrent writes ke file berbeda aman
+                string fileName = $"{evt.EventId}_{evt.EventTimeUtc.Ticks}.json";
+                string filePath = Path.Combine(dir, fileName);
 
-                    // Idempotent — kalau sudah ada (replay), skip
-                    if (File.Exists(filePath))
-                        return;
+                // Idempotent — kalau sudah ada (replay), skip tanpa lock
+                if (File.Exists(filePath))
+                    return;
 
-                    string content = JsonConvert.SerializeObject(evt, Formatting.Indented);
-                    string tempPath = filePath + ".tmp";
-                    await File.WriteAllTextAsync(tempPath, content);
-                    File.Move(tempPath, filePath, overwrite: false);
-                }
-                finally
-                {
-                    writeLock.Release();
-                }
+                string content = JsonConvert.SerializeObject(evt, Formatting.Indented);
+                string tempPath = filePath + ".tmp";
+                await File.WriteAllTextAsync(tempPath, content);
+                // File.Move atomic di Windows (same-volume). overwrite: false agar idempotent
+                // kalau dua thread race ke file yang sama — salah satu akan throw IOException,
+                // yang di-swallow oleh catch di bawah. Data tidak corrupt.
+                File.Move(tempPath, filePath, overwrite: false);
             }
-            catch { /* fire-and-forget, jangan crash service */ }
+            catch { /* fire-and-forget */ }
         }
 
         /// <summary>
@@ -237,6 +236,15 @@ namespace EventLogOutEmployeeService
         private readonly string pendingDirectoryPath;
         private readonly SemaphoreSlim fileLock = new SemaphoreSlim(1, 1);
 
+        // ── In-memory cache ──────────────────────────────────────────────────────
+        // Semua query (GroupHas6006, FindMostRecent, dll) pakai cache ini — tidak
+        // perlu disk read setiap call. Cache di-init dari disk sekali di constructor,
+        // lalu di-sync otomatis setiap kali ada write/delete.
+        // fileLock tetap melindungi cache + disk secara bersamaan.
+        private readonly Dictionary<string, QueuedAttendanceEvent> _cache =
+            new Dictionary<string, QueuedAttendanceEvent>(StringComparer.OrdinalIgnoreCase);
+        private bool _cacheInitialized = false;
+
         private static readonly TimeSpan DedupWindow = TimeSpan.FromSeconds(30);
 
         public PersistentEventQueue(string queueDirectoryPath)
@@ -247,6 +255,31 @@ namespace EventLogOutEmployeeService
             CleanupOrphanedTempFiles();
         }
 
+        // ── Cache helpers ────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Pastikan cache sudah di-populate dari disk. Dipanggil sekali dari dalam fileLock.
+        /// Setelah ini, semua operasi baca pakai _cache langsung.
+        /// </summary>
+        private async Task EnsureCacheAsync()
+        {
+            if (_cacheInitialized) return;
+            var items = await LoadAllFromDiskAsync();
+            _cache.Clear();
+            foreach (var item in items)
+                _cache[item.QueueId] = item;
+            _cacheInitialized = true;
+        }
+
+        private List<QueuedAttendanceEvent> GetCachedList()
+            => _cache.Values.ToList();
+
+        private void CachePut(QueuedAttendanceEvent item)
+            => _cache[item.QueueId] = item;
+
+        private void CacheRemove(string queueId)
+            => _cache.Remove(queueId);
+
         public async Task<bool> EnqueueIfNotDuplicateAsync(
             QueuedAttendanceEvent item,
             CancellationToken cancellationToken = default)
@@ -254,7 +287,8 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                await EnsureCacheAsync();
+                var items = GetCachedList();
 
                 var existing = items.FirstOrDefault(x =>
                     x.EventId == item.EventId &&
@@ -272,6 +306,8 @@ namespace EventLogOutEmployeeService
                         item.LastDispatchError = existing.LastDispatchError;
                         await WriteItemInternalAsync(item);
                         await DeleteItemInternalAsync(existing.QueueId);
+                        CachePut(item);
+                        CacheRemove(existing.QueueId);
                         return true;
                     }
 
@@ -291,6 +327,7 @@ namespace EventLogOutEmployeeService
                 }
 
                 await WriteItemInternalAsync(item);
+                CachePut(item);
                 return true;
             }
             finally
@@ -304,7 +341,8 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
+                await EnsureCacheAsync();
+                var items = GetCachedList();
                 return items.Count == 0 ? null : SortQueue(items)[0];
             }
             finally
@@ -318,8 +356,9 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = SortQueue(await ReadAllInternalAsync());
-                return items.FirstOrDefault(x => !x.NextRetryAtUtc.HasValue || x.NextRetryAtUtc.Value <= utcNow);
+                await EnsureCacheAsync();
+                return SortQueue(GetCachedList())
+                    .FirstOrDefault(x => !x.NextRetryAtUtc.HasValue || x.NextRetryAtUtc.Value <= utcNow);
             }
             finally
             {
@@ -332,13 +371,40 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                var retries = items
-                    .Where(x => x.NextRetryAtUtc.HasValue)
-                    .Select(x => x.NextRetryAtUtc!.Value)
-                    .ToList();
+                await EnsureCacheAsync();
+                DateTime? min = null;
+                foreach (var item in _cache.Values)
+                {
+                    if (item.NextRetryAtUtc.HasValue &&
+                        (!min.HasValue || item.NextRetryAtUtc.Value < min.Value))
+                        min = item.NextRetryAtUtc.Value;
+                }
+                return min;
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
 
-                return retries.Count == 0 ? null : retries.Min();
+        /// <summary>
+        /// #2: Cek apakah raw event sudah fully dispatched di queue.
+        /// Pakai in-memory cache — tidak scan disk. Aman dari blocking GetAwaiter().GetResult().
+        /// </summary>
+        public async Task<bool> IsFullyDispatchedAsync(
+            int eventId, string computerName, DateTime eventTimeUtc,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
+                    x.EventId == eventId &&
+                    x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                    Math.Abs((x.EventTime - eventTimeUtc).TotalSeconds) < 5 &&
+                    x.RawRecordDispatched &&
+                    x.SummaryDispatched);
             }
             finally
             {
@@ -351,8 +417,8 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                return items.Any(x =>
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
                     x.EventId == 6006 &&
                     x.ShutdownGroupId == groupId &&
                     !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase));
@@ -372,8 +438,8 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                return items.Any(x =>
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
                     x.EventId == 6006 &&
                     x.ShutdownGroupId == groupId &&
                     !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) &&
@@ -400,8 +466,8 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                return items.Any(x =>
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
                     (x.EventId == 4624 || x.EventId == 6005) &&
                     x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
                     x.EventTime > afterTimeUtc &&
@@ -418,8 +484,8 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                return items.Any(x =>
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
                     x.ShutdownGroupId == groupId &&
                     !x.SummaryDispatched &&
                     GetStaticShutdownPriority(x.EventId, x.EventType) > thanPriority);
@@ -448,7 +514,9 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
+                await EnsureCacheAsync();
                 await DeleteItemInternalAsync(queueId);
+                CacheRemove(queueId);
             }
             finally
             {
@@ -465,7 +533,10 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                QueuedAttendanceEvent? item = await ReadByIdInternalAsync(queueId);
+                await EnsureCacheAsync();
+                // Baca dari cache dulu, fallback ke disk kalau belum ada
+                if (!_cache.TryGetValue(queueId, out var item))
+                    item = await ReadByIdInternalAsync(queueId);
                 if (item == null)
                     return;
 
@@ -476,6 +547,7 @@ namespace EventLogOutEmployeeService
                     item.SummaryDispatched = summaryDispatched.Value;
 
                 await WriteItemInternalAsync(item);
+                CachePut(item);
             }
             finally
             {
@@ -493,7 +565,9 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                QueuedAttendanceEvent? item = await ReadByIdInternalAsync(queueId);
+                await EnsureCacheAsync();
+                if (!_cache.TryGetValue(queueId, out var item))
+                    item = await ReadByIdInternalAsync(queueId);
                 if (item == null)
                     return;
 
@@ -501,6 +575,7 @@ namespace EventLogOutEmployeeService
                 item.NextRetryAtUtc = nextRetryAtUtc;
                 item.LastDispatchError = lastDispatchError;
                 await WriteItemInternalAsync(item);
+                CachePut(item);
             }
             finally
             {
@@ -513,7 +588,9 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
+                await EnsureCacheAsync();
                 await WriteItemInternalAsync(item);
+                CachePut(item);
             }
             finally
             {
@@ -526,11 +603,12 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                foreach (var item in items.Where(x => x.ShutdownGroupId == groupId && !x.ShutdownGroupIsRestart))
+                await EnsureCacheAsync();
+                foreach (var item in _cache.Values.Where(x => x.ShutdownGroupId == groupId && !x.ShutdownGroupIsRestart).ToList())
                 {
                     item.ShutdownGroupIsRestart = true;
                     await WriteItemInternalAsync(item);
+                    CachePut(item);
                 }
             }
             finally
@@ -544,11 +622,12 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                foreach (var item in items.Where(x => x.ShutdownGroupId == groupId && x.QueueId != exceptQueueId && !x.SummaryDispatched))
+                await EnsureCacheAsync();
+                foreach (var item in _cache.Values.Where(x => x.ShutdownGroupId == groupId && x.QueueId != exceptQueueId && !x.SummaryDispatched).ToList())
                 {
                     item.SummaryDispatched = true;
                     await WriteItemInternalAsync(item);
+                    CachePut(item);
                 }
             }
             finally
@@ -562,7 +641,8 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                return (await ReadAllInternalAsync()).Count;
+                await EnsureCacheAsync();
+                return _cache.Count;
             }
             finally
             {
@@ -575,7 +655,8 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                return SortQueue(await ReadAllInternalAsync());
+                await EnsureCacheAsync();
+                return SortQueue(GetCachedList());
             }
             finally
             {
@@ -588,18 +669,21 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
+                await EnsureCacheAsync();
                 string workDate = beforeTimeUtc.ToLocalTime().ToString("yyyy-MM-dd");
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                var latest = items
-                    .Where(x =>
-                        (x.EventId == 4624 || x.EventId == 6005) &&
+                QueuedAttendanceEvent? latest = null;
+                foreach (var x in _cache.Values)
+                {
+                    if ((x.EventId == 4624 || x.EventId == 6005) &&
                         x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
                         x.EventTime <= beforeTimeUtc &&
                         x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
                         !string.IsNullOrWhiteSpace(x.Username))
-                    .OrderByDescending(x => x.EventTime)
-                    .FirstOrDefault();
-
+                    {
+                        if (latest == null || x.EventTime > latest.EventTime)
+                            latest = x;
+                    }
+                }
                 return latest?.Username;
             }
             finally
@@ -613,18 +697,21 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
+                await EnsureCacheAsync();
                 string workDate = beforeTimeUtc.ToLocalTime().ToString("yyyy-MM-dd");
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                var latest = items
-                    .Where(x =>
-                        x.EventId == 4624 &&
+                QueuedAttendanceEvent? latest = null;
+                foreach (var x in _cache.Values)
+                {
+                    if (x.EventId == 4624 &&
                         x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
                         x.EventTime <= beforeTimeUtc &&
                         x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
                         !string.IsNullOrWhiteSpace(x.Username))
-                    .OrderByDescending(x => x.EventTime)
-                    .FirstOrDefault();
-
+                    {
+                        if (latest == null || x.EventTime > latest.EventTime)
+                            latest = x;
+                    }
+                }
                 return latest?.Username;
             }
             finally
@@ -641,20 +728,20 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                var first = items
-                    .Where(x =>
-                        x.EventId == 4624 &&
+                await EnsureCacheAsync();
+                QueuedAttendanceEvent? first = null;
+                foreach (var x in _cache.Values)
+                {
+                    if (x.EventId == 4624 &&
                         x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
                         x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
                         !string.IsNullOrWhiteSpace(x.Username))
-                    .OrderBy(x => x.EventTime)
-                    .FirstOrDefault();
-
-                if (first == null)
-                    return null;
-
-                return (first.Username, first.EventTime);
+                    {
+                        if (first == null || x.EventTime < first.EventTime)
+                            first = x;
+                    }
+                }
+                return first == null ? null : (first.Username, first.EventTime);
             }
             finally
             {
@@ -671,28 +758,27 @@ namespace EventLogOutEmployeeService
             await fileLock.WaitAsync(cancellationToken);
             try
             {
-                List<QueuedAttendanceEvent> items = await ReadAllInternalAsync();
-                var first = items
-                    .Where(x =>
-                        x.EventId == 4624 &&
+                await EnsureCacheAsync();
+                QueuedAttendanceEvent? first = null;
+                foreach (var x in _cache.Values)
+                {
+                    if (x.EventId == 4624 &&
                         x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
                         x.EventTime >= notBeforeUtc &&
                         x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
                         !string.IsNullOrWhiteSpace(x.Username))
-                    .OrderBy(x => x.EventTime)
-                    .FirstOrDefault();
-
-                if (first == null)
-                    return null;
-
-                return (first.Username, first.EventTime);
+                    {
+                        if (first == null || x.EventTime < first.EventTime)
+                            first = x;
+                    }
+                }
+                return first == null ? null : (first.Username, first.EventTime);
             }
             finally
             {
                 fileLock.Release();
             }
         }
-
         private static bool ShouldReplaceExistingLogin(QueuedAttendanceEvent existing, QueuedAttendanceEvent incoming)
         {
             if (incoming.EventTime < existing.EventTime)
@@ -750,7 +836,9 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        private async Task<List<QueuedAttendanceEvent>> ReadAllInternalAsync()
+        // LoadAllFromDiskAsync: hanya dipanggil sekali dari EnsureCacheAsync saat init.
+        // Setelah cache ter-populate, semua baca dari _cache, tidak dari disk.
+        private async Task<List<QueuedAttendanceEvent>> LoadAllFromDiskAsync()
         {
             EnsureQueueDirectories();
             var items = new List<QueuedAttendanceEvent>();
@@ -773,7 +861,7 @@ namespace EventLogOutEmployeeService
                 }
             }
 
-            return SortQueue(items);
+            return items;
         }
 
         private async Task<QueuedAttendanceEvent?> ReadByIdInternalAsync(string queueId)
