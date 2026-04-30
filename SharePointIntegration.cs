@@ -646,18 +646,10 @@ namespace EventLogOutEmployeeService
 
             if (!IsValidShutdownCandidate(eventId, eventType, shutdownTime, loginTime, expectedTimeOut))
             {
-                // Bedakan dua alasan skip: restart vs anomaly (logout-before-login).
-                bool isRestartSkip = eventId == 1074 && IsRestartEventType(eventType);
-                string skipReason = isRestartSkip
-                    ? "restart event excluded"
-                    : $"anomaly: shutdownTime ({shutdownTime:O}) < loginTime ({loginTime?.ToString("O") ?? "null"}) — logout-before-login guard triggered";
-
                 SafeWriteEventLog("Application",
-                    $"[DBG-Summary] TryUpdateShutdown: SKIP — {skipReason} " +
-                    $"eventId={eventId} eventType='{eventType}' shutdownTime={shutdownTime:O} " +
-                    $"user={username} computer={computerName}",
-                    isRestartSkip ? EventLogEntryType.Information : EventLogEntryType.Warning,
-                    isRestartSkip ? 3013 : 3019);
+                    $"[DBG-Summary] TryUpdateShutdown: SKIP — restart event is excluded " +
+                    $"eventId={eventId} eventType='{eventType}' shutdownTime={shutdownTime:O}",
+                    EventLogEntryType.Information, 3013);
                 return;
             }
 
@@ -958,11 +950,13 @@ namespace EventLogOutEmployeeService
         {
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
-            3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019, 3021, 3022, 3023,
+            3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022, 3023,
             // Dispatch & raw detail
             4010, 4011, 4020, 4021, 4022, 4025,
             // Cleanup progress
             5001, 5002, 5003,
+            // 3019 sengaja TIDAK ada di sini — dipakai untuk anomaly guard (logout-before-login)
+            // yang harus selalu tampil meski VerboseLogging = false.
         };
 
         private async Task<JToken?> FindSummaryItemForShutdownAsync(
@@ -1190,10 +1184,7 @@ namespace EventLogOutEmployeeService
         ///
         /// Rules:
         ///   • 1074 Restart → never written to Summary (not a real end-of-day).
-        ///   • shutdownTime &lt; loginTime → anomaly guard: impossible logout-before-login, skip.
-        ///     Terjadi kalau event shutdown dari hari/sesi sebelumnya ter-dispatch telat dan
-        ///     salah cocok ke summary row hari ini (yesterday fallback, overnight delay, dll).
-        ///   • Selain itu, shutdown event dianggap valid.
+        ///   • Selain restart, shutdown event selalu dianggap valid (tanpa validasi waktu).
         /// </summary>
         private static bool IsValidShutdownCandidate(
             int eventId, string eventType,
@@ -1202,13 +1193,6 @@ namespace EventLogOutEmployeeService
         {
             // 1074 Restart bukan final shutdown — skip
             if (eventId == 1074 && IsRestartEventType(eventType))
-                return false;
-
-            // Anomaly guard: shutdownTime tidak boleh lebih awal dari loginTime row ini.
-            // Kalau terjadi, ini sinyal bahwa event shutdown berasal dari sesi/hari lain
-            // yang salah di-apply ke row ini (misal: yesterday-fallback overshoot, atau
-            // event 42 dari malam sebelumnya yang ter-dispatch setelah service restart).
-            if (loginTime.HasValue && shutdownTime < loginTime.Value)
                 return false;
 
             // Event 42 (Sleep) hanya boleh masuk kalau sudah lolos ShouldUseEvent42AsLastResortAsync.

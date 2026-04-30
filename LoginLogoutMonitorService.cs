@@ -617,13 +617,15 @@ namespace EventLogOutEmployeeService
             1016, 1037, 1038,
             // Debug system event parsing — semua [DBG-*]
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
+            // Debug fallback resolution detail — [DBG-1074] resolved, [DBG-6005] ignored/skip/allow
+            2013, 2014, 2024, 2025,
             // Debug RawEventStore fallback — [DBG-4624], [DBG-6005], [DBG-GetMRU], [DBG-42]
             2027, 2028, 2030, 2031, 2032,
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
             3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
-            // Dispatch detail
-            4002, 4003, 4004, 4005, 4008, 4009, 4010,
+            // Dispatch detail (per-event, terlalu sering di production)
+            4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009, 4010,
             // Event 42 last-resort promotion
             4011,
             // RAW insert success detail
@@ -1252,11 +1254,8 @@ namespace EventLogOutEmployeeService
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
         {
             // Login events (4624 normal, 6005 fallback): summary hanya first login of day.
-            // IsEarlierLoginCandidate: login dari device lain yang lebih awal dari yang eligible —
-            // tetap perlu dispatch ke UpsertDailySummaryLoginAsync untuk patch LoginTime ke nilai
-            // yang lebih awal (multi-device scenario, terutama saat replay setelah service restart).
             if (item.EventId == 4624 || item.EventId == 6005)
-                return item.IsSummaryEligible || item.IsEarlierLoginCandidate;
+                return item.IsSummaryEligible;
 
             // Seluruh group ditandai restart → semua member skip summary.
             // Ini mencakup 4647, 1074, dan 6006 dalam rangkaian restart.
@@ -1449,12 +1448,8 @@ namespace EventLogOutEmployeeService
                 {
                     if (item.EventId == 4624 || item.EventId == 6005)
                     {
-                        string summaryReason = item.IsEarlierLoginCandidate
-                            ? "earlier login candidate (multi-device patch)"
-                            : "first login of day";
-
                         SafeWriteEventLog("Application",
-                            $"[DISPATCH] Sending summary login ({summaryReason}): user={item.Username} computer={item.ComputerName} " +
+                            $"[DISPATCH] Sending summary login: user={item.Username} computer={item.ComputerName} " +
                             $"loginTime={item.LoginTime?.ToString("O") ?? item.EventTime.ToString("O")}",
                             EventLogEntryType.Information, 4004);
 
