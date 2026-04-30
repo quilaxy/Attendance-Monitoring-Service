@@ -198,6 +198,16 @@ namespace EventLogOutEmployeeService
         /// apakah event lain akan muncul kemudian.
         /// </summary>
         public bool IsLastResort42 { get; set; } = false;
+
+        /// <summary>
+        /// True kalau login ini lebih awal dari login eligible yang sudah ada di queue
+        /// untuk user+workDate yang sama (dari device lain).
+        /// IsSummaryEligible = false karena sudah ada yang eligible, tapi event ini
+        /// tetap perlu dispatch ke UpsertDailySummaryLoginAsync untuk patch LoginTime
+        /// ke nilai yang lebih awal. Hanya berlaku skenario multi-device.
+        /// Di-clear (false) setelah summary berhasil di-dispatch.
+        /// </summary>
+        public bool IsEarlierLoginCandidate { get; set; } = false;
     }
 
     public class PersistentEventQueue
@@ -287,13 +297,26 @@ namespace EventLogOutEmployeeService
                 if (item.EventId == 4624 || item.EventId == 6005)
                 {
                     string itemWorkDate = item.EventTime.ToLocalTime().ToString("yyyy-MM-dd");
-                    bool alreadyHasLoginToday = items.Any(x =>
+
+                    // Cari login eligible yang sudah ada di queue untuk user+workDate ini
+                    var existingEligible = items.FirstOrDefault(x =>
                         (x.EventId == 4624 || x.EventId == 6005) &&
                         x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
                         x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == itemWorkDate &&
                         x.IsSummaryEligible);
 
+                    bool alreadyHasLoginToday = existingEligible != null;
                     item.IsSummaryEligible = !alreadyHasLoginToday;
+
+                    // Multi-device: kalau sudah ada login eligible tapi login baru ini lebih awal
+                    // (device lain login lebih cepat tapi masuk queue belakangan — terjadi saat replay),
+                    // tandai sebagai EarlierLoginCandidate agar tetap dispatch ke UpsertDailySummaryLoginAsync
+                    // untuk patch LoginTime ke nilai yang lebih awal.
+                    if (alreadyHasLoginToday && existingEligible != null &&
+                        item.EventTime < existingEligible.EventTime)
+                    {
+                        item.IsEarlierLoginCandidate = true;
+                    }
                 }
 
                 await WriteItemInternalAsync(item);

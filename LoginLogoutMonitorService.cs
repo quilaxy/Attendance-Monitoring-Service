@@ -1252,8 +1252,11 @@ namespace EventLogOutEmployeeService
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
         {
             // Login events (4624 normal, 6005 fallback): summary hanya first login of day.
+            // IsEarlierLoginCandidate: login dari device lain yang lebih awal dari yang eligible —
+            // tetap perlu dispatch ke UpsertDailySummaryLoginAsync untuk patch LoginTime ke nilai
+            // yang lebih awal (multi-device scenario, terutama saat replay setelah service restart).
             if (item.EventId == 4624 || item.EventId == 6005)
-                return item.IsSummaryEligible;
+                return item.IsSummaryEligible || item.IsEarlierLoginCandidate;
 
             // Seluruh group ditandai restart → semua member skip summary.
             // Ini mencakup 4647, 1074, dan 6006 dalam rangkaian restart.
@@ -1446,8 +1449,12 @@ namespace EventLogOutEmployeeService
                 {
                     if (item.EventId == 4624 || item.EventId == 6005)
                     {
+                        string summaryReason = item.IsEarlierLoginCandidate
+                            ? "earlier login candidate (multi-device patch)"
+                            : "first login of day";
+
                         SafeWriteEventLog("Application",
-                            $"[DISPATCH] Sending summary login: user={item.Username} computer={item.ComputerName} " +
+                            $"[DISPATCH] Sending summary login ({summaryReason}): user={item.Username} computer={item.ComputerName} " +
                             $"loginTime={item.LoginTime?.ToString("O") ?? item.EventTime.ToString("O")}",
                             EventLogEntryType.Information, 4004);
 
