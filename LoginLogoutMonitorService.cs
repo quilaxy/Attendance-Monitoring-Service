@@ -682,11 +682,11 @@ namespace EventLogOutEmployeeService
                 if (eventId != 4624 && eventId != 4647)
                     continue;
 
-                // Pre-filter 4624: skip irrelevant logon types early
+                // Pre-filter 4624: skip irrelevant logon types dan admin split token early
                 if (eventId == 4624 && entry.Message != null)
                 {
                     int lt = ParseLogonType(entry.Message);
-                    if (!IsRelevantLogonType(lt))
+                    if (!IsRelevantLogonType(lt) || IsAdminSplitTokenLogin(entry.Message))
                         continue;
                 }
 
@@ -880,6 +880,14 @@ namespace EventLogOutEmployeeService
                 int logonType    = raw.LogonType;
 
                 if (eventId == 4624 && !IsRelevantLogonType(logonType))
+                    return;
+
+                // FIX (defense-in-depth): skip admin split token saat replay dari RawEventStore.
+                // Normalnya SaveRawSecurityEventAsync sudah tidak menyimpan event admin ke disk,
+                // tapi file lama (sebelum fix) mungkin masih ada di rawevents\ dan akan di-replay.
+                // MessageExcerpt berisi section "New Logon:" yang include "Linked Logon ID:" dan
+                // "Elevated Token:" — cukup untuk re-detect tanpa full message.
+                if (eventId == 4624 && IsAdminSplitTokenLogin(raw.MessageExcerpt))
                     return;
 
                 string? username = raw.Username;
@@ -2262,6 +2270,14 @@ namespace EventLogOutEmployeeService
                     }
                 }
 
+                // FIX: jangan simpan event admin/privileged ke RawEventStore sama sekali.
+                // Tanpa ini, event 4624 admin tersimpan ke disk dengan Username sudah ter-extract,
+                // lalu saat ProcessRawSecurityEventAsync replay — yang tidak punya akses ke
+                // full message — tidak bisa re-check split token dan akun admin lolos masuk queue.
+                // IsAdminSplitTokenLogin cek Linked Logon ID non-0x0 DAN Elevated Token: Yes.
+                if (eventId == 4624 && IsAdminSplitTokenLogin(message ?? excerpt))
+                    return;
+
                 string? username = message != null ? GetUsernameFromEvent(message, eventId) : null;
                 string? sid      = message != null ? GetUserSidFromSecurityEvent(message, eventId) : null;
                 int logonType    = (eventId == 4624 && message != null) ? ParseLogonType(message) : 0;
@@ -2421,23 +2437,45 @@ namespace EventLogOutEmployeeService
         /// (high integrity) dan satu dengan Elevated Token: No (filtered standard token).
         /// Keduanya punya Linked Logon ID non-zero yang saling pointing satu sama lain.
         ///
-        /// Kalau Linked Logon ID != 0x0000000000000000 → ini bagian dari split token pair
-        /// → skip kedua event, karena login admin tidak perlu di-record sebagai attendance.
+        /// Dua kondisi ANY-of yang menyebabkan event di-skip:
+        ///   1. Linked Logon ID (TargetLinkedLogonId) != 0x0  → bagian dari UAC split token pair.
+        ///      Berlaku untuk KEDUA event (Elevated Token Yes maupun No) karena keduanya
+        ///      punya linked logon ID yang saling pointing.
+        ///   2. Elevated Token = Yes (%%1842 di XML / "Elevated Token: Yes" di plain-text)
+        ///      → token high-integrity milik akun admin/privileged; tidak relevan untuk absensi.
+        ///
+        /// Catatan: %%1843 = No (non-elevated, user biasa) → LOLOS; %%1842 = Yes → SKIP.
         /// </summary>
         private static bool IsAdminSplitTokenLogin(string? message)
         {
             if (string.IsNullOrEmpty(message)) return false;
             try
             {
-                var match = Regex.Match(message,
-                    @"Linked Logon ID:\s*(0x[0-9A-Fa-f]+)",
+                // ── Cek 1: Linked Logon ID non-zero ─────────────────────────────────
+                // "Linked Logon ID:\t\t0x42e9e44"  (plain-text EventLog format)
+                // "TargetLinkedLogonId: 0x42e9e44"  (kadang muncul di excerpt berbeda)
+                var linkedMatch = Regex.Match(message,
+                    @"(?:Linked Logon ID|TargetLinkedLogonId):\s*(0x[0-9A-Fa-f]+)",
                     RegexOptions.IgnoreCase);
-                if (!match.Success) return false;
+                if (linkedMatch.Success)
+                {
+                    string linkedId = linkedMatch.Groups[1].Value.Trim();
+                    // 0x0 atau 0x0000000000000000 = tidak ada linked logon = bukan split token
+                    if (Convert.ToInt64(linkedId, 16) != 0)
+                        return true;
+                }
 
-                string linkedId = match.Groups[1].Value.Trim();
-                // 0x0 atau 0x0000000000000000 = tidak ada linked logon = bukan split token
-                long parsed = Convert.ToInt64(linkedId, 16);
-                return parsed != 0;
+                // ── Cek 2: Elevated Token = Yes ──────────────────────────────────────
+                // Plain-text format: "Elevated Token:\t\tYes"
+                // XML raw format:    "%%1842"  (Yes) vs "%%1843" (No)
+                // Cukup satu dari dua format ini untuk mendeteksi elevated token.
+                var elevatedMatch = Regex.Match(message,
+                    @"Elevated Token:\s*(?:Yes|%%1842)",
+                    RegexOptions.IgnoreCase);
+                if (elevatedMatch.Success)
+                    return true;
+
+                return false;
             }
             catch { return false; }
         }
