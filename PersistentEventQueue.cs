@@ -14,7 +14,7 @@ namespace EventLogOutEmployeeService
     // SEBELUM diproses ke queue. Tujuan: kalau Security log di-rotate/clear sebelum
     // service sempat replay, data tetap ada di sini dan bisa di-ingest ulang.
     //
-    // Format file: rawevents\{yyyyMMdd}\{computerName}\{eventId}_{ticks}.json
+    // Format file: rawevents\{yyyyMMdd}\{eventId}_{ticks}.json
     // Retention: 7 hari (dibersihkan bersamaan cleanup SharePoint).
     // ─────────────────────────────────────────────────────────────────────────────
 
@@ -57,8 +57,7 @@ namespace EventLogOutEmployeeService
             {
                 string dir = Path.Combine(
                     baseDirectory,
-                    evt.EventTimeUtc.ToLocalTime().ToString("yyyyMMdd"),
-                    SanitizeName(evt.ComputerName));
+                    evt.EventTimeUtc.ToLocalTime().ToString("yyyyMMdd"));
                 Directory.CreateDirectory(dir);
 
                 // Nama file unik: eventId + ticks — concurrent writes ke file berbeda aman
@@ -87,17 +86,17 @@ namespace EventLogOutEmployeeService
             => Path.Combine(baseDirectory, localDate.ToString("yyyyMMdd"));
 
         /// <summary>
-        /// Fix 2: Lookup langsung pakai sanitized folder name (sudah uppercase/stripped),
-        /// untuk menghindari double-sanitize saat dipanggil dari ReplayFromRawStore
-        /// yang sudah mendapat folder name dari Directory.GetDirectories.
-        /// RawSecurityEvent.ComputerName di dalam JSON tetap menyimpan nama asli.
+        /// Ambil semua raw event untuk workDate tertentu, sorted ascending.
+        /// Dipakai sebagai fallback kalau Security log lokal sudah ter-rotate.
+        /// Struktur folder flat: rawevents\{yyyyMMdd}\ — tidak ada subfolder per PC
+        /// karena service hanya jalan di satu PC dan ComputerName selalu sama.
         /// </summary>
-        public List<RawSecurityEvent> GetEventsForDateBySanitizedName(string sanitizedName, DateTime localDate, int eventId)
+        public List<RawSecurityEvent> GetEventsForDate(DateTime localDate, int eventId)
         {
             var result = new List<RawSecurityEvent>();
             try
             {
-                string dir = Path.Combine(baseDirectory, localDate.ToString("yyyyMMdd"), sanitizedName);
+                string dir = Path.Combine(baseDirectory, localDate.ToString("yyyyMMdd"));
                 if (!Directory.Exists(dir))
                     return result;
 
@@ -121,40 +120,13 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Ambil semua raw event untuk device + workDate tertentu, sorted ascending.
-        /// Dipakai sebagai fallback kalau Security log lokal sudah ter-rotate.
+        /// Overload dengan computerName untuk backward-compat panggilan dari
+        /// GetRawEventsFromStore dan ResolveFirst4624 — filter post-read by ComputerName.
         /// </summary>
         public List<RawSecurityEvent> GetEventsForDate(string computerName, DateTime localDate, int eventId)
-        {
-            var result = new List<RawSecurityEvent>();
-            try
-            {
-                string dir = Path.Combine(
-                    baseDirectory,
-                    localDate.ToString("yyyyMMdd"),
-                    SanitizeName(computerName));
-
-                if (!Directory.Exists(dir))
-                    return result;
-
-                string prefix = $"{eventId}_";
-                foreach (string file in Directory.GetFiles(dir, $"{prefix}*.json", SearchOption.TopDirectoryOnly))
-                {
-                    try
-                    {
-                        string content = File.ReadAllText(file);
-                        var evt = JsonConvert.DeserializeObject<RawSecurityEvent>(content);
-                        if (evt != null)
-                            result.Add(evt);
-                    }
-                    catch { /* skip corrupt file */ }
-                }
-
-                result.Sort((a, b) => a.EventTimeUtc.CompareTo(b.EventTimeUtc));
-            }
-            catch { /* silent fail */ }
-            return result;
-        }
+            => GetEventsForDate(localDate, eventId)
+                .Where(e => e.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
 
         /// <summary>
         /// Cleanup folder lebih dari RetentionWindow (7 hari).
@@ -182,8 +154,6 @@ namespace EventLogOutEmployeeService
             catch { /* silent fail */ }
         }
 
-        private static string SanitizeName(string name)
-            => string.Concat(name.Split(Path.GetInvalidFileNameChars())).ToUpperInvariant();
     }
 
     public class QueuedAttendanceEvent

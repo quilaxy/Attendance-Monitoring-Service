@@ -784,49 +784,33 @@ namespace EventLogOutEmployeeService
 
                 for (DateTime date = localFrom; date <= localTo; date = date.AddDays(1))
                 {
-                    // Fix 1: pakai rawEventStore.GetDateDirectory() bukan hardcoded ProgramData path
-                    string dateDir = rawEventStore.GetDateDirectory(date);
-                    if (!Directory.Exists(dateDir))
-                        continue;
+                    // Struktur flat: rawevents\{yyyyMMdd}\ — tidak ada subfolder per PC
+                    var events4624 = rawEventStore.GetEventsForDate(date, 4624);
+                    var events4647 = rawEventStore.GetEventsForDate(date, 4647);
 
-                    foreach (string computerDir in Directory.GetDirectories(dateDir))
+                    var allEvents = events4624.Concat(events4647)
+                        .Where(e => e.EventTimeUtc >= replayFrom && e.EventTimeUtc <= replayTo)
+                        .OrderBy(e => e.EventTimeUtc)
+                        .ToList();
+
+                    foreach (var raw in allEvents)
                     {
-                        // Fix 2: computerName dari folder name adalah sanitized (uppercase).
-                        // RawSecurityEvent.ComputerName di dalam JSON menyimpan nama asli.
-                        // Kita pakai folder name hanya sebagai selector untuk GetEventsForDate
-                        // — di dalam method itu SanitizeName dipanggil ulang pada parameter,
-                        // jadi kita pass nama asli dari event JSON, bukan folder name.
-                        // Tapi untuk GetEventsForDate kita perlu folder name agar path match.
-                        string sanitizedName = Path.GetFileName(computerDir);
+                        // Skip kalau event ini sudah fully dispatched di queue
+                        // (beyond DedupWindow 30 detik — tidak akan terdedup otomatis).
+                        if (await IsAlreadyFullyDispatchedInQueueAsync(raw))
+                            continue;
 
-                        var events4624 = rawEventStore.GetEventsForDateBySanitizedName(sanitizedName, date, 4624);
-                        var events4647 = rawEventStore.GetEventsForDateBySanitizedName(sanitizedName, date, 4647);
-
-                        var allEvents = events4624.Concat(events4647)
-                            .Where(e => e.EventTimeUtc >= replayFrom && e.EventTimeUtc <= replayTo)
-                            .OrderBy(e => e.EventTimeUtc)
-                            .ToList();
-
-                        foreach (var raw in allEvents)
+                        try
                         {
-                            // Fix 6: skip kalau event ini sudah fully dispatched di queue
-                            // (beyond DedupWindow 30 detik — tidak akan terdedup otomatis).
-                            // Cek berdasarkan EventId + ComputerName + EventTime exact match.
-                            if (await IsAlreadyFullyDispatchedInQueueAsync(raw))
-                                continue;
-
-                            try
-                            {
-                                await ProcessRawSecurityEventAsync(raw, writeRawRecord: true);
-                                totalProcessed++;
-                            }
-                            catch (Exception ex)
-                            {
-                                SafeWriteEventLog("Application",
-                                    $"[RAW-REPLAY] Error processing raw event id={raw.EventId} " +
-                                    $"computer={raw.ComputerName} time={raw.EventTimeUtc:O}: {ex.Message}",
-                                    EventLogEntryType.Warning, 1036);
-                            }
+                            await ProcessRawSecurityEventAsync(raw, writeRawRecord: true);
+                            totalProcessed++;
+                        }
+                        catch (Exception ex)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[RAW-REPLAY] Error processing raw event id={raw.EventId} " +
+                                $"computer={raw.ComputerName} time={raw.EventTimeUtc:O}: {ex.Message}",
+                                EventLogEntryType.Warning, 1036);
                         }
                     }
                 }
@@ -3543,39 +3527,66 @@ namespace EventLogOutEmployeeService
 
             try
             {
+                // Cari anchor "on behalf of user" (English) atau variannya (non-English).
+                // Semua pattern harus beroperasi SETELAH anchor ini — bukan scan seluruh message —
+                // agar tidak tersangkut path executable di baris pertama seperti:
+                //   "C:\WINDOWS\servicing\TrustedInstaller.exe ... on behalf of user NT AUTHORITY\SYSTEM"
+                // yang menyebabkan Pattern 3 match "servicing", "system32", "uus", dll. sebagai username.
+
                 // Pattern 1 (English): "on behalf of user DOMAIN\User for the following reason"
                 var match = Regex.Match(message, @"on behalf of user\s+([^\r\n]+)", RegexOptions.IgnoreCase);
 
-                // Pattern 2 (non-English locale): "DOMAIN\Username for the following reason"
-                // e.g. Indonesian Windows: "atas nama pengguna DOMAIN\User untuk alasan berikut"
+                // Pattern 2 (non-English / Indonesian): "atas nama pengguna DOMAIN\User untuk alasan"
                 if (!match.Success)
-                    match = Regex.Match(message, @"\\([^\\\s]+)\s+for the following reason", RegexOptions.IgnoreCase);
+                    match = Regex.Match(message,
+                        @"(?:atas nama pengguna|au nom de l'utilisateur|im Auftrag des Benutzers|en nombre del usuario)\s+([^\r\n]+)",
+                        RegexOptions.IgnoreCase);
 
                 if (match.Success)
                 {
                     string candidate = match.Groups[1].Value.Trim();
-                    int reasonIndex = candidate.IndexOf(" for the following reason", StringComparison.OrdinalIgnoreCase);
-                    if (reasonIndex > 0)
-                        candidate = candidate.Substring(0, reasonIndex).Trim();
+
+                    // Buang trailing "for the following reason" / "untuk alasan berikut" dll.
+                    var trailingPattern = new Regex(
+                        @"\s+(?:for the following reason|untuk alasan berikut|pour la raison suivante|aus folgendem Grund|por la siguiente raz[oó]n).*$",
+                        RegexOptions.IgnoreCase);
+                    candidate = trailingPattern.Replace(candidate, string.Empty).Trim();
 
                     candidate = NormalizeDisplayUsername(candidate);
 
                     if (IsValidUsername(candidate))
                         return candidate;
+
+                    // Username dari anchor tidak valid (misal SYSTEM, TrustedInstaller) →
+                    // langsung return null, biarkan caller lakukan fallback ke 4624/queue.
+                    // Jangan lanjut ke Pattern 3 karena anchor sudah ditemukan tapi usernya sistem.
+                    SafeWriteEventLog("Application",
+                        $"[DBG-1074] GetUserFromSystem1074Message: anchor found but username '{candidate}' is system/invalid → fallback to 4624",
+                        EventLogEntryType.Information, 2020);
+                    return null;
                 }
 
-                // Pattern 3 (broad fallback): any "DOMAIN\Username" occurrence in the message.
-                // Last resort for unknown locale formats.
-                var domainMatch = Regex.Match(message, @"[A-Za-z0-9_\-]+\\([A-Za-z0-9_\.\-]+)", RegexOptions.IgnoreCase);
-                if (domainMatch.Success)
+                // Pattern 3 (broad fallback untuk locale tidak dikenal).
+                // DIBATASI: hanya scan dari posisi setelah tanda titik pertama di baris kedua ke bawah,
+                // bukan dari awal message, agar tidak tersangkut path exe di baris pertama.
+                // Strategi: cari baris yang mengandung "DOMAIN\User" tapi bukan path file (tidak ada :\).
+                foreach (string line in message.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
                 {
-                    string candidate = domainMatch.Groups[1].Value.Trim();
-                    if (IsValidUsername(candidate))
+                    // Skip baris yang merupakan path file (ada drive letter seperti C:\)
+                    if (Regex.IsMatch(line, @"[A-Za-z]:\\", RegexOptions.None))
+                        continue;
+
+                    var domainMatch = Regex.Match(line, @"[A-Za-z0-9_\-]+\\([A-Za-z0-9_\.\-]+)", RegexOptions.IgnoreCase);
+                    if (domainMatch.Success)
                     {
-                        SafeWriteEventLog("Application",
-                            $"[DBG-1074] GetUserFromSystem1074Message: patterns 1+2 missed, broad fallback matched '{candidate}'",
-                            EventLogEntryType.Information, 2020);
-                        return candidate;
+                        string candidate = domainMatch.Groups[1].Value.Trim();
+                        if (IsValidUsername(candidate))
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[DBG-1074] GetUserFromSystem1074Message: Pattern 3 fallback matched '{candidate}' from line: '{line.Trim()}'",
+                                EventLogEntryType.Information, 2020);
+                            return candidate;
+                        }
                     }
                 }
             }
@@ -3759,11 +3770,23 @@ namespace EventLogOutEmployeeService
 
         private static readonly HashSet<string> _invalidUsernames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
+            // Akun sistem Windows standar
             "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "NETWORK SERVICE",
-            "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator"
+            "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator",
+            // Nama Windows path component yang terbukti lolos lewat Pattern 3
+            // karena ada di path executable di baris pertama event 1074
+            // (misal C:\WINDOWS\servicing\TrustedInstaller.exe → "servicing")
+            "system32", "syswow64", "servicing", "winsxs", "uus",
+            "trustedinstaller", "svchost", "services", "lsass", "winlogon",
+            "explorer", "consent", "credpro"
         };
 
-        private static readonly string[] _invalidUsernamePrefixes = { "DWM-", "UMFD-", "NT Service" };
+        private static readonly string[] _invalidUsernamePrefixes =
+        {
+            "DWM-", "UMFD-", "NT Service",
+            // Path-relative prefixes yang kadang tersisa setelah NormalizeDisplayUsername
+            "NT AUTHORITY", "BUILTIN"
+        };
 
         // #3: IsValidUsername static — _invalidUsernames dan _invalidUsernamePrefixes sudah
         // static readonly, method-nya juga harus static agar tidak ada implicit instance capture.

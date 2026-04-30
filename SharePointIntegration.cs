@@ -646,10 +646,18 @@ namespace EventLogOutEmployeeService
 
             if (!IsValidShutdownCandidate(eventId, eventType, shutdownTime, loginTime, expectedTimeOut))
             {
+                // Bedakan dua alasan skip: restart vs anomaly (logout-before-login).
+                bool isRestartSkip = eventId == 1074 && IsRestartEventType(eventType);
+                string skipReason = isRestartSkip
+                    ? "restart event excluded"
+                    : $"anomaly: shutdownTime ({shutdownTime:O}) < loginTime ({loginTime?.ToString("O") ?? "null"}) — logout-before-login guard triggered";
+
                 SafeWriteEventLog("Application",
-                    $"[DBG-Summary] TryUpdateShutdown: SKIP — restart event is excluded " +
-                    $"eventId={eventId} eventType='{eventType}' shutdownTime={shutdownTime:O}",
-                    EventLogEntryType.Information, 3013);
+                    $"[DBG-Summary] TryUpdateShutdown: SKIP — {skipReason} " +
+                    $"eventId={eventId} eventType='{eventType}' shutdownTime={shutdownTime:O} " +
+                    $"user={username} computer={computerName}",
+                    isRestartSkip ? EventLogEntryType.Information : EventLogEntryType.Warning,
+                    isRestartSkip ? 3013 : 3019);
                 return;
             }
 
@@ -1182,7 +1190,10 @@ namespace EventLogOutEmployeeService
         ///
         /// Rules:
         ///   • 1074 Restart → never written to Summary (not a real end-of-day).
-        ///   • Selain restart, shutdown event selalu dianggap valid (tanpa validasi waktu).
+        ///   • shutdownTime &lt; loginTime → anomaly guard: impossible logout-before-login, skip.
+        ///     Terjadi kalau event shutdown dari hari/sesi sebelumnya ter-dispatch telat dan
+        ///     salah cocok ke summary row hari ini (yesterday fallback, overnight delay, dll).
+        ///   • Selain itu, shutdown event dianggap valid.
         /// </summary>
         private static bool IsValidShutdownCandidate(
             int eventId, string eventType,
@@ -1191,6 +1202,13 @@ namespace EventLogOutEmployeeService
         {
             // 1074 Restart bukan final shutdown — skip
             if (eventId == 1074 && IsRestartEventType(eventType))
+                return false;
+
+            // Anomaly guard: shutdownTime tidak boleh lebih awal dari loginTime row ini.
+            // Kalau terjadi, ini sinyal bahwa event shutdown berasal dari sesi/hari lain
+            // yang salah di-apply ke row ini (misal: yesterday-fallback overshoot, atau
+            // event 42 dari malam sebelumnya yang ter-dispatch setelah service restart).
+            if (loginTime.HasValue && shutdownTime < loginTime.Value)
                 return false;
 
             // Event 42 (Sleep) hanya boleh masuk kalau sudah lolos ShouldUseEvent42AsLastResortAsync.
