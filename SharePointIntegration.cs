@@ -802,8 +802,18 @@ namespace EventLogOutEmployeeService
             int deletedCount = 0;
             int totalFetched = 0;
 
+            // Filter server-side: hanya fetch item yang dateField < cutoffDate.
+            // Jauh lebih efisien dari fetch-all lalu filter di client — SharePoint yang filter,
+            // bukan kita yang scan semua 23.000+ item hanya untuk hapus beberapa ratus.
+            // Format cutoffDate sebagai ISO 8601 UTC agar OData filter konsisten
+            // dengan format yang disimpan SharePoint (EventTime = UTC, WorkDate = date string).
+            string cutoffStr = cutoffDate.ToString("yyyy-MM-dd");
+            string filter = $"fields/{dateField} lt '{cutoffStr}'";
+
             string? url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items" +
-                          $"?$expand=fields&$select=id,fields&$top=5000";
+                          $"?$expand=fields&$select=id,fields" +
+                          $"&$filter={Uri.EscapeDataString(filter)}" +
+                          $"&$top=500"; // lebih kecil dari sebelumnya — kita hanya fetch yang akan dihapus
 
             while (!string.IsNullOrWhiteSpace(url))
             {
@@ -829,17 +839,8 @@ namespace EventLogOutEmployeeService
                     {
                         try
                         {
-                            var itemFields = item["fields"] as JObject;
-                            string? dateValue = itemFields?[dateField]?.ToString();
-                            if (string.IsNullOrWhiteSpace(dateValue))
-                                continue;
-
-                            if (!DateTime.TryParse(dateValue, out DateTime parsed))
-                                continue;
-
-                            if (parsed >= cutoffDate)
-                                continue;
-
+                            // Server sudah filter dateField < cutoffDate — semua item di sini
+                            // memang perlu dihapus. Tidak perlu filter ulang di sisi client.
                             string? itemId = item["id"]?.ToString();
                             if (string.IsNullOrWhiteSpace(itemId))
                                 continue;
@@ -950,13 +951,11 @@ namespace EventLogOutEmployeeService
         {
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
-            3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022, 3023,
+            3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019, 3021, 3022, 3023,
             // Dispatch & raw detail
             4010, 4011, 4020, 4021, 4022, 4025,
             // Cleanup progress
             5001, 5002, 5003,
-            // 3019 sengaja TIDAK ada di sini — dipakai untuk anomaly guard (logout-before-login)
-            // yang harus selalu tampil meski VerboseLogging = false.
         };
 
         private async Task<JToken?> FindSummaryItemForShutdownAsync(

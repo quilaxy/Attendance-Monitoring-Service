@@ -241,6 +241,11 @@ namespace EventLogOutEmployeeService
 
                             StartCheckpointHeartbeat();
 
+                            SafeWriteEventLog("Attendance-Service",
+                                $"Service ready: replay complete, dispatch running. " +
+                                $"Pending queue: {eventQueue.GetCountAsync().GetAwaiter().GetResult()} item(s).",
+                                EventLogEntryType.Information, 1048);
+
                             // MonitorEvents loop (cleanup + dispatch tasks)
                             MonitorEvents(ct);
                         }
@@ -609,8 +614,8 @@ namespace EventLogOutEmployeeService
         {
             // Checkpoint detail
             1018, 1019, 1020, 1021, 1022, 1025,
-            // Replay progress
-            1030, 1031, 1032, 1033, 1034,
+            // Replay progress (termasuk 1029 "no checkpoint found" — kondisi normal fresh install)
+            1029, 1030, 1031, 1032, 1033, 1034,
             // RawEventStore replay detail
             1036,
             // Live event skip & duplicate skip — normal behavior, bukan error
@@ -632,6 +637,8 @@ namespace EventLogOutEmployeeService
             4020, 4021, 4022, 4025,
             // Cleanup progress detail
             5001, 5002, 5003, 5006,
+            // Catatan: 0 (start), 1048 (ready), 1050 (OnStop), 1051 (OnShutdown)
+            // sengaja TIDAK ada di sini — lifecycle events selalu tampil.
         };
 
         private void SaveReplayCheckpoint(DateTime checkpoint)
@@ -1053,18 +1060,24 @@ namespace EventLogOutEmployeeService
 
         // ─── Lifecycle ───────────────────────────────────────────────────────────
 
-        protected override void OnStop() => HandleServiceStopping("OnStop");
+        protected override void OnStop() => HandleServiceStopping("OnStop", 1050);
 
         /// <summary>
         /// Called by SCM during Windows system shutdown/restart (requires CanShutdown = true).
         /// OnStop() is NOT guaranteed to be called in that scenario.
         /// </summary>
-        protected override void OnShutdown() => HandleServiceStopping("OnShutdown");
+        protected override void OnShutdown() => HandleServiceStopping("OnShutdown", 1051);
 
-        private void HandleServiceStopping(string caller)
+        private void HandleServiceStopping(string caller, int stopEventId)
         {
             try
             {
+                // Log segera saat stop dipanggil — sebelum checkpoint dan cleanup,
+                // agar muncul di Event Viewer meski Windows kill process sebelum selesai.
+                SafeWriteEventLog("Attendance-Service",
+                    $"Service stopping ({caller}).",
+                    EventLogEntryType.Information, stopEventId);
+
                 // ── Step 1: Request extra shutdown time from SCM immediately.
                 // Windows system shutdown gives services only ~5 seconds by default.
                 // RequestAdditionalTime tells SCM we need more — prevents premature kill.
@@ -1122,8 +1135,8 @@ namespace EventLogOutEmployeeService
                 }
 
                 SafeWriteEventLog("Attendance-Service",
-                    $"Service has been successfully shut down ({caller}).",
-                    EventLogEntryType.Information, 0);
+                    $"Service stopped ({caller}).",
+                    EventLogEntryType.Information, stopEventId);
             }
             catch (Exception ex)
             {
