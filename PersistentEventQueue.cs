@@ -34,7 +34,11 @@ namespace EventLogOutEmployeeService
     public class RawEventStore
     {
         private readonly string baseDirectory;
-        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(7);
+        // Retention 2 hari — cukup untuk cover worst case service restart.
+        // Dengan sc failure dipasang, service restart dalam detik kalau crash.
+        // Data sudah dispatched ke SharePoint jauh sebelum 2 hari berlalu.
+        // Dari sisi compliance (APPI): data minimization — simpan sesingkat mungkin.
+        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(2);
         // #10: writeLock global dihilangkan.
         // File path sudah unik per event: {eventId}_{ticks}.json
         // File.Move (temp→final) atomic di Windows untuk same-volume.
@@ -129,9 +133,12 @@ namespace EventLogOutEmployeeService
                 .ToList();
 
         /// <summary>
-        /// Cleanup folder lebih dari RetentionWindow (7 hari).
+        /// Cleanup folder lebih dari RetentionWindow (2 hari).
+        /// Sebelum menghapus, verifikasi semua file di folder sudah dispatched ke SharePoint
+        /// via eventQueue.IsFullyDispatchedAsync. Kalau ada yang belum, folder di-skip
+        /// dan dicoba lagi di cleanup berikutnya.
         /// </summary>
-        public void CleanupOldDates()
+        public async Task CleanupOldDatesAsync(PersistentEventQueue eventQueue, CancellationToken cancellationToken = default)
         {
             try
             {
@@ -139,19 +146,83 @@ namespace EventLogOutEmployeeService
                 foreach (string dateDir in Directory.GetDirectories(baseDirectory))
                 {
                     string dirName = Path.GetFileName(dateDir);
-                    if (DateTime.TryParseExact(dirName, "yyyyMMdd",
+                    if (!DateTime.TryParseExact(dirName, "yyyyMMdd",
                         System.Globalization.CultureInfo.InvariantCulture,
                         System.Globalization.DateTimeStyles.None, out DateTime dirDate))
+                        continue;
+
+                    if (dirDate.Date >= cutoff.Date)
+                        continue;
+
+                    // Verifikasi semua event di folder ini sudah dispatched ke SharePoint
+                    // sebelum menghapus. Kalau ada yang belum, skip folder ini.
+                    bool allDispatched = await AllEventsDispatchedAsync(dateDir, eventQueue, cancellationToken);
+                    if (!allDispatched)
                     {
-                        if (dirDate.Date < cutoff.Date)
-                        {
-                            try { Directory.Delete(dateDir, recursive: true); }
-                            catch { /* skip if locked */ }
-                        }
+                        SafeRawLog(
+                            $"[RawEventStore] Cleanup SKIP {dirName} — ada event yang belum dispatched ke SharePoint.",
+                            EventLogEntryType.Warning, 5010);
+                        continue;
                     }
+
+                    try
+                    {
+                        Directory.Delete(dateDir, recursive: true);
+                        SafeRawLog(
+                            $"[RawEventStore] Cleanup OK — deleted {dirName} (all events dispatched).",
+                            EventLogEntryType.Information, 5011);
+                    }
+                    catch { /* skip if locked */ }
                 }
             }
             catch { /* silent fail */ }
+        }
+
+        /// <summary>
+        /// Cek apakah semua file JSON di folder sudah fully dispatched di queue.
+        /// Event yang tidak ada di queue (sudah dihapus dari queue setelah dispatch) dianggap selesai.
+        /// Event yang ada di queue tapi belum dispatched → return false.
+        /// </summary>
+        private static async Task<bool> AllEventsDispatchedAsync(
+            string dateDir, PersistentEventQueue eventQueue, CancellationToken cancellationToken)
+        {
+            try
+            {
+                foreach (string file in Directory.GetFiles(dateDir, "*.json", SearchOption.TopDirectoryOnly))
+                {
+                    try
+                    {
+                        string content = File.ReadAllText(file);
+                        var evt = Newtonsoft.Json.JsonConvert.DeserializeObject<RawSecurityEvent>(content);
+                        if (evt == null) continue;
+
+                        // Cek di queue — kalau masih ada dan belum dispatched, block cleanup
+                        bool dispatched = await eventQueue.IsFullyDispatchedAsync(
+                            evt.EventId, evt.ComputerName, evt.EventTimeUtc, cancellationToken);
+
+                        // IsFullyDispatchedAsync return false kalau:
+                        // (a) event masih di queue dan belum selesai → block
+                        // (b) event sudah tidak ada di queue (sudah dihapus setelah dispatch) → anggap done
+                        // Bedakan (a) dan (b) dengan cek apakah event ada di queue sama sekali
+                        bool existsInQueue = await eventQueue.ExistsInQueueAsync(
+                            evt.EventId, evt.ComputerName, evt.EventTimeUtc, cancellationToken);
+
+                        if (existsInQueue && !dispatched)
+                            return false;
+                    }
+                    catch { /* skip corrupt file */ }
+                }
+                return true;
+            }
+            catch { return true; } // kalau tidak bisa baca folder, anggap aman untuk dihapus
+        }
+
+        private static void SafeRawLog(string message, EventLogEntryType type, int eventId)
+        {
+            if (!LoginLogoutMonitorService.VerboseLogging && eventId == 5011)
+                return;
+            try { EventLog.WriteEntry("Application", message, type, eventId); }
+            catch { }
         }
 
     }
@@ -398,6 +469,31 @@ namespace EventLogOutEmployeeService
                     Math.Abs((x.EventTime - eventTimeUtc).TotalSeconds) < 5 &&
                     x.RawRecordDispatched &&
                     x.SummaryDispatched);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Cek apakah event masih ada di queue (terlepas dari dispatch status-nya).
+        /// Dipakai oleh RawEventStore.CleanupOldDatesAsync untuk membedakan:
+        ///   - Event sudah tidak ada di queue (sudah selesai + dihapus) → aman dihapus dari rawevents
+        ///   - Event masih ada di queue tapi belum dispatched → tahan, jangan hapus rawevents
+        /// </summary>
+        public async Task<bool> ExistsInQueueAsync(
+            int eventId, string computerName, DateTime eventTimeUtc,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
+                    x.EventId == eventId &&
+                    x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                    Math.Abs((x.EventTime - eventTimeUtc).TotalSeconds) < 5);
             }
             finally
             {

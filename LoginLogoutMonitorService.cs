@@ -1302,14 +1302,16 @@ namespace EventLogOutEmployeeService
         /// <summary>
         /// Priority untuk shutdown group — harus konsisten dengan SharePointIntegration.GetShutdownPriority.
         /// Dipakai untuk menentukan event mana di group yang boleh dispatch summary saat timer expired.
+        ///   4647 = 6 (HIGHEST — explicit logoff, reliable di sleep/fast-startup/hibernate)
+        ///   6006 confirmed = 5 | 1074 shutdown = 4 | 6008/41 = 1 | 42 = 0 (last resort)
         /// </summary>
         private static int GetShutdownEventPriority(int eventId, string eventType)
         {
+            if (eventId == 4647) return 6; // Priority tertinggi — explicit user logoff dari Security log
             if (eventId == 6006)
                 return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 5;
             if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
                                 && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 4;
-            if (eventId == 4647) return 2;
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
             if (eventId == 42)   return 0; // last resort — hanya kalau tidak ada event lain
@@ -1367,7 +1369,10 @@ namespace EventLogOutEmployeeService
                 }
 
                 // Shutdown group hold: tahan summary dispatch untuk 4647/1074/6006 sampai
-                // group lengkap (ada 6006) atau timer 10 detik habis.
+                // group lengkap atau timer 10 detik habis.
+                // Priority: 4647 (6) > 6006 confirmed (5) > 1074 (4).
+                // Kalau ada 4647 di group → 4647 yang dispatch, yang lain di-skip.
+                // Kalau tidak ada 4647 → 6006 confirmed yang dispatch kalau ada, fallback 1074.
                 // Raw tetap dispatch langsung — group hanya berlaku untuk summary.
                 if (needsSummary && item.ShutdownGroupId != null && item.ShutdownGroupHoldUntil.HasValue)
                 {
@@ -1393,14 +1398,30 @@ namespace EventLogOutEmployeeService
                         bool confirmedExists = await eventQueue.GroupHasConfirmed6006Async(item.ShutdownGroupId);
                         if (confirmedExists)
                         {
-                            // Confirmed 6006 ada di group → 6006 yang akan kirim summary dengan priority tertinggi.
-                            needsSummary = false;
-                            SafeWriteEventLog("Application",
-                                $"[DISPATCH] Shutdown group: confirmed 6006 in group, skipping summary for " +
-                                $"queueId={item.QueueId} eventId={item.EventId}",
-                                EventLogEntryType.Information, 4009);
-                            await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
-                            item.SummaryDispatched = true;
+                            // 4647 priority lebih tinggi dari confirmed 6006 (6 vs 5) —
+                            // kalau item ini 4647, biarkan dia dispatch, bukan 6006.
+                            if (item.EventId == 4647)
+                            {
+                                // 4647 menang — mark 6006 di group sebagai summaryDispatched
+                                // agar 6006 tidak kirim summary lagi setelahnya.
+                                await eventQueue.MarkGroupSummaryDispatchedAsync(item.ShutdownGroupId, exceptQueueId: item.QueueId);
+                                SafeWriteEventLog("Application",
+                                    $"[DISPATCH] Shutdown group: 4647 takes priority over confirmed 6006. " +
+                                    $"queueId={item.QueueId} groupId={item.ShutdownGroupId}",
+                                    EventLogEntryType.Information, 4009);
+                                // needsSummary tetap true — 4647 yang dispatch
+                            }
+                            else
+                            {
+                                // Bukan 4647 — confirmed 6006 yang dispatch summary (priority lebih tinggi).
+                                needsSummary = false;
+                                SafeWriteEventLog("Application",
+                                    $"[DISPATCH] Shutdown group: confirmed 6006 in group, skipping summary for " +
+                                    $"queueId={item.QueueId} eventId={item.EventId}",
+                                    EventLogEntryType.Information, 4009);
+                                await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
+                                item.SummaryDispatched = true;
+                            }
                         }
                         else
                         {
@@ -1575,7 +1596,7 @@ namespace EventLogOutEmployeeService
                     if (lastLocalCleanupDate.Date < now.Date)
                     {
                         await summaryCache.CleanupOldEntriesAsync(cancellationToken);
-                        rawEventStore.CleanupOldDates();
+                        await rawEventStore.CleanupOldDatesAsync(eventQueue, cancellationToken);
                         lastLocalCleanupDate = now.Date;
                         SafeWriteEventLog("Application",
                             $"[CLEANUP] Local cleanup done (summaryCache + rawEvents) for {now.Date:yyyy-MM-dd}.",

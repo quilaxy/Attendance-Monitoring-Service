@@ -587,6 +587,49 @@ namespace EventLogOutEmployeeService
                 await summaryCache.AddAsync(summaryKey);
         }
 
+        /// <summary>
+        /// Buat summary row minimal — hanya Title, Username, WorkDate.
+        /// Dipakai sebagai fallback saat 4624 tidak ter-capture (Security log overwrite).
+        /// Semua kolom lain (LoginTime, LoginDevice, dll) sengaja kosong.
+        /// ShutdownTime akan diisi oleh caller setelah row ini terbuat.
+        /// Yang penting: row dengan Title+WorkDate sudah ada sehingga ShutdownTime tidak terlewat.
+        /// </summary>
+        private async Task CreateEmptySummaryRowAsync(
+            HttpClient client, string username,
+            DateTime shutdownTime, SummaryCache? summaryCache = null)
+        {
+            string workDate   = shutdownTime.ToLocalTime().ToString("yyyy-MM-dd");
+            string summaryKey = BuildSummaryKey(username, workDate);
+
+            var fieldsData = new JObject
+            {
+                ["Title"]    = summaryKey,
+                ["Username"] = username,
+                ["WorkDate"] = workDate
+            };
+
+            var postData = new JObject { ["fields"] = fieldsData };
+            var content  = new StringContent(JsonConvert.SerializeObject(postData), Encoding.UTF8, "application/json");
+
+            var response = await client.PostAsync(
+                $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items",
+                content);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                string body = await response.Content.ReadAsStringAsync();
+                throw new InvalidOperationException(
+                    $"Failed to create empty summary row for key '{summaryKey}'. Status={response.StatusCode} Body={body}");
+            }
+
+            SafeWriteEventLog("Application",
+                $"[DBG-Summary] CreateEmptySummaryRow: created minimal row summaryKey={summaryKey}",
+                EventLogEntryType.Warning, 3028);
+
+            if (summaryCache != null)
+                await summaryCache.AddAsync(summaryKey);
+        }
+
         // ── Summary list — Shutdown ───────────────────────────────────────────────
 
         /// <summary>
@@ -619,11 +662,40 @@ namespace EventLogOutEmployeeService
             var summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime, summaryCache);
             if (summaryItem == null)
             {
+                // Fix B: row tidak ditemukan — kemungkinan 4624 tidak ter-capture karena Security log
+                // overwrite sebelum service sempat replay. Daripada skip dan ShutdownTime hilang,
+                // buat row baru dengan LoginTime = shutdownTime sebagai estimasi (data minimal),
+                // lalu lanjutkan untuk tulis ShutdownTime ke row yang baru dibuat.
+                // Username sudah diketahui dari 4647 — tidak perlu resolve dari event baru.
                 SafeWriteEventLog("Application",
-                    $"[DBG-Summary] TryUpdateShutdown: SKIP — no matching summary row for user={username} " +
-                    $"computer={computerName} shutdownTime={shutdownTime:O}",
-                    EventLogEntryType.Information, 3011);
-                return;
+                    $"[DBG-Summary] TryUpdateShutdown: no summary row found for user={username} " +
+                    $"computer={computerName} shutdownTime={shutdownTime:O}. " +
+                    $"Creating estimated row — login event likely missed due to Security log overwrite.",
+                    EventLogEntryType.Warning, 3025);
+
+                try
+                {
+                    // Buat row minimal — hanya Title, Username, WorkDate.
+                    // Semua kolom lain kosong, ShutdownTime diisi setelah row terbuat.
+                    await CreateEmptySummaryRowAsync(client, username, shutdownTime, summaryCache);
+
+                    // Fetch row yang baru dibuat untuk lanjutkan update ShutdownTime
+                    summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime, summaryCache);
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown: failed to create estimated row for user={username}: {ex.Message}",
+                        EventLogEntryType.Warning, 3026);
+                }
+
+                if (summaryItem == null)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown: SKIP — could not create or find summary row for user={username}",
+                        EventLogEntryType.Warning, 3027);
+                    return;
+                }
             }
 
             string? itemId  = summaryItem?["id"]?.ToString();
