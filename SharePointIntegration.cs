@@ -740,10 +740,19 @@ namespace EventLogOutEmployeeService
             // isNewSession: ada ShutdownTime sebelumnya, dan incoming lebih baru.
             // Artinya user sudah login lagi (sesi baru) lalu shutdown lagi.
             // Dalam kasus ini, abaikan priority lama — shutdown terbaru selalu lebih relevan.
-            // Contoh: 6006 jam 09:00 (priority 5) lalu login jam 13:00 lalu 4647 jam 17:00 (priority 2)
-            // → tanpa fix: 4647 di-skip karena priority lebih rendah, ShutdownTime tetap 09:00 ❌
+            // Contoh: 6006 jam 09:00 (priority 5) lalu login jam 13:00 lalu 4647 jam 17:00 (priority 6)
             // → dengan fix: 4647 jam 17:00 > 6006 jam 09:00 → reset priority, tulis 17:00 ✅
-            bool isNewSession = currentShutdown.HasValue && shutdownTime > currentShutdown.Value;
+            //
+            // EXCEPTION: Event 42 (Sleep/Hibernate) tidak pernah dianggap isNewSession.
+            // 42 muncul sebagai side effect fast startup hibernate — bukan intentional user action.
+            // Workflow user: harus klik shutdown (4647 selalu ada), tidak boleh sleep.
+            // Jadi 42 yang datang setelah 4647 (misal selisih beberapa menit) bukan sesi baru —
+            // dia hanya artifact fast startup. Kalau sudah ada ShutdownTime dari event lain,
+            // 42 harus selalu kalah via priority check normal (priority -1).
+            // 42 tetap bisa jadi ShutdownTime kalau belum ada event lain sama sekali (last resort).
+            bool isNewSession = eventId != 42
+                && currentShutdown.HasValue
+                && shutdownTime > currentShutdown.Value;
             if (isNewSession)
             {
                 SafeWriteEventLog("Application",
