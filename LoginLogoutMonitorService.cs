@@ -190,13 +190,13 @@ namespace EventLogOutEmployeeService
             // setelah setup dasar selesai. RequestAdditionalTime diperpanjang dari background.
             RequestAdditionalTime(30_000);
 
-            // GAP FIX: Aktifkan listener SEBELUM apapun — termasuk sebelum delay network.
-            // Sebelumnya EnableRaisingEvents = true baru di-set setelah delay 10 detik +
-            // PrimeFirstLogon + RetryPending selesai — artinya ada gap ~12 detik di mana
+            // GAP FIX: Aktifkan listener SEBELUM apapun — sebelum init, sebelum replay.
+            // Sebelumnya EnableRaisingEvents = true baru di-set setelah delay 10 detik (legacy
+            // network wait) + PrimeFirstLogon + RetryPending selesai — ada gap ~12 detik di mana
             // 4624 yang masuk saat boot tidak tertangkap sama sekali.
-            // Dengan dipindah ke sini, event handler aktif hampir bersamaan dengan service
-            // spawn oleh SCM — gap diperkecil dari ~12 detik menjadi <1 detik.
-            // RawEventStore akan nulis 4624 ke disk real-time meski init belum selesai.
+            // Delay 10 detik juga sudah dihapus karena tidak perlu lagi — RawEventStore nulis
+            // event ke disk real-time, network failure di-handle oleh retry queue.
+            // Dengan dua fix ini, gap diperkecil dari ~12 detik menjadi <1 detik.
             if (securityEventLog != null)
                 securityEventLog.EnableRaisingEvents = true;
             if (systemEventLog != null)
@@ -217,8 +217,11 @@ namespace EventLogOutEmployeeService
                     SharePointIntegration.ResetNetworkWaitFlag();
                     SharePointIntegration.SetServiceStartTime(serviceStartTime);
 
-                    int delaySeconds = (currentRetry == 1) ? 10 : 3;
-                    Thread.Sleep(delaySeconds * 1000);
+                    // Delay awal dihapus — sebelumnya 10 detik untuk nunggu network ready,
+                    // tapi sekarang tidak perlu karena:
+                    // - RawEventStore sudah nulis event ke disk real-time (tidak bergantung network)
+                    // - Kalau dispatch ke SharePoint gagal → masuk retry queue → otomatis retry
+                    // - Delay justru memperbesar gap antara 4624 login dan service ready
 
                     string publishDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "");
                     Directory.SetCurrentDirectory(publishDirectory);
