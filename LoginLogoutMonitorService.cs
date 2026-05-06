@@ -190,6 +190,18 @@ namespace EventLogOutEmployeeService
             // setelah setup dasar selesai. RequestAdditionalTime diperpanjang dari background.
             RequestAdditionalTime(30_000);
 
+            // GAP FIX: Aktifkan listener SEBELUM apapun — termasuk sebelum delay network.
+            // Sebelumnya EnableRaisingEvents = true baru di-set setelah delay 10 detik +
+            // PrimeFirstLogon + RetryPending selesai — artinya ada gap ~12 detik di mana
+            // 4624 yang masuk saat boot tidak tertangkap sama sekali.
+            // Dengan dipindah ke sini, event handler aktif hampir bersamaan dengan service
+            // spawn oleh SCM — gap diperkecil dari ~12 detik menjadi <1 detik.
+            // RawEventStore akan nulis 4624 ke disk real-time meski init belum selesai.
+            if (securityEventLog != null)
+                securityEventLog.EnableRaisingEvents = true;
+            if (systemEventLog != null)
+                systemEventLog.EnableRaisingEvents = true;
+
             int maxRetries = 5;
             int currentRetry = 0;
             bool started = false;
@@ -232,10 +244,8 @@ namespace EventLogOutEmployeeService
                             PrimeFirstLogonIndexFromQueueAsync(ct).GetAwaiter().GetResult();
                             RetryPendingQueueOnStartupAsync(ct).GetAwaiter().GetResult();
 
-                            if (securityEventLog != null)
-                                securityEventLog.EnableRaisingEvents = true;
-                            if (systemEventLog != null)
-                                systemEventLog.EnableRaisingEvents = true;
+                            // EnableRaisingEvents sudah diaktifkan di OnStart() sebelum delay
+                            // dan sebelum background thread ini jalan — tidak perlu set lagi di sini.
 
                             ReplayMissedEventsFromCheckpoint().GetAwaiter().GetResult();
 
