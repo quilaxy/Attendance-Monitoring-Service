@@ -250,6 +250,12 @@ namespace EventLogOutEmployeeService
                             // selama kita kirim RequestAdditionalTime sebelum deadline.
                             RequestAdditionalTime(120_000);
 
+                            // Self-healing: pastikan startup type tetap Automatic dan
+                            // sc failure recovery action tetap terkonfigurasi.
+                            // Dijalankan setiap service start agar Windows Update atau
+                            // Group Policy yang me-reset konfigurasi ini langsung diperbaiki.
+                            EnsureServiceResilience();
+
                             PrimeFirstLogonIndexFromQueueAsync(ct).GetAwaiter().GetResult();
                             RetryPendingQueueOnStartupAsync(ct).GetAwaiter().GetResult();
 
@@ -304,6 +310,161 @@ namespace EventLogOutEmployeeService
         }
 
         private void EnsurCheckpointBootstrap() => EnsureCheckpointBootstrap();
+
+        // ─── Self-healing: startup type + sc failure ─────────────────────────────
+
+        /// <summary>
+        /// Dipanggil setiap service start dari background startup thread.
+        /// Tujuan: memastikan dua konfigurasi kritis tidak pernah hilang:
+        ///   1. StartupType = Automatic — Windows Update / Group Policy kadang me-reset ke Manual.
+        ///   2. sc failure recovery actions — ter-reset setelah Windows Feature Update.
+        ///
+        /// Kedua operasi pakai Process.Start("sc.exe") karena .NET ServiceController
+        /// tidak expose SetStartMode dan tidak bisa set failure actions.
+        /// Kalau sc.exe gagal (misal akses ditolak), error di-log tapi tidak throw —
+        /// service tetap jalan normal, hanya self-healing yang tidak berhasil.
+        ///
+        /// Tidak perlu elevated check di sini karena service Windows selalu jalan
+        /// sebagai LocalSystem atau akun yang punya hak modify service config.
+        /// </summary>
+        private void EnsureServiceResilience()
+        {
+            try
+            {
+                string serviceName = ServiceName; // nama service dari SCM, set oleh installer
+                if (string.IsNullOrWhiteSpace(serviceName))
+                {
+                    SafeWriteEventLog("Application",
+                        "[RESILIENCE] ServiceName kosong — skip self-healing.",
+                        EventLogEntryType.Warning, 1060);
+                    return;
+                }
+
+                EnsureStartupTypeAutomatic(serviceName);
+                EnsureFailureActions(serviceName);
+            }
+            catch (Exception ex)
+            {
+                // Tidak boleh throw — self-healing gagal tidak boleh crash service.
+                SafeWriteEventLog("Application",
+                    $"[RESILIENCE] EnsureServiceResilience error: {ex.Message}",
+                    EventLogEntryType.Warning, 1060);
+            }
+        }
+
+        /// <summary>
+        /// Cek startup type lewat sc.exe qc, perbaiki ke auto kalau bukan auto.
+        /// sc.exe qc output: "START_TYPE: 2 AUTO_START" atau "3 DEMAND_START" (manual), dll.
+        /// </summary>
+        private void EnsureStartupTypeAutomatic(string serviceName)
+        {
+            try
+            {
+                // Query current start type
+                string qcOutput = RunSc($"qc \"{serviceName}\"");
+
+                // "2   AUTO_START"  → sudah auto, tidak perlu apa-apa
+                // "2   AUTO_START  (DELAYED)" → auto delayed, juga acceptable
+                bool isAlreadyAuto = qcOutput.Contains("AUTO_START", StringComparison.OrdinalIgnoreCase);
+                if (isAlreadyAuto)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RESILIENCE] StartupType sudah AUTO — tidak perlu perubahan.",
+                        EventLogEntryType.Information, 1061);
+                    return;
+                }
+
+                // Bukan auto (manual/disabled) → perbaiki
+                SafeWriteEventLog("Application",
+                    $"[RESILIENCE] StartupType bukan AUTO (output: '{qcOutput.Trim()}') — " +
+                    $"memperbaiki ke auto...",
+                    EventLogEntryType.Warning, 1062);
+
+                string configOutput = RunSc($"config \"{serviceName}\" start= auto");
+
+                SafeWriteEventLog("Application",
+                    $"[RESILIENCE] StartupType diperbaiki ke AUTO. sc config output: '{configOutput.Trim()}'",
+                    EventLogEntryType.Information, 1063);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[RESILIENCE] EnsureStartupTypeAutomatic error: {ex.Message}",
+                    EventLogEntryType.Warning, 1064);
+            }
+        }
+
+        /// <summary>
+        /// Cek apakah sc failure sudah terkonfigurasi lewat sc.exe qfailure.
+        /// Kalau belum ada recovery action (reset= 0, actions kosong), set ulang.
+        ///
+        /// Target config:
+        ///   reset= 86400 (counter reset setelah 24 jam normal)
+        ///   actions= restart/5000/restart/15000/restart/60000
+        /// </summary>
+        private void EnsureFailureActions(string serviceName)
+        {
+            try
+            {
+                string qfailureOutput = RunSc($"qfailure \"{serviceName}\"");
+
+                // Kalau sudah ada "RESTART -- Delay" di output, sc failure sudah terkonfigurasi
+                bool alreadyConfigured = qfailureOutput.Contains("RESTART", StringComparison.OrdinalIgnoreCase) &&
+                                         qfailureOutput.Contains("Delay", StringComparison.OrdinalIgnoreCase);
+                if (alreadyConfigured)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RESILIENCE] sc failure sudah terkonfigurasi — tidak perlu perubahan.",
+                        EventLogEntryType.Information, 1065);
+                    return;
+                }
+
+                // Belum terkonfigurasi → set recovery actions
+                SafeWriteEventLog("Application",
+                    $"[RESILIENCE] sc failure belum terkonfigurasi — memperbaiki...",
+                    EventLogEntryType.Warning, 1066);
+
+                string failureOutput = RunSc(
+                    $"failure \"{serviceName}\" reset= 86400 " +
+                    $"actions= restart/5000/restart/15000/restart/60000");
+
+                SafeWriteEventLog("Application",
+                    $"[RESILIENCE] sc failure dikonfigurasi ulang. Output: '{failureOutput.Trim()}'",
+                    EventLogEntryType.Information, 1067);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[RESILIENCE] EnsureFailureActions error: {ex.Message}",
+                    EventLogEntryType.Warning, 1068);
+            }
+        }
+
+        /// <summary>
+        /// Jalankan sc.exe dengan argumen tertentu, return stdout+stderr sebagai string.
+        /// Timeout 10 detik — sc.exe lokal hampir selalu selesai dalam < 1 detik.
+        /// </summary>
+        private static string RunSc(string arguments)
+        {
+            using var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName               = "sc.exe",
+                    Arguments              = arguments,
+                    UseShellExecute        = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError  = true,
+                    CreateNoWindow         = true
+                }
+            };
+
+            process.Start();
+            string output = process.StandardOutput.ReadToEnd() +
+                            process.StandardError.ReadToEnd();
+            process.WaitForExit(10_000); // timeout 10 detik
+            return output;
+        }
 
         // ─── Crash handler ───────────────────────────────────────────────────────
 
@@ -598,14 +759,18 @@ namespace EventLogOutEmployeeService
                 {
                     // Heartbeat menulis Now tanpa pengurangan — per-event sudah handle
                     // akurasi (eventTime - 1 detik). Heartbeat hanya safety net saat idle.
-                    // Interval 1 menit cukup: worst-case gap = 59 detik, di-cover replay 7 hari.
+                    // Interval 15 detik: worst-case gap kalau 6008/power loss = 15 detik,
+                    // jauh lebih kecil dari sebelumnya (1 menit). Di environment dengan
+                    // Security log 20MB yang cepat rotate dan riwayat 6008, gap kecil
+                    // sangat penting agar replay window tidak kehilangan event login pagi.
+                    // Overhead: nulis satu file kecil tiap 15 detik — tidak signifikan.
                     SaveStopCheckpoint(DateTime.UtcNow);
                 }
                 catch
                 {
                     // Heartbeat must never crash service.
                 }
-            }, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+            }, null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
         }
 
         private static void SafeWriteEventLog(string source, string message, EventLogEntryType type, int eventId)
@@ -639,6 +804,12 @@ namespace EventLogOutEmployeeService
             1036,
             // Live event skip & duplicate skip — normal behavior, bukan error
             1016, 1037, 1038,
+            // Self-healing: "already OK" confirmations — verbose only (tidak perlu tampil setiap boot normal)
+            // Warning/fix IDs (1062, 1063, 1066, 1067) sengaja TIDAK di sini agar selalu tampil.
+            1061, 1065,
+            // Config validation: "OK" confirmation — verbose only.
+            // Error/warning IDs (1070, 1071, 1072, 1073) sengaja TIDAK di sini agar selalu tampil.
+            1075,
             // Debug system event parsing — semua [DBG-*]
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
             // Debug fallback resolution detail — [DBG-1074] resolved, [DBG-6005] ignored/skip/allow
@@ -1029,7 +1200,129 @@ namespace EventLogOutEmployeeService
             dispatchBackoffSeconds = ReadIntListFromEnvironment(
                 "DISPATCH_BACKOFF_SECONDS", new[] { 30, 60, 120, 300, 600 });
 
+            ValidateConfiguration(config);
+
             return config;
+        }
+
+        /// <summary>
+        /// Validasi semua field konfigurasi kritis saat startup.
+        ///
+        /// Tujuan: mendeteksi masalah konfigurasi SEBELUM service mencoba dispatch ke SharePoint
+        /// (yang terjadi lazily saat event pertama masuk). Tanpa ini, credential yang salah
+        /// atau field yang kosong baru ketahuan saat dispatch gagal dengan pesan error yang
+        /// tidak jelas, bisa beberapa menit setelah service start.
+        ///
+        /// Level validasi:
+        ///   CRITICAL  — field wajib ada dan tidak boleh kosong. Kalau kosong, service tidak bisa
+        ///               kirim data ke SharePoint sama sekali. Log sebagai Error.
+        ///   WARNING   — field opsional tapi penting. Kalau kosong, fitur tertentu tidak aktif.
+        ///               Log sebagai Warning agar mudah dideteksi.
+        ///   FORMAT    — field ada tapi format mencurigakan (misal TenantId bukan GUID).
+        ///               Log sebagai Warning — tidak hard-fail karena format bisa valid meski tidak
+        ///               sesuai ekspektasi.
+        ///
+        /// Tidak throw — validasi gagal tidak boleh mencegah service start sama sekali,
+        /// karena RawEventStore + queue masih bisa menampung event meski SharePoint belum siap.
+        /// </summary>
+        private static void ValidateConfiguration(IConfiguration config)
+        {
+            bool hasError = false;
+
+            // ── Helper lokal ──────────────────────────────────────────────────────
+            void Critical(string key, string? value)
+            {
+                if (!string.IsNullOrWhiteSpace(value))
+                    return;
+
+                hasError = true;
+                SafeWriteEventLog("Application",
+                    $"[CONFIG] CRITICAL: '{key}' kosong atau tidak ditemukan di appsettings. " +
+                    $"Service tidak bisa mengirim data ke SharePoint.",
+                    EventLogEntryType.Error, 1070);
+            }
+
+            void Warn(string key, string? value, string reason)
+            {
+                if (!string.IsNullOrWhiteSpace(value))
+                    return;
+
+                SafeWriteEventLog("Application",
+                    $"[CONFIG] WARNING: '{key}' kosong. {reason}",
+                    EventLogEntryType.Warning, 1071);
+            }
+
+            void FormatWarn(string key, string? value, Func<string, bool> isValid, string hint)
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    return; // sudah ter-cover oleh Critical/Warn
+
+                if (!isValid(value))
+                    SafeWriteEventLog("Application",
+                        $"[CONFIG] WARNING: '{key}' = '{value}' format tidak sesuai ekspektasi. {hint}",
+                        EventLogEntryType.Warning, 1072);
+            }
+
+            // ── AzureSettings ─────────────────────────────────────────────────────
+            string? tenantId     = config["AzureSettings:TenantId"];
+            string? clientId     = config["AzureSettings:ClientId"];
+            string? clientSecret = config["AzureSettings:ClientSecret"];
+
+            Critical("AzureSettings:TenantId",     tenantId);
+            Critical("AzureSettings:ClientId",     clientId);
+            Critical("AzureSettings:ClientSecret", clientSecret);
+
+            // TenantId dan ClientId harus berupa GUID
+            FormatWarn("AzureSettings:TenantId", tenantId,
+                v => Guid.TryParse(v, out _),
+                "Seharusnya berupa GUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).");
+            FormatWarn("AzureSettings:ClientId", clientId,
+                v => Guid.TryParse(v, out _),
+                "Seharusnya berupa GUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).");
+
+            // ClientSecret tidak boleh berisi placeholder literal
+            if (!string.IsNullOrWhiteSpace(clientSecret))
+            {
+                string[] placeholders = { "YOUR_", "PLACEHOLDER", "CHANGE_ME", "TODO", "<", ">" };
+                bool looksLikePlaceholder = Array.Exists(
+                    placeholders, p => clientSecret.Contains(p, StringComparison.OrdinalIgnoreCase));
+                if (looksLikePlaceholder)
+                    SafeWriteEventLog("Application",
+                        "[CONFIG] WARNING: 'AzureSettings:ClientSecret' sepertinya masih berisi " +
+                        "placeholder dan belum diganti dengan nilai asli.",
+                        EventLogEntryType.Warning, 1072);
+            }
+
+            // ── SharePointSettings ────────────────────────────────────────────────
+            string? siteId      = config["SharePointSettings:SiteId"];
+            string? listId      = config["SharePointSettings:ListId"];
+            string? summaryListId = config["SharePointSettings:SummaryListId"];
+
+            Critical("SharePointSettings:SiteId",  siteId);
+            Critical("SharePointSettings:ListId",  listId);
+
+            // SummaryListId opsional tapi kalau kosong fitur Summary nonaktif
+            Warn("SharePointSettings:SummaryListId", summaryListId,
+                "Fitur Summary (ClockIn/ClockOut harian) tidak akan aktif.");
+
+            // ── AppSettings ───────────────────────────────────────────────────────
+            // VerboseLogging tidak wajib — default false, tidak perlu divalidasi.
+
+            // ── Hasil akhir ───────────────────────────────────────────────────────
+            if (hasError)
+            {
+                SafeWriteEventLog("Application",
+                    "[CONFIG] Satu atau lebih field CRITICAL kosong. " +
+                    "Service tetap jalan tapi dispatch ke SharePoint akan gagal sampai config diperbaiki. " +
+                    "Periksa Application EventLog event ID 1070 untuk detail.",
+                    EventLogEntryType.Error, 1073);
+            }
+            else
+            {
+                SafeWriteEventLog("Application",
+                    "[CONFIG] Validasi konfigurasi OK — semua field kritis terisi.",
+                    EventLogEntryType.Information, 1075);
+            }
         }
 
         private static int ReadIntFromEnvironment(string key, int fallback)

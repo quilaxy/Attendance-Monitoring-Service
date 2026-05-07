@@ -34,11 +34,23 @@ namespace EventLogOutEmployeeService
     public class RawEventStore
     {
         private readonly string baseDirectory;
-        // Retention 2 hari — cukup untuk cover worst case service restart.
-        // Dengan sc failure dipasang, service restart dalam detik kalau crash.
-        // Data sudah dispatched ke SharePoint jauh sebelum 2 hari berlalu.
-        // Dari sisi compliance (APPI): data minimization — simpan sesingkat mungkin.
-        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(2);
+        // Retention 7 hari — selaras dengan MaxReplayLookback di LoginLogoutMonitorService.
+        // Alasan dinaikkan dari 2 hari:
+        //   - Security log 20MB bisa rotate dalam hitungan jam di environment high-traffic.
+        //   - Service bisa mati tanpa sc failure (Windows Update, 6008 power loss, dsb)
+        //     sehingga gap bisa lebih dari 2 hari sebelum ada yang sadar dan restart manual.
+        //   - Tanpa RawEventStore, replay hanya bisa recover dari Security log yang sudah rotate.
+        //   - 7 hari cover weekend panjang + libur nasional tanpa ada yang perlu intervensi.
+        // Data yang disimpan: Username (Windows), SID, ComputerName, EventTime, LogonType.
+        // Tidak ada email, password, atau data personal lain — aman untuk retensi 7 hari.
+        // Estimasi ukuran: ~1KB/event × ~200 event/hari × 7 hari ≈ 1.4MB total, sangat kecil.
+        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(7);
+
+        // Hard cap: folder lebih dari HardCapWindow SELALU dihapus tanpa cek dispatch status.
+        // Mencegah folder menumpuk kalau SharePoint down berhari-hari dan cleanup normal terus di-skip.
+        // 14 hari = 2× RetentionWindow — cukup panjang agar tidak agresif, cukup pendek agar
+        // tidak ada akumulasi data yang tidak perlu.
+        private static readonly TimeSpan HardCapWindow = TimeSpan.FromDays(14);
         // #10: writeLock global dihilangkan.
         // File path sudah unik per event: {eventId}_{ticks}.json
         // File.Move (temp→final) atomic di Windows untuk same-volume.
@@ -133,7 +145,7 @@ namespace EventLogOutEmployeeService
                 .ToList();
 
         /// <summary>
-        /// Cleanup folder lebih dari RetentionWindow (2 hari).
+        /// Cleanup folder lebih dari RetentionWindow (7 hari), dengan hard cap 14 hari.
         /// Sebelum menghapus, verifikasi semua file di folder sudah dispatched ke SharePoint
         /// via eventQueue.IsFullyDispatchedAsync. Kalau ada yang belum, folder di-skip
         /// dan dicoba lagi di cleanup berikutnya.
@@ -142,7 +154,9 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                DateTime cutoff = DateTime.Today.Subtract(RetentionWindow);
+                DateTime softCutoff = DateTime.Today.Subtract(RetentionWindow);  // 7 hari
+                DateTime hardCutoff = DateTime.Today.Subtract(HardCapWindow);    // 14 hari
+
                 foreach (string dateDir in Directory.GetDirectories(baseDirectory))
                 {
                     string dirName = Path.GetFileName(dateDir);
@@ -151,11 +165,27 @@ namespace EventLogOutEmployeeService
                         System.Globalization.DateTimeStyles.None, out DateTime dirDate))
                         continue;
 
-                    if (dirDate.Date >= cutoff.Date)
+                    // Belum melewati soft cutoff (7 hari) — skip sama sekali
+                    if (dirDate.Date >= softCutoff.Date)
                         continue;
 
-                    // Verifikasi semua event di folder ini sudah dispatched ke SharePoint
-                    // sebelum menghapus. Kalau ada yang belum, skip folder ini.
+                    // Lewat hard cap (14 hari) — hapus tanpa cek dispatch status.
+                    // Safety valve: kalau SharePoint down berhari-hari dan dispatch terus gagal,
+                    // folder tidak akan menumpuk selamanya.
+                    if (dirDate.Date < hardCutoff.Date)
+                    {
+                        try
+                        {
+                            Directory.Delete(dateDir, recursive: true);
+                            SafeRawLog(
+                                $"[RawEventStore] Hard cap cleanup — deleted {dirName} (>{HardCapWindow.Days} days old, forced).",
+                                EventLogEntryType.Warning, 5012);
+                        }
+                        catch { /* skip if locked */ }
+                        continue;
+                    }
+
+                    // Antara 7–14 hari: cek dispatch status dulu sebelum hapus (perilaku normal).
                     bool allDispatched = await AllEventsDispatchedAsync(dateDir, eventQueue, cancellationToken);
                     if (!allDispatched)
                     {

@@ -201,6 +201,42 @@ namespace EventLogOutEmployeeService
                     }
 
                     string errorBody = await response.Content.ReadAsStringAsync();
+
+                    // Deteksi error code Azure AD yang spesifik dari response body.
+                    // AADSTS7000215 / AADSTS7000222 = ClientSecret invalid atau expired.
+                    // AADSTS700016                  = Application (ClientId) tidak ditemukan di tenant.
+                    // AADSTS7000215 muncul kalau secret salah; AADSTS7000222 kalau sudah expired.
+                    // Keduanya tidak perlu di-retry — retry tidak akan membantu, langsung log Error.
+                    bool isSecretExpiredOrInvalid =
+                        errorBody.Contains("AADSTS7000215", StringComparison.OrdinalIgnoreCase) ||
+                        errorBody.Contains("AADSTS7000222", StringComparison.OrdinalIgnoreCase);
+                    bool isAppNotFound =
+                        errorBody.Contains("AADSTS700016", StringComparison.OrdinalIgnoreCase);
+
+                    if (isSecretExpiredOrInvalid)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[TOKEN] CRITICAL: ClientSecret expired atau tidak valid. " +
+                            $"Perlu direnew di Azure AD → App registrations → Certificates & secrets, " +
+                            $"lalu update ClientSecret di appsettings.json. " +
+                            $"AzureError={ExtractAadErrorCode(errorBody)}",
+                            EventLogEntryType.Error, 4015);
+                        // Tidak perlu retry — secret expired tidak akan tiba-tiba valid lagi.
+                        throw new Exception(
+                            $"ClientSecret expired atau tidak valid (AADSTS). Dispatch dihentikan sampai secret diperbarui.");
+                    }
+
+                    if (isAppNotFound)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[TOKEN] CRITICAL: ClientId tidak ditemukan di tenant. " +
+                            $"Periksa AzureSettings:ClientId dan AzureSettings:TenantId di appsettings.json. " +
+                            $"AzureError={ExtractAadErrorCode(errorBody)}",
+                            EventLogEntryType.Error, 4016);
+                        throw new Exception(
+                            $"ClientId tidak ditemukan di tenant Azure AD. Periksa konfigurasi.");
+                    }
+
                     SafeWriteEventLog("Application",
                         $"[TOKEN] Attempt {attempt}/{maxRetries} failed: HTTP {(int)response.StatusCode} — {errorBody}",
                         EventLogEntryType.Warning, 4011);
@@ -1259,6 +1295,24 @@ namespace EventLogOutEmployeeService
 
         private static string BuildSummaryKey(string username, string workDate)
             => $"{username}\\{workDate}";
+
+        /// <summary>
+        /// Ekstrak error code Azure AD (format "AADSTS######") dari response body token endpoint.
+        /// Dipakai untuk log pesan error yang actionable tanpa dump seluruh response body.
+        /// Kalau tidak ditemukan, return "(unknown)".
+        /// </summary>
+        private static string ExtractAadErrorCode(string responseBody)
+        {
+            try
+            {
+                // Response body adalah JSON: {"error":"invalid_client","error_description":"AADSTS7000222: ..."}
+                // Cukup cari pola AADSTS diikuti angka tanpa perlu full JSON parse.
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    responseBody, @"AADSTS\d+", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                return match.Success ? match.Value : "(unknown)";
+            }
+            catch { return "(unknown)"; }
+        }
 
         private static string EscapeODataLiteral(string value)
             => value.Replace("'", "''");
