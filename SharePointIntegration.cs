@@ -649,6 +649,7 @@ namespace EventLogOutEmployeeService
         public async Task TryUpdateDailySummaryShutdownAsync(
             string accessToken, string username, string computerName,
             DateTime shutdownTime, int eventId, string eventType,
+            IReadOnlyDictionary<string, List<DateTime>> allLogon4624Index,
             SummaryCache? summaryCache = null)
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
@@ -737,22 +738,32 @@ namespace EventLogOutEmployeeService
             // di sini priority check tetap jalan, hanya baseline-nya di-set ke -2 bukan 0.
             int effectiveCurrentPriority = currentShutdown.HasValue ? currentPriority : -2;
 
-            // isNewSession: ada ShutdownTime sebelumnya, dan incoming lebih baru.
-            // Artinya user sudah login lagi (sesi baru) lalu shutdown lagi.
-            // Dalam kasus ini, abaikan priority lama — shutdown terbaru selalu lebih relevan.
-            // Contoh: 6006 jam 09:00 (priority 5) lalu login jam 13:00 lalu 4647 jam 17:00 (priority 6)
-            // → dengan fix: 4647 jam 17:00 > 6006 jam 09:00 → reset priority, tulis 17:00 ✅
+            // isNewSession: sesi baru = ada 4624 login setelah currentShutdown.
+            // Definisi ini paling akurat — tidak bergantung threshold waktu atau exclude event ID.
+            // Pakai allLogon4624Index (in-memory, semua login per computer per hari) untuk
+            // cek apakah ada login baru setelah shutdown terakhir tanpa perlu query ke mana-mana.
+            // Berbeda dari firstLogon4624Index yang hanya simpan earliest, allLogon4624Index
+            // simpan semua login — penting untuk kasus multiple login/logout dalam sehari.
             //
-            // EXCEPTION: Event 42 (Sleep/Hibernate) tidak pernah dianggap isNewSession.
-            // 42 muncul sebagai side effect fast startup hibernate — bukan intentional user action.
-            // Workflow user: harus klik shutdown (4647 selalu ada), tidak boleh sleep.
-            // Jadi 42 yang datang setelah 4647 (misal selisih beberapa menit) bukan sesi baru —
-            // dia hanya artifact fast startup. Kalau sudah ada ShutdownTime dari event lain,
-            // 42 harus selalu kalah via priority check normal (priority -1).
-            // 42 tetap bisa jadi ShutdownTime kalau belum ada event lain sama sekali (last resort).
-            bool isNewSession = eventId != 42
-                && currentShutdown.HasValue
-                && shutdownTime > currentShutdown.Value;
+            // Contoh 1x login logout:
+            //   4647 17:00 tersimpan → 1074/6006/42 datang tanpa ada 4624 baru
+            //   → isNewSession = false → priority check ketat → 4647 tidak bisa dioverride ✅
+            //
+            // Contoh multiple login logout:
+            //   4647 12:00 tersimpan → 4624 13:00 login lagi → 4647 17:00
+            //   → isNewSession = true (ada 4624 jam 13:00 setelah 12:00) ✅
+            bool isNewSession = false;
+            if (currentShutdown.HasValue && shutdownTime > currentShutdown.Value)
+            {
+                string workDate = shutdownTime.ToLocalTime().ToString("yyyy-MM-dd");
+                string indexKey = $"{computerName}_{workDate}";
+                if (allLogon4624Index.TryGetValue(indexKey, out var logins))
+                {
+                    isNewSession = logins.Any(t =>
+                        t > currentShutdown.Value &&
+                        t <= shutdownTime);
+                }
+            }
             if (isNewSession)
             {
                 SafeWriteEventLog("Application",

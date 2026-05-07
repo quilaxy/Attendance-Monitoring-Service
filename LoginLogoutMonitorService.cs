@@ -46,6 +46,12 @@ namespace EventLogOutEmployeeService
             new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, (string Username, DateTime EventTime)> firstLogon4624ByDeviceWorkDate =
             new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
+
+        // Semua 4624 per computer per hari — dipakai untuk isNewSession check di shutdown dispatch.
+        // Berbeda dari firstLogon4624ByDeviceWorkDate yang hanya simpan earliest login,
+        // dictionary ini simpan semua login agar bisa detect sesi baru setelah shutdown pertama.
+        private readonly Dictionary<string, List<DateTime>> allLogon4624ByDeviceWorkDate =
+            new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> startupAnchorByDeviceWorkDate =
             new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private int queueAlertThreshold = 500;
@@ -1515,7 +1521,9 @@ namespace EventLogOutEmployeeService
                         await sharePoint.TryUpdateDailySummaryShutdownAsync(
                             accessToken, item.Username, item.ComputerName,
                             item.ShutdownTime ?? item.EventTime,
-                            item.EventId, item.EventType, summaryCache);
+                            item.EventId, item.EventType,
+                            allLogon4624ByDeviceWorkDate,
+                            summaryCache);
                     }
 
                     await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
@@ -3450,11 +3458,21 @@ namespace EventLogOutEmployeeService
 
             lock (firstLogonLock)
             {
+                // Track earliest login (existing behavior)
                 if (!firstLogon4624ByDeviceWorkDate.TryGetValue(key, out var existing) ||
                     eventTime < existing.EventTime)
                 {
                     firstLogon4624ByDeviceWorkDate[key] = (username, eventTime);
                 }
+
+                // Track semua login untuk isNewSession check di shutdown dispatch
+                if (!allLogon4624ByDeviceWorkDate.TryGetValue(key, out var logins))
+                {
+                    logins = new List<DateTime>();
+                    allLogon4624ByDeviceWorkDate[key] = logins;
+                }
+                if (!logins.Contains(eventTime))
+                    logins.Add(eventTime);
             }
         }
 
