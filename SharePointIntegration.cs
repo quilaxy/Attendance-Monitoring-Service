@@ -334,6 +334,11 @@ namespace EventLogOutEmployeeService
                     }
 
                     // ── Insert ────────────────────────────────────────────────
+                    // EventTime  : UTC ISO 8601 — dipakai untuk filter/sort/cleanup (Date Only di SharePoint).
+                    // Time       : string HH:mm:ss local — kolom Single Line of Text, untuk tampilan jam.
+                    //              Konsisten dengan ClockIn/ClockOut di Summary list.
+                    string timeStr = eventTime.ToLocalTime().ToString("HH:mm:ss");
+
                     var postData = new
                     {
                         fields = new
@@ -342,6 +347,7 @@ namespace EventLogOutEmployeeService
                             Username     = username,
                             EventID      = eventId,
                             EventTime    = eventTimeStr,
+                            Time         = timeStr,
                             EventType    = eventType,
                             ComputerName = computerName
                         }
