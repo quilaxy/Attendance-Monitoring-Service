@@ -638,7 +638,8 @@ namespace EventLogOutEmployeeService
         /// Rules (summary = work-hour tracker, only final shutdown matters):
         ///   • Row must already exist (created by UpsertDailySummaryLoginAsync).
         ///     If no row exists yet, the event is too early in the day — skip.
-        ///   • Priority (higher wins): 6006 > 1074-Shutdown > 4647 > 6008/41.
+        ///   • Priority (higher wins): 4647 > 6006-confirmed > 1074-Shutdown > 6008/41.
+        ///     4647 adalah priority tertinggi — reliable di semua skenario (sleep, fast startup, hibernate).
         ///     A lower-priority event never overwrites a higher-priority one.
         ///   • For same priority: keep the LATEST timestamp (most recent shutdown).
         ///   • Tidak ada validasi jam khusus (expected timeout/session guardrail).
@@ -1293,20 +1294,22 @@ namespace EventLogOutEmployeeService
 
         /// <summary>
         /// Priority for Summary ShutdownTime. Higher value wins.
+        ///   4647 User Logout        = 6  (HIGHEST — explicit logoff dari Security log, reliable di semua skenario
+        ///                                  termasuk sleep/hibernate/fast-startup yang tidak punya 1074 atau 6006)
         ///   6006 confirmed shutdown = 5  (paired 1074 was power-off/shutdown)
         ///   1074 Shutdown           = 4  (confirmed power-off, no 6006 yet)
-        ///   6006 unconfirmed        = 3  (no paired 1074 — could be restart, treated cautiously)
-        ///   4647 User Logout        = 2
+        ///   6006 unconfirmed        = 0  (no paired 1074 — kemungkinan restart, di-skip)
         ///   6008 Unexpected         = 1
         ///   41   Crash              = 1
+        ///   42   Sleep last-resort  = -1 (hanya kalau tidak ada event lain sama sekali)
         /// </summary>
         private static int GetShutdownPriority(int eventId, string eventType)
         {
+            if (eventId == 4647) return 6; // Priority tertinggi — explicit user logoff dari Security log
             if (eventId == 6006)
                 return IsUnconfirmed6006(eventType) ? 0 : 5;  // unconfirmed = restart = skip
 
             if (eventId == 1074 && !IsRestartEventType(eventType)) return 4;
-            if (eventId == 4647) return 2;
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
             // Event 42 last-resort: priority -1 sehingga ANY event lain selalu overwrite.
