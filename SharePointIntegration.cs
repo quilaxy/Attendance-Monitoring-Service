@@ -757,7 +757,11 @@ namespace EventLogOutEmployeeService
             if (currentShutdown.HasValue && shutdownTime > currentShutdown.Value)
             {
                 string workDate = shutdownTime.ToLocalTime().ToString("yyyy-MM-dd");
-                string indexKey = $"{computerName}_{workDate}";
+                // KEY HARUS SAMA dengan BuildDeviceWorkDateKey di LoginLogoutMonitorService:
+                // $"{computerName}::{workDate}" — bukan underscore.
+                // Bug sebelumnya: pakai "_" sehingga TryGetValue tidak pernah match
+                // dan isNewSession selalu false untuk semua skenario multiple login/logout.
+                string indexKey = $"{computerName}::{workDate}";
                 if (allLogon4624Index.TryGetValue(indexKey, out var logins))
                 {
                     isNewSession = logins.Any(t =>

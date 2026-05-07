@@ -2209,12 +2209,18 @@ namespace EventLogOutEmployeeService
                     PendingUsernameResolution = pendingUsernameResolution
                 };
 
-                // Shutdown group: 4647, 1074, 6006 yang terjadi berbarengan dikelompokkan
-                // agar summary hanya di-dispatch setelah group lengkap (atau timeout 3 detik).
-                // Tujuan: mencegah 4647 atau 1074 overwrite satu sama lain via isNewSession
-                // padahal ketiganya satu rangkaian shutdown yang sama.
+                // Shutdown group: 1074 dan 6006 yang terjadi berbarengan dikelompokkan
+                // agar 6006 bisa ambil username dari 1074 yang berdekatan dan summary hanya
+                // di-dispatch satu kali per rangkaian shutdown.
+                // 4647 TIDAK di-group: dia punya username sendiri dari Security log, tidak butuh
+                // pairing, dan ikut group justru menyebabkan bug — kalau 4647 muncul di rangkaian
+                // shutdown berbeda (sesi baru) tapi epoch90s-nya collision dengan group lama,
+                // MarkGroupSummaryDispatchedAsync akan mark 4647 baru sebagai sudah dispatch
+                // padahal belum, sehingga logout time tidak terupdate ke waktu yang lebih baru.
+                // 4647 langsung dispatch ke TryUpdateDailySummaryShutdownAsync; priority system
+                // di sana sudah cukup sebagai arbiter (4647=6, highest priority).
                 // 6008 dan 41 tidak di-group karena mereka standalone (tidak ada paired event).
-                if (eventId == 4647 || eventId == 1074 || eventId == 6006)
+                if (eventId == 1074 || eventId == 6006)
                 {
                     string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
                     // #7: Pakai window 90 detik (epoch / 90) bukan 1 menit penuh (epoch / 60).
