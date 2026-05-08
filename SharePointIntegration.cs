@@ -453,17 +453,50 @@ namespace EventLogOutEmployeeService
                 $"loginTime={loginTime:O} workDate={workDate} summaryKey={summaryKey}",
                 EventLogEntryType.Information, 3001);
 
-            // ── Cache check: kalau summaryKey sudah ada di cache lokal, row pasti
-            // sudah ada di SharePoint — skip query sama sekali.
-            if (summaryCache != null && await summaryCache.ContainsAsync(summaryKey))
-            {
-                SafeWriteEventLog("Application",
-                    $"[DBG-Summary] UpsertLogin: cache hit — row already exists for summaryKey={summaryKey}, skipping",
-                    EventLogEntryType.Information, 3007);
-                return;
-            }
+            // ── Cache check ───────────────────────────────────────────────────────
+            // Cache membuktikan row sudah ada di SharePoint, tapi TIDAK membuktikan
+            // bahwa loginTime yang tersimpan sudah paling awal.
+            // Skenario multi-device: Device A login 09:01 (cache terisi), lalu Device B
+            // login 07:24 → tanpa pengecekan ini, cache hit langsung return dan ClockIn
+            // tidak pernah di-update ke 07:24.
+            //
+            // Strategi:
+            //   • Cache hit + loginTime TIDAK lebih awal → skip (perilaku normal, hemat query).
+            //   • Cache hit + loginTime lebih awal        → fall through ke block update.
+            //   • Cache miss                              → fall through ke FindSummaryItem (perilaku lama).
+            bool cacheHit = summaryCache != null && await summaryCache.ContainsAsync(summaryKey);
 
             using var client = CreateGraphClient(accessToken, 60);
+
+            if (cacheHit)
+            {
+                // Query sekali untuk tahu storedLoginTime — hanya dilakukan kalau cache hit.
+                var cacheCheckItems = await FindSummaryItemWithRetryAsync(client, summaryKey);
+                if (cacheCheckItems != null && cacheCheckItems.Count > 0)
+                {
+                    var ccFields = cacheCheckItems[0]["fields"] as JObject;
+                    DateTime? storedLoginCheck = ParseFieldDateTime(ccFields, "LoginTime");
+
+                    if (storedLoginCheck.HasValue && loginTime >= storedLoginCheck.Value)
+                    {
+                        // loginTime tidak lebih awal → tidak ada yang perlu di-update.
+                        SafeWriteEventLog("Application",
+                            $"[DBG-Summary] UpsertLogin: cache hit, loginTime tidak lebih awal " +
+                            $"(stored={storedLoginCheck.Value:O} incoming={loginTime:O}) — skipping",
+                            EventLogEntryType.Information, 3007);
+                        return;
+                    }
+
+                    // loginTime lebih awal → fall through ke existingItems block untuk patch.
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] UpsertLogin: cache hit tapi loginTime lebih awal " +
+                        $"(stored={storedLoginCheck?.ToString("O") ?? "(null)"} incoming={loginTime:O}) — patching",
+                        EventLogEntryType.Information, 3008);
+                }
+                // Kalau cacheCheckItems kosong: cache stale (row terhapus di SharePoint).
+                // Fall through ke existingItems block untuk create ulang.
+            }
+
             var existingItems = await FindSummaryItemWithRetryAsync(client, summaryKey);
 
             if (existingItems != null && existingItems.Count > 0)
