@@ -62,6 +62,7 @@ sc create Attendance-Service ^
 ### 1.3 Start / Stop / Remove
 
 ```bat
+sc failure Attendance-Service reset= 86400 actions= restart/5000/restart/15000/restart/60000
 sc start Attendance-Service
 sc stop Attendance-Service
 sc delete Attendance-Service
