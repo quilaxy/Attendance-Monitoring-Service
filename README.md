@@ -1,7 +1,7 @@
 # Attendance Monitoring Service — Technical Documentation
 
 > **Stack:** .NET 8, Windows Service, SharePoint (Microsoft Graph API)  
-> **Last updated:** 2026-04-21
+> **Last updated:** 2026-05-08
 
 ---
 
