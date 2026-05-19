@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.ServiceProcess;
@@ -40,6 +41,7 @@ namespace EventLogOutEmployeeService
         private static readonly TimeSpan primary1074PairWindow = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan fallback1074PairWindow = TimeSpan.FromSeconds(120);
         private static readonly TimeSpan last1074RetentionWindow = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan LiveEventGracePeriod = TimeSpan.FromSeconds(10);
         private readonly Dictionary<string, string> sidUsernameCache =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, (string Username, DateTime EventTime)> lastKnownLoginByComputer =
@@ -2000,7 +2002,7 @@ namespace EventLogOutEmployeeService
             if (e?.Entry == null) return;
 
             EventLogEntry entry = e.Entry;
-            if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime()))
+            if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime(), isSecurityEvent: true))
                 return;
 
             // Opsi 3: simpan raw event ke disk SEBELUM diproses, agar tidak hilang
@@ -2027,9 +2029,13 @@ namespace EventLogOutEmployeeService
         // Ticks-based agar bisa diakses dengan Interlocked.Read (DateTime tidak thread-safe secara native)
         private long _lastSkipLogTimeTicks = DateTime.MinValue.Ticks;
 
-        private bool ShouldSkipLiveEntry(DateTime eventTime)
+        private bool ShouldSkipLiveEntry(DateTime eventTime, bool isSecurityEvent = false)
         {
-            if (eventTime <= replayUpperBound)
+            DateTime effectiveBound = isSecurityEvent
+                ? replayUpperBound.Add(LiveEventGracePeriod)
+                : replayUpperBound;
+
+            if (eventTime <= effectiveBound)
             {
                 if (replayInProgress)
                 {
@@ -3877,6 +3883,15 @@ namespace EventLogOutEmployeeService
             if (normalized.Contains("@"))
                 normalized = normalized.Split('@')[0].Trim();
 
+            if (normalized.Contains('.'))
+            {
+                normalized = string.Concat(
+                    normalized.Split('.')
+                              .Select(part => part.Length > 0
+                                  ? char.ToUpperInvariant(part[0]) + part.Substring(1)
+                                  : part));
+            }
+
             return normalized;
         }
 
@@ -4041,10 +4056,44 @@ namespace EventLogOutEmployeeService
                     return (primaryCandidate.Username, confirmedPrimaryShutdownType);
                 }
 
+                const double forwardWindowSeconds = 180.0;
+                Last1074State? forwardCandidate = null;
+                double forwardDiffSeconds = double.MaxValue;
+
+                for (int i = 0; i < last1074States.Count; i++)
+                {
+                    Last1074State candidate = last1074States[i];
+                    if (candidate.EventTime <= eventTime)
+                        continue;
+
+                    double diffSeconds = (candidate.EventTime - eventTime).TotalSeconds;
+                    if (diffSeconds > forwardWindowSeconds)
+                        continue;
+
+                    if (IsRestartShutdownType(candidate.ShutdownType))
+                        continue;
+
+                    if (forwardCandidate == null || diffSeconds < forwardDiffSeconds)
+                    {
+                        forwardCandidate = candidate;
+                        forwardDiffSeconds = diffSeconds;
+                    }
+                }
+
+                if (forwardCandidate != null)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-6006] TryResolve: FORWARD match (inverted order) username='{forwardCandidate.Username}' " +
+                        $"diff=+{forwardDiffSeconds:F1}s 1074Type='{forwardCandidate.ShutdownType}' 6006Time={eventTime:O}",
+                        EventLogEntryType.Information, 2012);
+                    return (forwardCandidate.Username, forwardCandidate.ShutdownType);
+                }
+
                 if (fallbackCandidate == null)
                 {
                     SafeWriteEventLog("Application",
-                        $"[DBG-6006] TryResolve: no 1074 candidate in <=120s window before 6006. 6006Time={eventTime:O}",
+                        $"[DBG-6006] TryResolve: no 1074 candidate in <=120s window before 6006 " +
+                        $"and no forward match. 6006Time={eventTime:O}",
                         EventLogEntryType.Information, 2011);
                     return (null, null);
                 }
