@@ -39,7 +39,11 @@ namespace EventLogOutEmployeeService
         private static readonly List<Last1074State> last1074States = new List<Last1074State>();
         private static readonly TimeSpan primary1074PairWindow = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan fallback1074PairWindow = TimeSpan.FromSeconds(120);
-        private static readonly TimeSpan last1074RetentionWindow = TimeSpan.FromMinutes(5);
+        // Retention diperpanjang ke 10 menit (sebelumnya 5 menit) untuk menangkap kasus
+        // PC sangat lambat shutdown — jarak antara 1074 dan 6006 bisa >5 menit.
+        // Forward search (inverted order) di TryResolve1074StateFor6006 juga butuh state ini
+        // masih ada di memory saat 6006 tiba belakangan.
+        private static readonly TimeSpan last1074RetentionWindow = TimeSpan.FromMinutes(10);
         private readonly Dictionary<string, string> sidUsernameCache =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, (string Username, DateTime EventTime)> lastKnownLoginByComputer =
@@ -1593,17 +1597,19 @@ namespace EventLogOutEmployeeService
         ///   - stop checkpoint terus diupdate oleh heartbeat (service hidup) tapi tidak ada
         ///     event baru yang masuk karena handler tidak pernah dipanggil
         ///
-        /// Fix: cek setiap 5 menit. Kalau tidak ada Security event masuk dalam 2 jam
+        /// Fix: cek setiap 5 menit. Kalau tidak ada Security event masuk dalam 30 menit
         /// di jam kerja (07:00–19:00), lakukan disable→enable untuk re-subscribe.
         /// Setelah re-subscribe, jalankan mini-replay dari rawevents dan Security log
         /// untuk menangkap event yang missed selama subscription mati.
+        /// Threshold 30 menit (bukan 2 jam) karena di jam kerja, unlock/lock PC sangat
+        /// sering terjadi — 30 menit tanpa satupun Security event adalah anomali kuat.
         /// </summary>
         private async Task SecurityLogSubscriptionHealthCheckTask(CancellationToken cancellationToken)
         {
-            // Threshold: 2 jam tanpa event Security di jam kerja dianggap subscription mati.
-            // Alasan 2 jam: user bisa pergi makan siang tanpa interaksi PC, tapi 2 jam tanpa
-            // satupun 4624 Logon Type 7 (unlock) di jam kerja sangat tidak normal.
-            const int silentThresholdSeconds   = 7200; // 2 jam
+            // Threshold: 30 menit tanpa event Security di jam kerja dianggap subscription mati.
+            // Di jam kerja, Logon Type 7 (unlock) dari screensaver/sleep terjadi sangat sering.
+            // 30 menit tanpa event apapun = subscription hampir pasti sudah drop.
+            const int silentThresholdSeconds   = 1800; // 30 menit (sebelumnya 7200 = 2 jam)
             const int workHourStart            = 7;    // 07:00
             const int workHourEnd              = 19;   // 19:00
             const int checkIntervalMinutes     = 5;
@@ -1690,10 +1696,10 @@ namespace EventLogOutEmployeeService
                             $"[HEALTH] Mini-replay Security log: from={missedSinceUtc:O} to={replayTo:O}",
                             EventLogEntryType.Information, 1082);
 
-                        // Set replayUpperBound sementara agar ShouldSkipLiveEntry tidak
-                        // membuang live event yang mungkin masuk selama replay berlangsung.
-                        // Grace period 10 detik di isSecurityEvent=true sudah cover ini.
-                        ReplaySecurityEvents(missedSinceUtc, replayTo);
+                        // ReplaySecurityEvents menggunakan .GetAwaiter().GetResult() di dalamnya
+                        // (ProcessSecurityEntryAsync dipanggil sync). Jalankan di thread pool
+                        // untuk menghindari deadlock potensial dari async context health check task.
+                        await Task.Run(() => ReplaySecurityEvents(missedSinceUtc, replayTo), cancellationToken);
 
                         // Juga replay dari RawEventStore untuk tanggal-tanggal yang tercakup
                         await ReplayFromRawStore(missedSinceUtc, replayTo);
@@ -3955,6 +3961,30 @@ namespace EventLogOutEmployeeService
                 }
                 if (!logins.Contains(eventTime))
                     logins.Add(eventTime);
+
+                // Prune entries lebih dari 2 hari — dictionary ini tidak pernah di-clear
+                // sehingga bisa tumbuh tanpa batas pada service yang jalan berbulan-bulan.
+                // Key format: "COMPUTER::yyyy-MM-dd" — parse date dari suffix.
+                // Lakukan prune berkala hanya kalau dictionary sudah cukup besar (>50 entries)
+                // agar tidak ada overhead per-event saat jumlah entry masih kecil.
+                if (firstLogon4624ByDeviceWorkDate.Count > 50)
+                {
+                    string cutoffDate = DateTime.Today.AddDays(-2).ToString("yyyy-MM-dd");
+                    var toRemove = new List<string>();
+                    foreach (var k in firstLogon4624ByDeviceWorkDate.Keys)
+                    {
+                        // Key format: "{computerName}::{yyyy-MM-dd}"
+                        int sep = k.LastIndexOf("::", StringComparison.Ordinal);
+                        if (sep >= 0 && string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0)
+                            toRemove.Add(k);
+                    }
+                    foreach (var k in toRemove)
+                    {
+                        firstLogon4624ByDeviceWorkDate.Remove(k);
+                        allLogon4624ByDeviceWorkDate.Remove(k);
+                        startupAnchorByDeviceWorkDate.Remove(k);
+                    }
+                }
             }
         }
 
