@@ -4177,7 +4177,10 @@ namespace EventLogOutEmployeeService
                     var domainMatch = Regex.Match(line, @"[A-Za-z0-9_\-]+\\([A-Za-z0-9_\.\-]+)", RegexOptions.IgnoreCase);
                     if (domainMatch.Success)
                     {
-                        string candidate = domainMatch.Groups[1].Value.Trim();
+                        // FIX: NormalizeDisplayUsername wajib dipanggil di sini seperti Pattern 1 & 2.
+                        // Tanpa ini, UPN prefix (nyoman.maheswari) dari Pattern 3 tidak di-TitleCase
+                        // sehingga username tidak konsisten dengan output 4647 dan 1074 Pattern 1.
+                        string candidate = NormalizeDisplayUsername(domainMatch.Groups[1].Value.Trim());
                         if (IsValidUsername(candidate))
                         {
                             SafeWriteEventLog("Application",
