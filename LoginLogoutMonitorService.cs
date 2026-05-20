@@ -810,6 +810,16 @@ namespace EventLogOutEmployeeService
             // Config validation: "OK" confirmation — verbose only.
             // Error/warning IDs (1070, 1071, 1072, 1073) sengaja TIDAK di sini agar selalu tampil.
             1075,
+            // Health check: "OK" / info detail — verbose only.
+            // Warning/error IDs (1079, 1081, 1084, 1085) sengaja TIDAK di sini — selalu tampil.
+            // 1079 = subscription silent warning → selalu tampil (kondisi abnormal)
+            // 1080 = re-subscribe OK → verbose (sukses, tidak perlu alert)
+            // 1081 = re-subscribe attempt failed → selalu tampil (warning)
+            // 1082 = mini-replay start → verbose
+            // 1083 = mini-replay selesai → verbose
+            // 1084 = mini-replay error → selalu tampil
+            // 1085 = health check task error → selalu tampil
+            1080, 1082, 1083,
             // Debug system event parsing — semua [DBG-*]
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
             // Debug fallback resolution detail — [DBG-1074] resolved, [DBG-6005] ignored/skip/allow
@@ -1471,6 +1481,9 @@ namespace EventLogOutEmployeeService
                 Task.Run(() => CleanupOldRecordsTask(cancellationToken), cancellationToken);
                 Task.Run(() => ProcessQueuedEventsTask(cancellationToken), cancellationToken);
 
+                // FIX [HEALTH]: Monitor Security log subscription — bisa drop silent setelah log rotate.
+                Task.Run(() => SecurityLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
+
                 while (!cancellationToken.IsCancellationRequested)
                     Thread.Sleep(5000);
             }
@@ -1567,6 +1580,148 @@ namespace EventLogOutEmployeeService
             return TimeSpan.FromSeconds(dispatchBackoffSeconds[index]);
         }
 
+        /// <summary>
+        /// Mendeteksi dan memulihkan Security log subscription yang drop secara silent.
+        ///
+        /// Penyebab: Windows EventLog.EntryWritten subscription berhenti firing tanpa exception
+        /// setelah Security log di-rotate (log penuh dan di-overwrite oleh event baru).
+        /// Ini adalah bug known di Windows EventLog API — tidak ada notifikasi saat ini terjadi.
+        ///
+        /// Dampak yang diamati:
+        ///   - rawevents berhenti terisi sejak log rotate terjadi
+        ///   - event 4624/4647 tidak masuk queue meski terlihat di Sentinel/Event Viewer
+        ///   - stop checkpoint terus diupdate oleh heartbeat (service hidup) tapi tidak ada
+        ///     event baru yang masuk karena handler tidak pernah dipanggil
+        ///
+        /// Fix: cek setiap 5 menit. Kalau tidak ada Security event masuk dalam 2 jam
+        /// di jam kerja (07:00–19:00), lakukan disable→enable untuk re-subscribe.
+        /// Setelah re-subscribe, jalankan mini-replay dari rawevents dan Security log
+        /// untuk menangkap event yang missed selama subscription mati.
+        /// </summary>
+        private async Task SecurityLogSubscriptionHealthCheckTask(CancellationToken cancellationToken)
+        {
+            // Threshold: 2 jam tanpa event Security di jam kerja dianggap subscription mati.
+            // Alasan 2 jam: user bisa pergi makan siang tanpa interaksi PC, tapi 2 jam tanpa
+            // satupun 4624 Logon Type 7 (unlock) di jam kerja sangat tidak normal.
+            const int silentThresholdSeconds   = 7200; // 2 jam
+            const int workHourStart            = 7;    // 07:00
+            const int workHourEnd              = 19;   // 19:00
+            const int checkIntervalMinutes     = 5;
+            const int maxResubscribeAttempts   = 3;
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(checkIntervalMinutes), cancellationToken);
+
+                    int hour = DateTime.Now.Hour;
+                    bool isWorkHour = hour >= workHourStart && hour < workHourEnd;
+                    if (!isWorkHour)
+                        continue;
+
+                    long lastTicksUtc   = Interlocked.Read(ref _lastSecurityEventTicksUtc);
+                    double silentSeconds = (DateTime.UtcNow.Ticks - lastTicksUtc) / (double)TimeSpan.TicksPerSecond;
+
+                    if (silentSeconds < silentThresholdSeconds)
+                        continue;
+
+                    int silentMinutes = (int)(silentSeconds / 60);
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH] Security log subscription silent {silentMinutes} menit di jam kerja " +
+                        $"(threshold={silentThresholdSeconds / 60} menit). Kemungkinan Security log di-rotate " +
+                        $"dan subscription drop. Memulai re-subscribe + mini-replay.",
+                        EventLogEntryType.Warning, 1079);
+
+                    // Catat waktu sejak kapan subscription dianggap mati — untuk mini-replay
+                    DateTime missedSinceUtc = new DateTime(lastTicksUtc, DateTimeKind.Utc);
+
+                    bool resubscribed = false;
+                    for (int attempt = 1; attempt <= maxResubscribeAttempts; attempt++)
+                    {
+                        try
+                        {
+                            if (securityEventLog == null)
+                            {
+                                SafeWriteEventLog("Application",
+                                    "[HEALTH] securityEventLog is null — tidak bisa re-subscribe.",
+                                    EventLogEntryType.Warning, 1080);
+                                break;
+                            }
+
+                            securityEventLog.EnableRaisingEvents = false;
+                            await Task.Delay(300, cancellationToken);
+                            securityEventLog.EnableRaisingEvents = true;
+
+                            // Reset counter setelah re-subscribe — beri waktu sebelum cek lagi
+                            Interlocked.Exchange(ref _lastSecurityEventTicksUtc, DateTime.UtcNow.Ticks);
+
+                            SafeWriteEventLog("Application",
+                                $"[HEALTH] Security log re-subscribed OK (attempt {attempt}/{maxResubscribeAttempts}).",
+                                EventLogEntryType.Information, 1080);
+                            resubscribed = true;
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[HEALTH] Re-subscribe attempt {attempt}/{maxResubscribeAttempts} failed: {ex.Message}",
+                                EventLogEntryType.Warning, 1081);
+
+                            if (attempt < maxResubscribeAttempts)
+                                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                        }
+                    }
+
+                    if (!resubscribed)
+                        continue;
+
+                    // ── Mini-replay: tangkap event yang missed selama subscription mati ──
+                    // Replay dari waktu subscription dianggap mati hingga sekarang.
+                    // Gunakan Security log langsung (bukan rawevents) karena rawevents
+                    // juga tidak terisi selama subscription mati.
+                    // Kalau Security log sudah di-rotate dan event tidak ada lagi, rawevents
+                    // juga tidak bisa membantu — data tersebut hilang permanen.
+                    try
+                    {
+                        DateTime replayTo = DateTime.UtcNow;
+
+                        SafeWriteEventLog("Application",
+                            $"[HEALTH] Mini-replay Security log: from={missedSinceUtc:O} to={replayTo:O}",
+                            EventLogEntryType.Information, 1082);
+
+                        // Set replayUpperBound sementara agar ShouldSkipLiveEntry tidak
+                        // membuang live event yang mungkin masuk selama replay berlangsung.
+                        // Grace period 10 detik di isSecurityEvent=true sudah cover ini.
+                        ReplaySecurityEvents(missedSinceUtc, replayTo);
+
+                        // Juga replay dari RawEventStore untuk tanggal-tanggal yang tercakup
+                        await ReplayFromRawStore(missedSinceUtc, replayTo);
+
+                        SafeWriteEventLog("Application",
+                            $"[HEALTH] Mini-replay selesai: from={missedSinceUtc:O} to={replayTo:O}",
+                            EventLogEntryType.Information, 1083);
+                    }
+                    catch (Exception ex)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[HEALTH] Mini-replay error: {ex.Message}",
+                            EventLogEntryType.Warning, 1084);
+                    }
+                }
+                catch (TaskCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH] SecurityLogSubscriptionHealthCheckTask error: {ex.Message}",
+                        EventLogEntryType.Warning, 1085);
+
+                    try { await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken); }
+                    catch (TaskCanceledException) { break; }
+                }
+            }
+        }
+
         private static bool IsPendingQueueItemExpired(QueuedAttendanceEvent item, DateTime nowUtc)
         {
             DateTime eventTimeUtc = item.EventTime.Kind == DateTimeKind.Unspecified
@@ -1615,15 +1770,20 @@ namespace EventLogOutEmployeeService
         /// Priority untuk shutdown group — harus konsisten dengan SharePointIntegration.GetShutdownPriority.
         /// Dipakai untuk menentukan event mana di group yang boleh dispatch summary saat timer expired.
         ///   4647 = 6 (HIGHEST — explicit logoff, reliable di sleep/fast-startup/hibernate)
-        ///   6006 confirmed = 5 | 1074 shutdown = 4 | 6008/41 = 1 | 42 = 0 (last resort)
+        ///   1074 shutdown = 5 | 6006 confirmed = 4 | 6008/41 = 1 | 42 = 0 (last resort)
+        /// FIX B: 1074 dinaikkan ke 5 (sebelumnya 4) dan 6006 confirmed diturunkan ke 4 (sebelumnya 5).
+        /// Alasan: 1074 Shutdown Initiated membawa timestamp tepat saat user memilih Shutdown,
+        /// sedangkan 6006 Shutdown Completed bisa tertunda beberapa detik/menit setelah itu.
+        /// Dengan inverted-order scenario (6006 tulis duluan), 1074 yang datang belakangan
+        /// harus tetap menang agar ClockOut mencatat waktu yang lebih akurat.
         /// </summary>
         private static int GetShutdownEventPriority(int eventId, string eventType)
         {
             if (eventId == 4647) return 6; // Priority tertinggi — explicit user logoff dari Security log
-            if (eventId == 6006)
-                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 5;
             if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
-                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 4;
+                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 5; // was 4
+            if (eventId == 6006)
+                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 4; // was 5
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
             if (eventId == 42)   return 0; // last resort — hanya kalau tidak ada event lain
@@ -1995,12 +2155,24 @@ namespace EventLogOutEmployeeService
 
         // ─── Event handlers ──────────────────────────────────────────────────────
 
+        // ── Security log subscription health check ───────────────────────────────
+        // Windows EventLog.EntryWritten subscription bisa drop secara silent setelah
+        // Security log di-rotate (log penuh dan di-overwrite). Tidak ada exception,
+        // tidak ada notifikasi — event handler berhenti firing tanpa jejak apapun.
+        // Counter ini melacak berapa detik sejak Security event terakhir diterima.
+        // SecurityLogSubscriptionHealthCheckTask memonitor counter ini dan re-subscribe
+        // kalau terlalu lama silent di jam kerja.
+        private long _lastSecurityEventTicksUtc = DateTime.UtcNow.Ticks;
+
         private void OnSecurityEventWritten(object sender, EntryWrittenEventArgs e)
         {
             if (e?.Entry == null) return;
 
+            // Reset health check counter — subscription masih hidup
+            Interlocked.Exchange(ref _lastSecurityEventTicksUtc, DateTime.UtcNow.Ticks);
+
             EventLogEntry entry = e.Entry;
-            if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime()))
+            if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime(), isSecurityEvent: true))
                 return;
 
             // Opsi 3: simpan raw event ke disk SEBELUM diproses, agar tidak hilang
@@ -2027,9 +2199,20 @@ namespace EventLogOutEmployeeService
         // Ticks-based agar bisa diakses dengan Interlocked.Read (DateTime tidak thread-safe secara native)
         private long _lastSkipLogTimeTicks = DateTime.MinValue.Ticks;
 
-        private bool ShouldSkipLiveEntry(DateTime eventTime)
+        // FIX BUG-2: Grace period for Security log events (4624/4647) past replayUpperBound.
+        // Rationale: 4647 (logout) and its paired 42 (sleep) fire within 2-3 seconds of each
+        // other. The 4647 comes from Security log, 42 from System log. Without the grace period,
+        // 4647 at the boundary is dropped while 42 passes → missing logout records.
+        private static readonly TimeSpan LiveEventGracePeriod = TimeSpan.FromSeconds(10);
+
+        private bool ShouldSkipLiveEntry(DateTime eventTime, bool isSecurityEvent = false)
         {
-            if (eventTime <= replayUpperBound)
+            // Security log events (4624/4647) get a grace period past replayUpperBound.
+            DateTime effectiveBound = isSecurityEvent
+                ? replayUpperBound.Add(LiveEventGracePeriod)
+                : replayUpperBound;
+
+            if (eventTime <= effectiveBound)
             {
                 if (replayInProgress)
                 {
@@ -3877,6 +4060,25 @@ namespace EventLogOutEmployeeService
             if (normalized.Contains("@"))
                 normalized = normalized.Split('@')[0].Trim();
 
+            // FIX BUG-1: On Azure AD joined devices, 4624 Account Name is UPN prefix
+            // (e.g. "nyoman.maheswari") while 4647 and 1074 produce SAMAccountName
+            // (e.g. "NyomanMaheswari"). SID.Translate() always fails on AzureAD → no
+            // other canonicalization path exists. Convert dot-separated UPN prefix to
+            // TitleCase so all event sources produce an identical username string.
+            // Examples:
+            //   nyoman.maheswari  → NyomanMaheswari   ✓
+            //   nabilla.nilawati  → NabillaNilawati    ✓
+            //   chaerunisa.izati  → ChaerunisaIzati    ✓
+            //   NyomanMaheswari   → NyomanMaheswari    ✓ (no dot → unchanged)
+            if (normalized.Contains('.'))
+            {
+                normalized = string.Concat(
+                    normalized.Split('.')
+                              .Select(part => part.Length > 0
+                                  ? char.ToUpperInvariant(part[0]) + part.Substring(1)
+                                  : part));
+            }
+
             return normalized;
         }
 
@@ -4041,10 +4243,49 @@ namespace EventLogOutEmployeeService
                     return (primaryCandidate.Username, confirmedPrimaryShutdownType);
                 }
 
+                // ── FIX BUG-3: Forward search: 1074 that arrives AFTER this 6006 ────────
+                // Windows occasionally logs 6006 before 1074 completes writing (inverted order).
+                // Search for a 1074 within 180 seconds AFTER this 6006.
+                // Only used when no backward candidate was found at all.
+                // Safety: if a restart 1074 is found in the forward window, do NOT pair it.
+                const double forwardWindowSeconds = 180.0;
+                Last1074State? forwardCandidate = null;
+                double forwardDiffSeconds = double.MaxValue;
+
+                for (int i = 0; i < last1074States.Count; i++)
+                {
+                    Last1074State candidate = last1074States[i];
+                    if (candidate.EventTime <= eventTime)
+                        continue; // already handled by backward search
+
+                    double diffSeconds = (candidate.EventTime - eventTime).TotalSeconds;
+                    if (diffSeconds > forwardWindowSeconds)
+                        continue;
+
+                    if (IsRestartShutdownType(candidate.ShutdownType))
+                        continue; // never pair a restart 1074
+
+                    if (forwardCandidate == null || diffSeconds < forwardDiffSeconds)
+                    {
+                        forwardCandidate   = candidate;
+                        forwardDiffSeconds = diffSeconds;
+                    }
+                }
+
+                if (forwardCandidate != null)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-6006] TryResolve: FORWARD match (inverted order) username='{forwardCandidate.Username}' " +
+                        $"diff=+{forwardDiffSeconds:F1}s 1074Type='{forwardCandidate.ShutdownType}' 6006Time={eventTime:O}",
+                        EventLogEntryType.Information, 2012);
+                    return (forwardCandidate.Username, forwardCandidate.ShutdownType);
+                }
+
                 if (fallbackCandidate == null)
                 {
                     SafeWriteEventLog("Application",
-                        $"[DBG-6006] TryResolve: no 1074 candidate in <=120s window before 6006. 6006Time={eventTime:O}",
+                        $"[DBG-6006] TryResolve: no 1074 candidate in <=120s window before 6006 " +
+                        $"and no forward match. 6006Time={eventTime:O}",
                         EventLogEntryType.Information, 2011);
                     return (null, null);
                 }

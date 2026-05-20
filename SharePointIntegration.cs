@@ -1403,10 +1403,9 @@ namespace EventLogOutEmployeeService
         private static int GetShutdownPriority(int eventId, string eventType)
         {
             if (eventId == 4647) return 6; // Priority tertinggi — explicit user logoff dari Security log
+            if (eventId == 1074 && !IsRestartEventType(eventType)) return 5; // was 4 — FIX B: 1074 > 6006 confirmed
             if (eventId == 6006)
-                return IsUnconfirmed6006(eventType) ? 0 : 5;  // unconfirmed = restart = skip
-
-            if (eventId == 1074 && !IsRestartEventType(eventType)) return 4;
+                return IsUnconfirmed6006(eventType) ? 0 : 4;  // was 5 — FIX B: 6006 confirmed turun ke 4
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
             // Event 42 last-resort: priority -1 sehingga ANY event lain selalu overwrite.
