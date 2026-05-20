@@ -1,7 +1,7 @@
 # Attendance Monitoring Service — Technical Documentation
 
 > **Stack:** .NET 8, Windows Service, SharePoint (Microsoft Graph API)  
-> **Last updated:** 2026-04-21
+> **Last updated:** 2026-05-08
 
 ---
 
@@ -62,6 +62,7 @@ sc create Attendance-Service ^
 ### 1.3 Start / Stop / Remove
 
 ```bat
+sc failure Attendance-Service reset= 86400 actions= restart/5000/restart/15000/restart/60000
 sc start Attendance-Service
 sc stop Attendance-Service
 sc delete Attendance-Service
@@ -525,9 +526,9 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 3003 | Info | UpsertLogin: updating to earlier loginTime |
 | 3004 | Info | UpsertLogin: creating new row |
 | 3005 | Info | UpsertLogin: successfully created row |
-| 3006 | Info | UpsertLogin: deleting duplicate row (auto-cleanup) |
-| 3007 | Info | UpsertLogin: cache hit — row already exists, skipping |
-| 3008 | Info | FindSummaryItemWithRetry: attempt N not found, retrying |
+| 3006 | Warning | UpsertLogin: deleting duplicate row (auto-cleanup) |
+| 3007 | Info | UpsertLogin: cache hit, loginTime tidak lebih awal — skipping |
+| 3008 | Info | UpsertLogin: cache hit tapi loginTime lebih awal — patching; juga dipakai FindSummaryItemWithRetry saat attempt belum menemukan row |
 | 3009 | Warning | FindSummaryItemWithRetry: all attempts exhausted |
 | 3010 | Info | TryUpdateShutdown: user, computer, shutdownTime, eventId |
 | 3011 | Info | TryUpdateShutdown: SKIP — no matching summary row |
@@ -860,15 +861,20 @@ Satu row per user per hari:
 ### 14.1 UpsertDailySummaryLoginAsync
 
 ```
-1. Cek SummaryCache → cache hit? → return (skip query)
-2. FindSummaryItemWithRetryAsync (retry 3x: 3s, 6s, 12s delay)
-3. Row ada?
+1. Cek SummaryCache
+2. Jika cache hit:
+   → query row untuk baca `stored LoginTime`
+   → jika incoming `loginTime` tidak lebih awal → skip
+   → jika incoming `loginTime` lebih awal → lanjut ke update path
+   → jika row tidak ditemukan (cache stale) → lanjut ke lookup normal
+3. FindSummaryItemWithRetryAsync (retry 3x: 3s, 6s, 12s delay)
+4. Row ada?
    → pilih canonical row (LoginTime paling awal)
    → hapus duplikat row jika ada (Event ID 3006)
    → update LoginTime jika incoming lebih awal
    → tulis ke SummaryCache
    → return
-4. Row tidak ada setelah semua retry → create new row
+5. Row tidak ada setelah semua retry → create new row
    → tulis ke SummaryCache
 ```
 
@@ -948,7 +954,7 @@ File: `summary-cache.json`
 
 ### 16.1 Tujuan
 
-Mencegah duplikat row di SummaryListId **lintas service restart**. Setelah restart, queue kosong sehingga `IsSummaryEligible` tidak bisa mendeteksi bahwa row untuk `user+workDate` hari ini sudah ada. Cache ini menjawab pertanyaan itu secara lokal tanpa query SharePoint.
+Mencegah duplikat row di SummaryListId **lintas service restart**. Setelah restart, queue kosong sehingga `IsSummaryEligible` tidak bisa mendeteksi bahwa row untuk `user+workDate` hari ini sudah ada. Cache ini mengurangi query SharePoint, namun pada cache hit service tetap melakukan verifikasi agar `LoginTime` paling awal lintas device tetap terjaga.
 
 ### 16.2 Format
 
@@ -1072,7 +1078,7 @@ Service dirancang untuk berjalan di banyak device secara bersamaan tanpa koordin
 |-------|---------|
 | Raw list writes | Concurrent insert dari device berbeda — SharePoint handle ini natively |
 | Summary list writes | Semua device upsert row user yang sama (`Username\WorkDate` unik per user per hari). LoginTime pakai paling awal lintas device, ShutdownTime pakai paling akhir lintas device |
-| SummaryCache | Lokal per device — tidak di-share |
+| SummaryCache | Lokal per device — tidak di-share. Cache hit tetap diverifikasi agar login yang lebih awal dari device lain tetap bisa patch `LoginTime` |
 | Cleanup | Siapapun yang cleanup pertama, hapus semua data lama semua device. Device lain yang cleanup belakangan tidak ketemu data lama → nothing to delete → aman |
 | Cleanup 404 | HTTP 404 saat delete diabaikan (item sudah dihapus device lain) |
 | Token | Masing-masing device fetch token sendiri (App Registration shared) |
