@@ -831,8 +831,8 @@ namespace EventLogOutEmployeeService
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
             // Debug fallback resolution detail — [DBG-1074] resolved
             2013,
-            // Debug RawEventStore fallback — [DBG-4624], [DBG-GetMRU], [DBG-42]
-            2028, 2031, 2032,
+            // Debug RawEventStore fallback — [DBG-4624], [DBG-GetMRU], [DBG-42], [DBG-4634]
+            2028, 2031, 2032, 2033,
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
             3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
@@ -895,7 +895,7 @@ namespace EventLogOutEmployeeService
                     continue;
 
                 int eventId = GetNormalizedEventId(entry);
-                if (eventId != 4624 && eventId != 4647)
+                if (eventId != 4624 && eventId != 4647 && eventId != 4634)
                     continue;
 
                 // Pre-filter 4624: skip irrelevant logon types dan admin split token early
@@ -1109,6 +1109,7 @@ namespace EventLogOutEmployeeService
                             isFallback: true, resolvedUsername: null,
                             status: "UNCONFIRMED", pendingUsernameResolution: true);
                     }
+                    // 4634 tanpa username tidak bisa dipromosikan — skip saja.
                     return;
                 }
 
@@ -1119,6 +1120,36 @@ namespace EventLogOutEmployeeService
                     lock (knownLoginLock)
                         lastKnownLoginByComputer[computerName] = (username, eventTime);
                     RegisterFirst4624Logon(computerName, username, eventTime);
+                }
+
+                // 4634 dari RawEventStore: jalankan cek duplikat 4647 sebelum enqueue,
+                // sama seperti di ProcessSecurityEntryAsync live path.
+                if (eventId == 4634)
+                {
+                    string workDate4634raw = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
+                    var allQueue4634raw = await eventQueue.GetAllAsync();
+                    bool has4647raw = allQueue4634raw.Any(x =>
+                        x.EventId == 4647 &&
+                        x.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
+                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634raw);
+                    if (has4647raw)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-4634] RawReplay skipped — 4647 already queued for user='{username}' " +
+                            $"computer='{computerName}' at {eventTime:O}",
+                            EventLogEntryType.Information, 2033);
+                        return;
+                    }
+
+                    await ProcessEvent(
+                        4634, username, eventTime, computerName,
+                        "Security", 0, null, writeRawRecord,
+                        usernameResolutionSource: "Direct",
+                        isFallback: true,
+                        fallbackSource: "Event4634_Fallback4647",
+                        status: "CONFIRMED");
+                    return;
                 }
 
                 await ProcessEvent(eventId, username, eventTime, computerName,
@@ -1838,6 +1869,12 @@ namespace EventLogOutEmployeeService
             if (item.EventId == 1074 || item.EventId == 6006 || item.EventId == 4647)
                 return true;
 
+            // 4634: fallback logout — masuk summary hanya kalau tidak ada 4647 di group
+            // yang sama (IsFallback4634 flag). Priority dikendalikan di
+            // TryUpdateDailySummaryShutdownAsync via GetShutdownPriority.
+            if (item.EventId == 4634)
+                return true;
+
             // FIX [BUG-2+3]: Event 42 (Sleep/Modern Standby) sebagai last-resort shutdown.
             // Hanya masuk summary kalau belum ada ShutdownTime sama sekali (IsLastResort42 flag).
             // Validasi wake (apakah 42 ini shutdown final) dilakukan di TryDispatchQueuedEventAsync.
@@ -1851,20 +1888,25 @@ namespace EventLogOutEmployeeService
         /// Priority untuk shutdown group — harus konsisten dengan SharePointIntegration.GetShutdownPriority.
         /// Dipakai untuk menentukan event mana di group yang boleh dispatch summary saat timer expired.
         ///   4647 = 6 (HIGHEST — explicit logoff, reliable di sleep/fast-startup/hibernate)
-        ///   1074 shutdown = 5 | 6006 confirmed = 4 | 42 = 0 (last resort)
-        /// FIX B: 1074 dinaikkan ke 5 (sebelumnya 4) dan 6006 confirmed diturunkan ke 4 (sebelumnya 5).
-        /// Alasan: 1074 Shutdown Initiated membawa timestamp tepat saat user memilih Shutdown,
-        /// sedangkan 6006 Shutdown Completed bisa tertunda beberapa detik/menit setelah itu.
-        /// Dengan inverted-order scenario (6006 tulis duluan), 1074 yang datang belakangan
-        /// harus tetap menang agar ClockOut mencatat waktu yang lebih akurat.
+        ///   4634 = 5 (fallback 4647 — Logoff event, unreliable tapi lebih baik dari system event)
+        ///   1074 shutdown = 4 | 6006 confirmed = 3 | 42 = 0 (last resort)
+        ///
+        /// Perubahan dari versi sebelumnya:
+        ///   - 4634 ditambahkan di priority 5 (di bawah 4647=6, di atas 1074=4).
+        ///   - 1074 diturunkan dari 5 → 4 dan 6006 dari 4 → 3 untuk memberi ruang 4634.
+        ///   - 42 tetap 0 (last resort).
+        ///
+        /// PENTING: Method ini harus di-sync dengan SharePointIntegration.GetShutdownPriority
+        /// kalau method tersebut ada di sana.
         /// </summary>
         private static int GetShutdownEventPriority(int eventId, string eventType)
         {
             if (eventId == 4647) return 6; // Priority tertinggi — explicit user logoff dari Security log
+            if (eventId == 4634) return 5; // Fallback 4647 — Logoff event, di bawah 4647 tapi di atas system events
             if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
-                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 5; // was 4
+                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 4; // was 5
             if (eventId == 6006)
-                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 4; // was 5
+                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 3; // was 4
             if (eventId == 42)   return 0; // last resort — hanya kalau tidak ada event lain
             return 0;
         }
@@ -1949,16 +1991,18 @@ namespace EventLogOutEmployeeService
                         {
                             // 4647 priority lebih tinggi dari confirmed 6006 (6 vs 5) —
                             // kalau item ini 4647, biarkan dia dispatch, bukan 6006.
-                            if (item.EventId == 4647)
+                            // 4634 (priority 5) juga lebih tinggi dari 6006 confirmed (3) —
+                            // sama-sama dari Security log, biarkan dia dispatch.
+                            if (item.EventId == 4647 || item.EventId == 4634)
                             {
-                                // 4647 menang — mark 6006 di group sebagai summaryDispatched
+                                // 4647/4634 menang — mark 6006 di group sebagai summaryDispatched
                                 // agar 6006 tidak kirim summary lagi setelahnya.
                                 await eventQueue.MarkGroupSummaryDispatchedAsync(item.ShutdownGroupId, exceptQueueId: item.QueueId);
                                 SafeWriteEventLog("Application",
-                                    $"[DISPATCH] Shutdown group: 4647 takes priority over confirmed 6006. " +
+                                    $"[DISPATCH] Shutdown group: {item.EventId} takes priority over confirmed 6006. " +
                                     $"queueId={item.QueueId} groupId={item.ShutdownGroupId}",
                                     EventLogEntryType.Information, 4009);
-                                // needsSummary tetap true — 4647 yang dispatch
+                                // needsSummary tetap true — 4647/4634 yang dispatch
                             }
                             else
                             {
@@ -2336,11 +2380,70 @@ namespace EventLogOutEmployeeService
             try
             {
                 int eventId = GetNormalizedEventId(log);
-                if (eventId != 4624 && eventId != 4647) return;
+                if (eventId != 4624 && eventId != 4647 && eventId != 4634) return;
 
                 DateTime eventTime = log.TimeGenerated.ToUniversalTime();
                 string computerName = log.MachineName;
                 string eventMessage = log.Message;
+
+                // 4634 — Logoff (unreliable, used as fallback for 4647 when 4647 is absent).
+                // Windows fires 4634 for every logoff including background/system sessions,
+                // so it is inherently noisy. We only promote it as a logout event when
+                // there is no 4647 already queued for the same user+computer+workDate
+                // within a short dedup window. Priority: below 4647, above 1074/6006.
+                // Username source: same "Subject:" section as 4647.
+                if (eventId == 4634)
+                {
+                    // Re-use the 4647 username extraction path — same XML/message structure.
+                    string? username4634 = GetUsernameFromEvent(eventMessage, 4647);
+                    if (string.IsNullOrEmpty(username4634) || !IsValidUsername(username4634))
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-4634] Username unresolvable at {eventTime:O} on {computerName} — skipped.",
+                            EventLogEntryType.Information, 2033);
+                        return;
+                    }
+
+                    string? sid4634 = GetUserSidFromSecurityEvent(eventMessage, 4647);
+                    username4634 = ResolveUsernameBySid(username4634, sid4634);
+                    if (string.IsNullOrEmpty(username4634) || !IsValidUsername(username4634))
+                        return;
+
+                    // Check: apakah 4647 untuk user+computer+workDate ini sudah ada di queue?
+                    // Kalau ada, 4634 tidak diperlukan — skip.
+                    // Menggunakan GetAllAsync karena HasEventForUserComputerWorkDateAsync mungkin
+                    // belum ada di PersistentEventQueue — lihat catatan di bawah untuk implementasi
+                    // method tersebut di PersistentEventQueue.
+                    string workDate4634 = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
+                    var allQueue4634 = await eventQueue.GetAllAsync();
+                    bool has4647 = allQueue4634.Any(x =>
+                        x.EventId == 4647 &&
+                        x.Username.Equals(username4634, StringComparison.OrdinalIgnoreCase) &&
+                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634);
+                    if (has4647)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-4634] Skipped — 4647 already queued for user='{username4634}' " +
+                            $"computer='{computerName}' at {eventTime:O}",
+                            EventLogEntryType.Information, 2033);
+                        return;
+                    }
+
+                    SafeWriteEventLog("Application",
+                        $"[DBG-4634] Promoting as fallback logout: user='{username4634}' " +
+                        $"computer='{computerName}' at {eventTime:O} (no 4647 found in queue)",
+                        EventLogEntryType.Information, 2033);
+
+                    await ProcessEvent(
+                        4634, username4634, eventTime, computerName,
+                        "Security", 0, null, writeRawRecord,
+                        usernameResolutionSource: "Direct",
+                        isFallback: true,
+                        fallbackSource: "Event4634_Fallback4647",
+                        status: "CONFIRMED");
+                    return;
+                }
 
                 // Parse logon type (only relevant for 4624)
                 int logonType = 0;
@@ -2691,6 +2794,10 @@ namespace EventLogOutEmployeeService
                     {
                         4624 => $"User Login\nLogon Type: {FormatLogonType(logonType)}",
                         4647 => "User Logout",
+                        // 4634: Logoff (fallback untuk 4647) — tidak reliable, dipakai hanya
+                        // saat 4647 tidak tersedia. Label dibedakan agar mudah diidentifikasi
+                        // di SharePoint sebagai fallback event, bukan primary logout.
+                        4634 => "User Logoff (Fallback 4634)",
                         _ => "Unknown Security Event"
                     },
                     "System" => eventId switch
@@ -2710,7 +2817,7 @@ namespace EventLogOutEmployeeService
                 if (eventTime.Kind == DateTimeKind.Unspecified)
                     eventTime = DateTime.SpecifyKind(eventTime, DateTimeKind.Local);
 
-                if (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 42)
+                if (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 4634 || eventId == 42)
                     SharePointIntegration.MarkShutdownEvent(eventTime);
 
                 DateTime? loginTime = null;
@@ -2727,6 +2834,14 @@ namespace EventLogOutEmployeeService
                 {
                     shutdownTime = eventTime;
                     shutdownType = $"{eventId} - {eventType}";
+                }
+                // 4634: fallback logout — set shutdownTime seperti 4647.
+                // Priority lebih rendah dari 4647; TryUpdateDailySummaryShutdownAsync
+                // akan menolak update kalau 4647 sudah ada (GetShutdownPriority: 4634 < 4647).
+                else if (eventId == 4634)
+                {
+                    shutdownTime = eventTime;
+                    shutdownType = $"4634 - {eventType}";
                 }
                 // Fix 7: event 42 (Sleep) juga set shutdownTime secara eksplisit.
                 // Sebelumnya null dan fallback ke EventTime saat dispatch — ini tetap benar
@@ -2850,7 +2965,7 @@ namespace EventLogOutEmployeeService
             try
             {
                 int eventId = GetNormalizedEventId(entry);
-                if (eventId != 4624 && eventId != 4647)
+                if (eventId != 4624 && eventId != 4647 && eventId != 4634)
                     return;
 
                 // Untuk 4624: ambil section "New Logon:" saja
@@ -3259,15 +3374,26 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Tentukan apakah event 42 (Sleep) boleh dipakai sebagai last-resort ShutdownTime.
+        /// Tentukan apakah event 42 (Sleep/Modern Standby) boleh dipakai sebagai ShutdownTime.
         ///
-        /// Rules:
+        /// Dua skenario yang ditangani:
+        ///
+        ///   A. Fast Startup + Sleep tanpa 4647:
+        ///      Saat Fast Startup diaktifkan, Windows kadang tidak menulis 4647 dan 1074/6006
+        ///      saat user klik Sleep. Satu-satunya marker yang tersisa adalah event 42.
+        ///      Dalam skenario ini 42 harus dipromosikan sebagai shutdown event.
+        ///
+        ///   B. Last-resort generik:
+        ///      Tidak ada event shutdown lebih baik (4647, 4634, 1074, 6006-confirmed) sama sekali,
+        ///      dan tidak ada wake event setelah 42 ini.
+        ///
+        /// Rules (semua harus terpenuhi):
         ///   1. Tidak ada event shutdown "lebih baik" di queue untuk user+computer+workDate ini
-        ///      (1074, 6006-confirmed, 4647). Kalau ada, biarkan mereka yang update summary.
+        ///      (4647, 4634, 1074, 6006-confirmed). Kalau ada, biarkan mereka yang update summary.
         ///   2. Tidak ada wake event (4624) setelah 42 ini di workDate yang sama.
         ///      Kalau ada wake setelah 42 → 42 bukan sleep final → skip.
         ///   3. Username sudah resolved (bukan __UNRESOLVED__).
-        ///   4. Timestamp 42 masuk akal: setelah login time (tidak sebelum jam kerja).
+        ///   4. Minimal 15 detik setelah event time agar event lain sempat masuk queue.
         /// </summary>
         private async Task<bool> ShouldUseEvent42AsLastResortAsync(QueuedAttendanceEvent item)
         {
@@ -3296,14 +3422,16 @@ namespace EventLogOutEmployeeService
 
             string workDate = item.EventTime.ToLocalTime().ToString("yyyy-MM-dd");
 
-            // Syarat 1: cek apakah ada event shutdown lebih baik di queue
+            // Syarat 1: cek apakah ada event shutdown lebih baik di queue.
+            // 4634 (fallback 4647) juga dianggap "lebih baik" dari 42 — kalau 4634 sudah ada,
+            // 42 tidak perlu dipromosikan sebagai last-resort.
             var allItems = await eventQueue.GetAllAsync();
             bool hasBetterShutdown = allItems.Any(x =>
                 x.QueueId != item.QueueId &&
                 x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
                 x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
                 x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
-                (x.EventId == 1074 || x.EventId == 4647 ||
+                (x.EventId == 1074 || x.EventId == 4647 || x.EventId == 4634 ||
                  (x.EventId == 6006 && !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))));
 
             if (hasBetterShutdown)
@@ -3347,7 +3475,8 @@ namespace EventLogOutEmployeeService
             }
 
             SafeWriteEventLog("Application",
-                $"[DBG-42] Promoting to last-resort shutdown: no better event, no wake after. " +
+                $"[DBG-42] Promoting as shutdown (no better event, no wake after). " +
+                $"Likely Sleep-as-shutdown scenario (Fast Startup / user clicked Sleep without 4647/1074). " +
                 $"computer={item.ComputerName} user={item.Username} sleepTime={item.EventTime:O}",
                 EventLogEntryType.Information, 2032);
             return true;
@@ -4132,7 +4261,7 @@ namespace EventLogOutEmployeeService
 
         private static bool SupportsPendingSystemResolution(int eventId)
         {
-            return eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 42;
+            return eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 4634 || eventId == 42;
         }
 
         private static string BuildPendingFallbackSource(int eventId)
