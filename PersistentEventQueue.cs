@@ -251,7 +251,7 @@ namespace EventLogOutEmployeeService
         {
             if (!LoginLogoutMonitorService.VerboseLogging && eventId == 5011)
                 return;
-            try { EventLog.WriteEntry("Application", message, type, eventId); }
+            try { EventLog.WriteEntry("Attendance-Service", message, type, eventId); }
             catch { }
         }
 
@@ -1031,11 +1031,9 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                EventLog.WriteEntry("Application", message, type, eventId);
+                EventLog.WriteEntry("Attendance-Service", message, type, eventId);
             }
-            catch
-            {
-            }
+            catch { }
         }
     }
 }

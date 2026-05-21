@@ -782,14 +782,15 @@ namespace EventLogOutEmployeeService
 
         private static void SafeWriteEventLog(string source, string message, EventLogEntryType type, int eventId)
         {
-            // Kalau VerboseLogging=false, skip event ID yang masuk kategori verbose.
-            // Hanya error, warning essential, dan lifecycle event yang tetap ditulis.
             if (!_verboseLogging && _verboseOnlyEventIds.Contains(eventId))
                 return;
 
             try
             {
-                EventLog.WriteEntry(source, message, type, eventId);
+                // Selalu pakai "Attendance-Service" — source yang terdaftar dengan message table.
+                // Source "Application" adalah built-in Windows tanpa custom message table
+                // sehingga Event Viewer menampilkan disclaimer panjang di setiap entry.
+                EventLog.WriteEntry("Attendance-Service", message, type, eventId);
             }
             catch
             {

@@ -1102,18 +1102,14 @@ namespace EventLogOutEmployeeService
         /// </summary>
         private static void SafeWriteEventLog(string source, string message, EventLogEntryType type, int eventId)
         {
-            // Kalau VerboseLogging=false, skip event ID yang masuk kategori verbose.
             if (!LoginLogoutMonitorService.VerboseLogging && _verboseOnlyEventIds.Contains(eventId))
                 return;
 
             try
             {
-                EventLog.WriteEntry(source, message, type, eventId);
+                EventLog.WriteEntry("Attendance-Service", message, type, eventId);
             }
-            catch
-            {
-                // Suppress all EventLog failures silently.
-            }
+            catch { }
         }
 
         /// <summary>
