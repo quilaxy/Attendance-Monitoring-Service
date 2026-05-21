@@ -59,7 +59,6 @@ namespace EventLogOutEmployeeService
         private readonly Dictionary<string, DateTime> startupAnchorByDeviceWorkDate =
             new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private int queueAlertThreshold = 500;
-        private TimeSpan startupToFirst4624MaxGapForDirectUse = TimeSpan.FromMinutes(90);
         private bool queueThresholdAlerted = false;
         private int[] dispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
         private HashSet<string> systemFallbackTriggerAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -211,6 +210,10 @@ namespace EventLogOutEmployeeService
                 securityEventLog.EnableRaisingEvents = true;
             if (systemEventLog != null)
                 systemEventLog.EnableRaisingEvents = true;
+
+            // Catat kapan subscription diaktifkan — startup probe butuh referensi ini
+            // untuk menghitung berapa lama subscription sudah aktif tanpa menerima event.
+            Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, DateTime.UtcNow.Ticks);
 
             int maxRetries = 5;
             int currentRetry = 0;
@@ -826,10 +829,10 @@ namespace EventLogOutEmployeeService
             1080, 1082, 1083,
             // Debug system event parsing — semua [DBG-*]
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
-            // Debug fallback resolution detail — [DBG-1074] resolved, [DBG-6005] ignored/skip/allow
-            2013, 2014, 2024, 2025,
-            // Debug RawEventStore fallback — [DBG-4624], [DBG-6005], [DBG-GetMRU], [DBG-42]
-            2027, 2028, 2030, 2031, 2032,
+            // Debug fallback resolution detail — [DBG-1074] resolved
+            2013,
+            // Debug RawEventStore fallback — [DBG-4624], [DBG-GetMRU], [DBG-42]
+            2028, 2031, 2032,
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
             3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
@@ -959,7 +962,7 @@ namespace EventLogOutEmployeeService
                     continue;
 
                 int eventId = GetNormalizedEventId(entry);
-                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 6005 && eventId != 41 && eventId != 42)
+                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     continue;
 
                 entries.Add((eventTime, entry, eventId));
@@ -1209,8 +1212,6 @@ namespace EventLogOutEmployeeService
             // Baca VerboseLogging dari AppSettings — default false (production mode)
             VerboseLogging = config.GetValue<bool>("AppSettings:VerboseLogging", defaultValue: false);
             queueAlertThreshold = Math.Max(1, ReadIntFromEnvironment("QUEUE_ALERT_THRESHOLD", 500));
-            int startupGapMinutes = ReadIntFromEnvironment("STARTUP_TO_FIRST_4624_MAX_GAP_MINUTES", 90);
-            startupToFirst4624MaxGapForDirectUse = TimeSpan.FromMinutes(Math.Max(1, startupGapMinutes));
             dispatchBackoffSeconds = ReadIntListFromEnvironment(
                 "DISPATCH_BACKOFF_SECONDS", new[] { 30, 60, 120, 300, 600 });
 
@@ -1587,133 +1588,116 @@ namespace EventLogOutEmployeeService
         /// <summary>
         /// Mendeteksi dan memulihkan Security log subscription yang drop secara silent.
         ///
-        /// Penyebab: Windows EventLog.EntryWritten subscription berhenti firing tanpa exception
-        /// setelah Security log di-rotate (log penuh dan di-overwrite oleh event baru).
-        /// Ini adalah bug known di Windows EventLog API — tidak ada notifikasi saat ini terjadi.
+        /// Dua skenario yang di-handle:
+        ///   1. STARTUP DROP — subscription tidak pernah menerima event sejak di-enable.
+        ///      Terjadi kalau Security log langsung di-rotate saat wake dari hibernate/fast-startup,
+        ///      atau kalau log sudah penuh sebelum service start.
+        ///      Deteksi: tidak ada Security event dalam probeStartupWindowSeconds setelah subscription di-enable.
         ///
-        /// Dampak yang diamati:
-        ///   - rawevents berhenti terisi sejak log rotate terjadi
-        ///   - event 4624/4647 tidak masuk queue meski terlihat di Sentinel/Event Viewer
-        ///   - stop checkpoint terus diupdate oleh heartbeat (service hidup) tapi tidak ada
-        ///     event baru yang masuk karena handler tidak pernah dipanggil
+        ///   2. MID-DAY DROP — subscription mati di tengah sesi setelah log rotate.
+        ///      Terjadi karena Windows EventLog.EntryWritten subscription berhenti firing
+        ///      tanpa exception atau notifikasi setelah Security log overwrite.
+        ///      Deteksi: tidak ada Security event dalam threshold tertentu.
+        ///      Threshold adaptif:
+        ///        - Jam kerja (07:00–19:00): 30 menit — unlock/lock screen sangat sering
+        ///        - Luar jam kerja: tidak enforce — bisa memang tidak ada activity
         ///
-        /// Fix: cek setiap 5 menit. Kalau tidak ada Security event masuk dalam 30 menit
-        /// di jam kerja (07:00–19:00), lakukan disable→enable untuk re-subscribe.
-        /// Setelah re-subscribe, jalankan mini-replay dari rawevents dan Security log
-        /// untuk menangkap event yang missed selama subscription mati.
-        /// Threshold 30 menit (bukan 2 jam) karena di jam kerja, unlock/lock PC sangat
-        /// sering terjadi — 30 menit tanpa satupun Security event adalah anomali kuat.
+        /// Fast startup / hibernate awareness:
+        ///   - Subscription bisa langsung drop saat wake kalau log sudah di-rotate sebelum hibernate
+        ///   - Probe startup (90 detik) menangkap ini jauh lebih cepat dari threshold 30 menit
+        ///
+        /// Re-subscribe selalu diikuti mini-replay untuk menangkap event yang missed.
         /// </summary>
         private async Task SecurityLogSubscriptionHealthCheckTask(CancellationToken cancellationToken)
         {
-            // Threshold: 30 menit tanpa event Security di jam kerja dianggap subscription mati.
-            // Di jam kerja, Logon Type 7 (unlock) dari screensaver/sleep terjadi sangat sering.
-            // 30 menit tanpa event apapun = subscription hampir pasti sudah drop.
-            const int silentThresholdSeconds   = 1800; // 30 menit (sebelumnya 7200 = 2 jam)
-            const int workHourStart            = 7;    // 07:00
-            const int workHourEnd              = 19;   // 19:00
-            const int checkIntervalMinutes     = 5;
-            const int maxResubscribeAttempts   = 3;
+            const int checkIntervalSeconds      = 30;   // cek setiap 30 detik (sebelumnya 5 menit)
+            const int probeStartupWindowSeconds = 90;   // setelah startup, tunggu 90 detik untuk event pertama
+            const int silentThresholdWorkHour   = 1800; // 30 menit di jam kerja
+            const int maxResubscribeAttempts    = 3;
+            const int workHourStart             = 7;
+            const int workHourEnd               = 19;
+
+            bool startupProbeCompleted = false;
 
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromMinutes(checkIntervalMinutes), cancellationToken);
+                    await Task.Delay(TimeSpan.FromSeconds(checkIntervalSeconds), cancellationToken);
 
-                    int hour = DateTime.Now.Hour;
+                    long enabledTicks   = Interlocked.Read(ref _subscriptionEnabledTicksUtc);
+                    long lastEventTicks = Interlocked.Read(ref _lastSecurityEventTicksUtc);
+                    DateTime nowUtc     = DateTime.UtcNow;
+
+                    double secondsSinceEnabled   = (nowUtc.Ticks - enabledTicks) / (double)TimeSpan.TicksPerSecond;
+                    double secondsSinceLastEvent = lastEventTicks == DateTime.MinValue.Ticks
+                        ? secondsSinceEnabled  // belum pernah ada event → hitung dari subscription enable
+                        : (nowUtc.Ticks - lastEventTicks) / (double)TimeSpan.TicksPerSecond;
+
+                    // ── PROBE STARTUP ──────────────────────────────────────────────────────
+                    // Setelah subscription di-enable, tunggu probeStartupWindowSeconds.
+                    // Kalau tidak ada Security event sama sekali dalam window itu → subscription
+                    // kemungkinan besar drop (fast startup / hibernate / log sudah penuh saat wake).
+                    // Tidak peduli jam kerja — startup bisa terjadi kapan saja.
+                    if (!startupProbeCompleted && secondsSinceEnabled >= probeStartupWindowSeconds)
+                    {
+                        startupProbeCompleted = true;
+
+                        if (lastEventTicks == DateTime.MinValue.Ticks)
+                        {
+                            // Tidak ada Security event sama sekali sejak subscription di-enable
+                            SafeWriteEventLog("Application",
+                                $"[HEALTH] Startup probe: no Security event in {probeStartupWindowSeconds}s since " +
+                                $"subscription enabled. Possible hibernate resume or log rotation at wake. " +
+                                $"Force re-subscribe + mini-replay.",
+                                EventLogEntryType.Warning, 1079);
+
+                            // Buffer 5 menit sebelum subscription untuk tangkap event yang terjadi
+                            // tepat saat wake sebelum service berhasil subscribe.
+                            DateTime missedSince = new DateTime(enabledTicks, DateTimeKind.Utc)
+                                .Subtract(TimeSpan.FromMinutes(5));
+
+                            await ResubscribeAndMiniReplayAsync(
+                                missedSince, nowUtc, maxResubscribeAttempts, cancellationToken);
+                        }
+                        else
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[HEALTH] Startup probe OK: Security event received within " +
+                                $"{secondsSinceEnabled:F0}s of subscription enable.",
+                                EventLogEntryType.Information, 1080);
+                        }
+
+                        continue;
+                    }
+
+                    // ── MID-DAY DROP CHECK ─────────────────────────────────────────────────
+                    // Setelah startup probe selesai, monitor terus untuk mid-day drop.
+                    if (!startupProbeCompleted)
+                        continue; // masih dalam window startup probe, belum saatnya cek mid-day
+
+                    int hour        = DateTime.Now.Hour;
                     bool isWorkHour = hour >= workHourStart && hour < workHourEnd;
+
+                    // Di luar jam kerja: skip mid-day check (wajar tidak ada Security event)
                     if (!isWorkHour)
                         continue;
 
-                    long lastTicksUtc   = Interlocked.Read(ref _lastSecurityEventTicksUtc);
-                    double silentSeconds = (DateTime.UtcNow.Ticks - lastTicksUtc) / (double)TimeSpan.TicksPerSecond;
-
-                    if (silentSeconds < silentThresholdSeconds)
+                    if (secondsSinceLastEvent < silentThresholdWorkHour)
                         continue;
 
-                    int silentMinutes = (int)(silentSeconds / 60);
+                    int silentMinutes = (int)(secondsSinceLastEvent / 60);
                     SafeWriteEventLog("Application",
-                        $"[HEALTH] Security log subscription silent {silentMinutes} menit di jam kerja " +
-                        $"(threshold={silentThresholdSeconds / 60} menit). Kemungkinan Security log di-rotate " +
-                        $"dan subscription drop. Memulai re-subscribe + mini-replay.",
+                        $"[HEALTH] Mid-day drop detected: Security log silent {silentMinutes} min " +
+                        $"(threshold={silentThresholdWorkHour / 60} min). Re-subscribe + mini-replay.",
                         EventLogEntryType.Warning, 1079);
 
-                    // Catat waktu sejak kapan subscription dianggap mati — untuk mini-replay
-                    DateTime missedSinceUtc = new DateTime(lastTicksUtc, DateTimeKind.Utc);
+                    DateTime midDayMissedSince = lastEventTicks == DateTime.MinValue.Ticks
+                        ? new DateTime(enabledTicks, DateTimeKind.Utc)
+                        : new DateTime(lastEventTicks, DateTimeKind.Utc);
 
-                    bool resubscribed = false;
-                    for (int attempt = 1; attempt <= maxResubscribeAttempts; attempt++)
-                    {
-                        try
-                        {
-                            if (securityEventLog == null)
-                            {
-                                SafeWriteEventLog("Application",
-                                    "[HEALTH] securityEventLog is null — tidak bisa re-subscribe.",
-                                    EventLogEntryType.Warning, 1080);
-                                break;
-                            }
-
-                            securityEventLog.EnableRaisingEvents = false;
-                            await Task.Delay(300, cancellationToken);
-                            securityEventLog.EnableRaisingEvents = true;
-
-                            // Reset counter setelah re-subscribe — beri waktu sebelum cek lagi
-                            Interlocked.Exchange(ref _lastSecurityEventTicksUtc, DateTime.UtcNow.Ticks);
-
-                            SafeWriteEventLog("Application",
-                                $"[HEALTH] Security log re-subscribed OK (attempt {attempt}/{maxResubscribeAttempts}).",
-                                EventLogEntryType.Information, 1080);
-                            resubscribed = true;
-                            break;
-                        }
-                        catch (Exception ex)
-                        {
-                            SafeWriteEventLog("Application",
-                                $"[HEALTH] Re-subscribe attempt {attempt}/{maxResubscribeAttempts} failed: {ex.Message}",
-                                EventLogEntryType.Warning, 1081);
-
-                            if (attempt < maxResubscribeAttempts)
-                                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
-                        }
-                    }
-
-                    if (!resubscribed)
-                        continue;
-
-                    // ── Mini-replay: tangkap event yang missed selama subscription mati ──
-                    // Replay dari waktu subscription dianggap mati hingga sekarang.
-                    // Gunakan Security log langsung (bukan rawevents) karena rawevents
-                    // juga tidak terisi selama subscription mati.
-                    // Kalau Security log sudah di-rotate dan event tidak ada lagi, rawevents
-                    // juga tidak bisa membantu — data tersebut hilang permanen.
-                    try
-                    {
-                        DateTime replayTo = DateTime.UtcNow;
-
-                        SafeWriteEventLog("Application",
-                            $"[HEALTH] Mini-replay Security log: from={missedSinceUtc:O} to={replayTo:O}",
-                            EventLogEntryType.Information, 1082);
-
-                        // ReplaySecurityEvents menggunakan .GetAwaiter().GetResult() di dalamnya
-                        // (ProcessSecurityEntryAsync dipanggil sync). Jalankan di thread pool
-                        // untuk menghindari deadlock potensial dari async context health check task.
-                        await Task.Run(() => ReplaySecurityEvents(missedSinceUtc, replayTo), cancellationToken);
-
-                        // Juga replay dari RawEventStore untuk tanggal-tanggal yang tercakup
-                        await ReplayFromRawStore(missedSinceUtc, replayTo);
-
-                        SafeWriteEventLog("Application",
-                            $"[HEALTH] Mini-replay selesai: from={missedSinceUtc:O} to={replayTo:O}",
-                            EventLogEntryType.Information, 1083);
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeWriteEventLog("Application",
-                            $"[HEALTH] Mini-replay error: {ex.Message}",
-                            EventLogEntryType.Warning, 1084);
-                    }
+                    await ResubscribeAndMiniReplayAsync(
+                        midDayMissedSince, nowUtc, maxResubscribeAttempts, cancellationToken);
                 }
                 catch (TaskCanceledException) { break; }
                 catch (Exception ex)
@@ -1728,6 +1712,98 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        /// <summary>
+        /// Re-subscribe Security log dan jalankan mini-replay untuk window yang missed.
+        /// Dipanggil baik dari startup probe maupun mid-day drop detection.
+        ///
+        /// Setelah re-subscribe berhasil:
+        ///   - _lastSecurityEventTicksUtc di-reset ke UtcNow agar mid-day cooldown
+        ///     tidak langsung trigger lagi (threshold 30 menit dihitung ulang dari sini).
+        ///   - _subscriptionEnabledTicksUtc di-reset ke UtcNow agar startup probe
+        ///     tidak aktif lagi di iterasi berikutnya.
+        /// </summary>
+        private async Task ResubscribeAndMiniReplayAsync(
+            DateTime missedSinceUtc,
+            DateTime replayToUtc,
+            int maxAttempts,
+            CancellationToken cancellationToken)
+        {
+            bool resubscribed = false;
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    if (securityEventLog == null)
+                    {
+                        SafeWriteEventLog("Application",
+                            "[HEALTH] securityEventLog is null — cannot re-subscribe.",
+                            EventLogEntryType.Warning, 1081);
+                        break;
+                    }
+
+                    securityEventLog.EnableRaisingEvents = false;
+                    await Task.Delay(300, cancellationToken);
+                    securityEventLog.EnableRaisingEvents = true;
+
+                    // Reset kedua counter setelah re-subscribe berhasil:
+                    //   _lastSecurityEventTicksUtc   → mid-day cooldown dihitung ulang dari sini
+                    //   _subscriptionEnabledTicksUtc → probe startup tidak aktif di iterasi berikutnya
+                    long nowTicks = DateTime.UtcNow.Ticks;
+                    Interlocked.Exchange(ref _lastSecurityEventTicksUtc,   nowTicks);
+                    Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, nowTicks);
+
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH] Re-subscribed OK (attempt {attempt}/{maxAttempts}).",
+                        EventLogEntryType.Information, 1080);
+
+                    resubscribed = true;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH] Re-subscribe attempt {attempt}/{maxAttempts} failed: {ex.Message}",
+                        EventLogEntryType.Warning, 1081);
+
+                    if (attempt < maxAttempts)
+                        await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                }
+            }
+
+            if (!resubscribed)
+                return;
+
+            // Mini-replay: tangkap event yang missed selama subscription mati.
+            // Security log sebagai sumber utama, RawEventStore sebagai fallback
+            // kalau Security log sudah di-rotate sejak subscription drop.
+            try
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH] Mini-replay: from={missedSinceUtc:O} to={replayToUtc:O}",
+                    EventLogEntryType.Information, 1082);
+
+                // Jalankan di thread pool — ReplaySecurityEvents memanggil
+                // ProcessSecurityEntryAsync secara sync (.GetAwaiter().GetResult())
+                // sehingga perlu thread terpisah untuk hindari deadlock dari async context.
+                await Task.Run(
+                    () => ReplaySecurityEvents(missedSinceUtc, replayToUtc),
+                    cancellationToken);
+
+                await ReplayFromRawStore(missedSinceUtc, replayToUtc);
+
+                SafeWriteEventLog("Application",
+                    $"[HEALTH] Mini-replay done: from={missedSinceUtc:O} to={replayToUtc:O}",
+                    EventLogEntryType.Information, 1083);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH] Mini-replay error: {ex.Message}",
+                    EventLogEntryType.Warning, 1084);
+            }
+        }
+
         private static bool IsPendingQueueItemExpired(QueuedAttendanceEvent item, DateTime nowUtc)
         {
             DateTime eventTimeUtc = item.EventTime.Kind == DateTimeKind.Unspecified
@@ -1739,8 +1815,8 @@ namespace EventLogOutEmployeeService
 
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
         {
-            // Login events (4624 normal, 6005 fallback): summary hanya first login of day.
-            if (item.EventId == 4624 || item.EventId == 6005)
+            // Login events (4624 normal): summary hanya first login of day.
+            if (item.EventId == 4624)
                 return item.IsSummaryEligible;
 
             // Seluruh group ditandai restart → semua member skip summary.
@@ -1759,8 +1835,7 @@ namespace EventLogOutEmployeeService
                 item.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))
                 return false;
 
-            if (item.EventId == 1074 || item.EventId == 6006 ||
-                item.EventId == 4647 || item.EventId == 6008 || item.EventId == 41)
+            if (item.EventId == 1074 || item.EventId == 6006 || item.EventId == 4647)
                 return true;
 
             // FIX [BUG-2+3]: Event 42 (Sleep/Modern Standby) sebagai last-resort shutdown.
@@ -1776,7 +1851,7 @@ namespace EventLogOutEmployeeService
         /// Priority untuk shutdown group — harus konsisten dengan SharePointIntegration.GetShutdownPriority.
         /// Dipakai untuk menentukan event mana di group yang boleh dispatch summary saat timer expired.
         ///   4647 = 6 (HIGHEST — explicit logoff, reliable di sleep/fast-startup/hibernate)
-        ///   1074 shutdown = 5 | 6006 confirmed = 4 | 6008/41 = 1 | 42 = 0 (last resort)
+        ///   1074 shutdown = 5 | 6006 confirmed = 4 | 42 = 0 (last resort)
         /// FIX B: 1074 dinaikkan ke 5 (sebelumnya 4) dan 6006 confirmed diturunkan ke 4 (sebelumnya 5).
         /// Alasan: 1074 Shutdown Initiated membawa timestamp tepat saat user memilih Shutdown,
         /// sedangkan 6006 Shutdown Completed bisa tertunda beberapa detik/menit setelah itu.
@@ -1790,8 +1865,6 @@ namespace EventLogOutEmployeeService
                                 && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 5; // was 4
             if (eventId == 6006)
                 return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 4; // was 5
-            if (eventId == 6008) return 1;
-            if (eventId == 41)   return 1;
             if (eventId == 42)   return 0; // last resort — hanya kalau tidak ada event lain
             return 0;
         }
@@ -1802,9 +1875,7 @@ namespace EventLogOutEmployeeService
             {
                 if (item.PendingUsernameResolution)
                 {
-                    bool resolved = item.EventId == 6005
-                        ? await TryResolvePending6005UsernameAsync(item)
-                        : await TryResolvePendingSystemUsernameAsync(item);
+                    bool resolved = await TryResolvePendingSystemUsernameAsync(item);
                     if (!resolved)
                     {
                         item.LastDispatchError ??= $"{item.EventId} username is still unresolved";
@@ -1958,7 +2029,7 @@ namespace EventLogOutEmployeeService
 
                 if (needsSummary)
                 {
-                    if (item.EventId == 4624 || item.EventId == 6005)
+                    if (item.EventId == 4624)
                     {
                         SafeWriteEventLog("Application",
                             $"[DISPATCH] Sending summary login: user={item.Username} computer={item.ComputerName} " +
@@ -2165,10 +2236,16 @@ namespace EventLogOutEmployeeService
         // Windows EventLog.EntryWritten subscription bisa drop secara silent setelah
         // Security log di-rotate (log penuh dan di-overwrite). Tidak ada exception,
         // tidak ada notifikasi — event handler berhenti firing tanpa jejak apapun.
-        // Counter ini melacak berapa detik sejak Security event terakhir diterima.
-        // SecurityLogSubscriptionHealthCheckTask memonitor counter ini dan re-subscribe
-        // kalau terlalu lama silent di jam kerja.
-        private long _lastSecurityEventTicksUtc = DateTime.UtcNow.Ticks;
+        //
+        // _lastSecurityEventTicksUtc: kapan terakhir OnSecurityEventWritten dipanggil.
+        //   Init ke MinValue (bukan UtcNow) agar startup probe bisa membedakan
+        //   "belum pernah ada event" vs "sudah ada event sebelumnya".
+        //
+        // _subscriptionEnabledTicksUtc: kapan EnableRaisingEvents = true terakhir dipanggil.
+        //   Diset di OnStart() dan ResubscribeAndMiniReplayAsync() setiap kali
+        //   subscription di-enable ulang.
+        private long _lastSecurityEventTicksUtc   = DateTime.MinValue.Ticks;
+        private long _subscriptionEnabledTicksUtc = DateTime.MinValue.Ticks;
 
         private void OnSecurityEventWritten(object sender, EntryWrittenEventArgs e)
         {
@@ -2390,7 +2467,7 @@ namespace EventLogOutEmployeeService
             try
             {
                 int eventId = GetNormalizedEventId(log);
-                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 6005 && eventId != 41 && eventId != 42)
+                if (eventId != 1074 && eventId != 6006 && eventId != 6008 && eventId != 41 && eventId != 42)
                     return;
 
                 DateTime eventTime = log.TimeGenerated.ToUniversalTime();
@@ -2421,15 +2498,13 @@ namespace EventLogOutEmployeeService
                         EventLogEntryType.Information, 2002);
                 }
 
-                if (eventId == 6005)
+                // 6008 and 41 — Application Log warning only, not enqueued to SharePoint.
+                if (eventId == 6008 || eventId == 41)
                 {
-                    bool handled = await TryProcessFallbackLoginFrom6005Async(eventTime, computerName, writeRawRecord);
-                    if (!handled)
-                    {
-                        SafeWriteEventLog("Application",
-                            $"[DBG-6005] Event ignored at {eventTime:O} on {computerName} — no fallback login needed/resolved.",
-                            EventLogEntryType.Information, 2014);
-                    }
+                    string label = eventId == 6008 ? "Unexpected Shutdown" : "System Crash";
+                    SafeWriteEventLog("Application",
+                        $"[SYSTEM] Event {eventId} ({label}) detected at {eventTime:O} on {computerName} — logged as warning, not dispatched.",
+                        EventLogEntryType.Warning, eventId == 6008 ? 6008 : 41);
                     return;
                 }
 
@@ -2620,15 +2695,12 @@ namespace EventLogOutEmployeeService
                     },
                     "System" => eventId switch
                     {
-                        6005 => "UNCONFIRMED - Fallback from Event 6005, Security Log unavailable",
                         1074 => ParseShutdownType(eventMessage),
                         // For 6006: eventMessage carries the confirmed 1074 shutdown type (if paired).
                         // If null, we don't know the cause — label it as unconfirmed.
                         6006 => !string.IsNullOrEmpty(eventMessage)
                                     ? $"Shutdown Completed ({eventMessage})"
                                     : "Shutdown Completed (type unconfirmed)",
-                        6008 => "Unexpected Shutdown",
-                        41   => "System Crash",
                         42   => "Sleep",
                         _    => "Unknown System Event"
                     },
@@ -2638,8 +2710,7 @@ namespace EventLogOutEmployeeService
                 if (eventTime.Kind == DateTimeKind.Unspecified)
                     eventTime = DateTime.SpecifyKind(eventTime, DateTimeKind.Local);
 
-                if (eventId == 1074 || eventId == 6006 || eventId == 4647 ||
-                    eventId == 6008 || eventId == 41 || eventId == 42)
+                if (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 42)
                     SharePointIntegration.MarkShutdownEvent(eventTime);
 
                 DateTime? loginTime = null;
@@ -2647,13 +2718,12 @@ namespace EventLogOutEmployeeService
                 DateTime? shutdownTime = null;
                 string? shutdownType = null;
 
-                if (eventId == 4624 || eventId == 6005)
+                if (eventId == 4624)
                 {
                     loginTime = eventTime;
                     expectedTimeOut = eventTime.AddHours(9);
                 }
-                else if (eventId == 1074 || eventId == 6006 ||
-                         eventId == 4647 || eventId == 6008 || eventId == 41)
+                else if (eventId == 1074 || eventId == 6006 || eventId == 4647)
                 {
                     shutdownTime = eventTime;
                     shutdownType = $"{eventId} - {eventType}";
@@ -2829,9 +2899,9 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Replay raw security events dari RawEventStore untuk workDate tertentu.
-        /// Dipanggil sebagai fallback di ResolveFirst4624ForWorkDateAsync dan
-        /// IsSecurityLogUnavailableOrLikelyCleared kalau Security log lokal kosong.
+        /// Ambil raw security events dari RawEventStore untuk workDate tertentu.
+        /// Dipanggil sebagai fallback di ResolveFirst4624ForWorkDateAsync
+        /// kalau Security log lokal kosong atau ter-rotate.
         /// </summary>
         private List<RawSecurityEvent> GetRawEventsFromStore(string computerName, DateTime localDate, int eventId)
         {
@@ -3188,134 +3258,13 @@ namespace EventLogOutEmployeeService
             return null;
         }
 
-        private async Task<bool> TryProcessFallbackLoginFrom6005Async(DateTime eventTime, string computerName, bool writeRawRecord)
-        {
-            if (!await ShouldAllow6005FallbackAsync(eventTime, computerName))
-                return false;
-
-            string? resolvedUsername = null;
-            string? fallbackSource = null;
-            bool isNetworkUnavailable = false;
-            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-
-            lock (knownLoginLock)
-            {
-                if (lastKnownLoginByComputer.TryGetValue(computerName, out var known) &&
-                    known.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
-                    IsValidUsername(known.Username))
-                {
-                    resolvedUsername = known.Username;
-                    fallbackSource = "Event6005_PreviousLog";
-                }
-            }
-
-            if (string.IsNullOrWhiteSpace(resolvedUsername))
-            {
-                string? fromQueue = await eventQueue.FindMostRecent4624UsernameForComputerAsync(computerName, eventTime);
-                if (!string.IsNullOrWhiteSpace(fromQueue) && IsValidUsername(fromQueue))
-                {
-                    resolvedUsername = fromQueue;
-                    fallbackSource = "Event6005_PreviousLog";
-                }
-            }
-
-            // Fix 4: coba RawEventStore sebelum SharePoint.
-            // Kalau Security log bersih dan queue kosong (fresh start), RawEventStore
-            // justru punya 4624 valid yang disimpan saat event terjadi — jauh lebih cepat
-            // dan lebih akurat daripada query SharePoint raw list.
-            if (string.IsNullOrWhiteSpace(resolvedUsername))
-            {
-                var rawEvents = GetRawEventsFromStore(computerName, eventTime.ToLocalTime().Date, 4624);
-                var bestRaw = rawEvents
-                    .Where(r => r.EventTimeUtc <= eventTime && IsRelevantLogonType(r.LogonType))
-                    .OrderByDescending(r => r.EventTimeUtc)
-                    .FirstOrDefault();
-
-                if (bestRaw != null)
-                {
-                    string? rawUser = bestRaw.Username;
-                    if (!string.IsNullOrWhiteSpace(rawUser))
-                        rawUser = ResolveUsernameBySid(rawUser, bestRaw.Sid);
-                    if (!string.IsNullOrWhiteSpace(rawUser) && IsValidUsername(rawUser))
-                    {
-                        resolvedUsername = rawUser;
-                        fallbackSource = "Event6005_RawStore";
-                        SafeWriteEventLog("Application",
-                            $"[DBG-6005] Resolved username from RawEventStore for {computerName}: " +
-                            $"user={resolvedUsername} rawTime={bestRaw.EventTimeUtc:O}",
-                            EventLogEntryType.Information, 2030);
-                    }
-                }
-            }
-
-            if (string.IsNullOrWhiteSpace(resolvedUsername))
-            {
-                var sharePointLookup = await sharePointIntegration.Value.GetLatestUsernameByComputerWithStatusAsync(computerName, eventTime);
-                string? fromSharePoint = sharePointLookup.Username;
-                isNetworkUnavailable = sharePointLookup.NetworkUnavailable;
-                if (!string.IsNullOrWhiteSpace(fromSharePoint) && IsValidUsername(fromSharePoint))
-                {
-                    resolvedUsername = fromSharePoint;
-                    fallbackSource = "Event6005_SharePoint";
-                }
-            }
-
-            if (string.IsNullOrWhiteSpace(resolvedUsername))
-            {
-                await ProcessEvent(
-                    6005,
-                    "__UNRESOLVED__",
-                    eventTime,
-                    computerName,
-                    "System",
-                    0,
-                    null,
-                    writeRawRecord,
-                    usernameResolutionSource: "Fallback6005_Pending",
-                    originalUsername: null,
-                    fallbackSource: "Event6005_Pending",
-                    isFallback: true,
-                    resolvedUsername: null,
-                    status: "UNCONFIRMED",
-                    pendingUsernameResolution: true);
-
-                SafeWriteEventLog("Application",
-                    $"[DBG-6005] Fallback login queued as pending at {eventTime:O} on {computerName}. " +
-                    $"reason={(isNetworkUnavailable ? "network unavailable" : "username not yet resolvable")}",
-                    EventLogEntryType.Information, 2026);
-                return true;
-            }
-
-            lock (knownLoginLock)
-                lastKnownLoginByComputer[computerName] = (resolvedUsername, eventTime);
-
-            await ProcessEvent(
-                6005,
-                resolvedUsername,
-                eventTime,
-                computerName,
-                "System",
-                0,
-                null,
-                writeRawRecord,
-                usernameResolutionSource: "Fallback6005",
-                originalUsername: null,
-                fallbackSource: fallbackSource,
-                isFallback: true,
-                resolvedUsername: resolvedUsername,
-                status: "UNCONFIRMED",
-                pendingUsernameResolution: false);
-
-            return true;
-        }
-
         /// <summary>
         /// Tentukan apakah event 42 (Sleep) boleh dipakai sebagai last-resort ShutdownTime.
         ///
         /// Rules:
         ///   1. Tidak ada event shutdown "lebih baik" di queue untuk user+computer+workDate ini
-        ///      (1074, 6006-confirmed, 4647, 6008, 41). Kalau ada, biarkan mereka yang update summary.
-        ///   2. Tidak ada wake event (4624/6005) setelah 42 ini di workDate yang sama.
+        ///      (1074, 6006-confirmed, 4647). Kalau ada, biarkan mereka yang update summary.
+        ///   2. Tidak ada wake event (4624) setelah 42 ini di workDate yang sama.
         ///      Kalau ada wake setelah 42 → 42 bukan sleep final → skip.
         ///   3. Username sudah resolved (bukan __UNRESOLVED__).
         ///   4. Timestamp 42 masuk akal: setelah login time (tidak sebelum jam kerja).
@@ -3354,7 +3303,7 @@ namespace EventLogOutEmployeeService
                 x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
                 x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
                 x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
-                (x.EventId == 1074 || x.EventId == 4647 || x.EventId == 6008 || x.EventId == 41 ||
+                (x.EventId == 1074 || x.EventId == 4647 ||
                  (x.EventId == 6006 && !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))));
 
             if (hasBetterShutdown)
@@ -3401,90 +3350,6 @@ namespace EventLogOutEmployeeService
                 $"[DBG-42] Promoting to last-resort shutdown: no better event, no wake after. " +
                 $"computer={item.ComputerName} user={item.Username} sleepTime={item.EventTime:O}",
                 EventLogEntryType.Information, 2032);
-            return true;
-        }
-
-        private async Task<bool> TryResolvePending6005UsernameAsync(QueuedAttendanceEvent item)
-        {
-            if (item.EventId != 6005 || !item.PendingUsernameResolution)
-                return true;
-
-            string workDate = item.EventTime.ToLocalTime().ToString("yyyy-MM-dd");
-            string? resolvedUsername = null;
-            string? fallbackSource = null;
-            bool networkUnavailable = false;
-
-            var firstAfter = await ResolveFirst4624ForWorkDateAsync(
-                item.ComputerName,
-                item.EventTime,
-                requireAfterEventTime: true);
-            if (firstAfter.HasValue && IsValidUsername(firstAfter.Value.Username))
-            {
-                resolvedUsername = firstAfter.Value.Username;
-                fallbackSource = "Event6005_First4624After";
-            }
-
-            if (string.IsNullOrWhiteSpace(resolvedUsername))
-            {
-                var first4624AfterFromQueue = await eventQueue.FindFirst4624ForComputerWorkDateAfterAsync(
-                    item.ComputerName,
-                    workDate,
-                    item.EventTime);
-                if (first4624AfterFromQueue.HasValue && IsValidUsername(first4624AfterFromQueue.Value.Username))
-                {
-                    resolvedUsername = first4624AfterFromQueue.Value.Username;
-                    fallbackSource = "Event6005_First4624After";
-                }
-            }
-
-            if (string.IsNullOrWhiteSpace(resolvedUsername))
-            {
-                resolvedUsername = await eventQueue.FindMostRecent4624UsernameForComputerAsync(item.ComputerName, item.EventTime);
-                if (!string.IsNullOrWhiteSpace(resolvedUsername) && IsValidUsername(resolvedUsername))
-                    fallbackSource = "Event6005_PreviousLog";
-            }
-
-            if (string.IsNullOrWhiteSpace(resolvedUsername))
-            {
-                var sharePointLookup = await sharePointIntegration.Value.GetLatestUsernameByComputerWithStatusAsync(
-                    item.ComputerName, item.EventTime);
-                resolvedUsername = sharePointLookup.Username;
-                networkUnavailable = sharePointLookup.NetworkUnavailable;
-                if (!string.IsNullOrWhiteSpace(resolvedUsername) && IsValidUsername(resolvedUsername))
-                    fallbackSource = "Event6005_SharePoint";
-            }
-
-            if (string.IsNullOrWhiteSpace(resolvedUsername))
-            {
-                item.PendingUsernameResolution = true;
-                item.Username = "__UNRESOLVED__";
-                item.ResolvedUsername = null;
-                item.FallbackSource = "Event6005_Pending";
-                item.Status = "UNCONFIRMED";
-                item.LastDispatchError = networkUnavailable
-                    ? "6005 username unresolved due to network unavailable"
-                    : "6005 username unresolved";
-                await eventQueue.ReplaceAsync(item);
-                return false;
-            }
-
-            lock (knownLoginLock)
-                lastKnownLoginByComputer[item.ComputerName] = (resolvedUsername, item.EventTime);
-
-            item.Username = resolvedUsername;
-            item.ResolvedUsername = resolvedUsername;
-            item.IsFallback = true;
-            item.UsernameResolutionSource = "Fallback6005";
-            item.FallbackSource = fallbackSource;
-            item.Status = "UNCONFIRMED";
-            item.PendingUsernameResolution = false;
-            item.LastDispatchError = null;
-            await eventQueue.ReplaceAsync(item);
-
-            // FIX [BUG-5]: Propagate username ke firstLogon4624 index agar event
-            // berikutnya (1074/6006) bisa resolve username via ResolveFirst4624UsernameForWorkDateAsync.
-            RegisterFirst4624Logon(item.ComputerName, resolvedUsername, item.EventTime);
-
             return true;
         }
 
@@ -3562,140 +3427,6 @@ namespace EventLogOutEmployeeService
             item.LastDispatchError = null;
             await eventQueue.ReplaceAsync(item);
             return true;
-        }
-
-        private async Task<bool> ShouldAllow6005FallbackAsync(DateTime eventTime, string computerName)
-        {
-            if (replayInProgress)
-                return false;
-
-            string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-            var first4624 = await ResolveFirst4624ForWorkDateAsync(
-                computerName,
-                eventTime,
-                requireAfterEventTime: false);
-
-            if (first4624.HasValue)
-            {
-                if (TryGetStartupAnchorForWorkDate(computerName, eventTime, out DateTime startupAnchorUtc))
-                {
-                    TimeSpan gap = first4624.Value.EventTime - startupAnchorUtc;
-                    if (gap < TimeSpan.Zero)
-                    {
-                        SafeWriteEventLog("Application",
-                            $"[DBG-6005] Startup anchor is later than first 4624. " +
-                            $"computer={computerName} workDate={workDate} startup={startupAnchorUtc:O} " +
-                            $"first4624={first4624.Value.EventTime:O}",
-                            EventLogEntryType.Warning, 2032);
-                        gap = TimeSpan.Zero;
-                    }
-
-                    if (gap <= startupToFirst4624MaxGapForDirectUse)
-                    {
-                        SafeWriteEventLog("Application",
-                            $"[DBG-6005] SKIP fallback: startup→first4624 gap within threshold. " +
-                            $"computer={computerName} workDate={workDate} startup={startupAnchorUtc:O} " +
-                            $"first4624={first4624.Value.EventTime:O} gapMin={gap.TotalMinutes:F1} " +
-                            $"thresholdMin={startupToFirst4624MaxGapForDirectUse.TotalMinutes:F1}",
-                            EventLogEntryType.Information, 2024);
-                        return false;
-                    }
-
-                    SafeWriteEventLog("Application",
-                        $"[DBG-6005] ALLOW fallback: startup→first4624 gap exceeds threshold. " +
-                        $"computer={computerName} workDate={workDate} startup={startupAnchorUtc:O} " +
-                        $"first4624={first4624.Value.EventTime:O} gapMin={gap.TotalMinutes:F1} " +
-                        $"thresholdMin={startupToFirst4624MaxGapForDirectUse.TotalMinutes:F1}",
-                        EventLogEntryType.Information, 2025);
-                    return true;
-                }
-
-                SafeWriteEventLog("Application",
-                    $"[DBG-6005] SKIP fallback: first 4624 already available and startup anchor not found. " +
-                    $"computer={computerName} workDate={workDate} first4624={first4624.Value.EventTime:O}",
-                    EventLogEntryType.Information, 2027);
-                return false;
-            }
-
-            return IsSecurityLogUnavailableOrLikelyCleared(eventTime, computerName);
-        }
-
-        private bool IsSecurityLogUnavailableOrLikelyCleared(DateTime eventTime, string computerName)
-        {
-            try
-            {
-                EventLog secLog = securityEventLog ?? new EventLog("Security");
-                int total = secLog.Entries.Count;
-                if (total == 0)
-                    return true;
-
-                DateTime workDateStartLocal = eventTime.ToLocalTime().Date;
-                DateTime workDateStartUtc = workDateStartLocal.ToUniversalTime();
-                DateTime oldestSeen = DateTime.MaxValue;
-                bool has4624Today = false;
-                bool hasLogClearedSignal = false;
-                int scanned = 0;
-
-                for (int i = total - 1; i >= 0 && scanned < 4000; i--)
-                {
-                    scanned++;
-                    EventLogEntry entry = secLog.Entries[i];
-                    DateTime t = entry.TimeGenerated.ToUniversalTime();
-                    if (t < oldestSeen)
-                        oldestSeen = t;
-
-                    if (t < workDateStartUtc)
-                        break;
-
-                    int eventId = GetNormalizedEventId(entry);
-                    if (eventId == 1102)
-                        hasLogClearedSignal = true;
-
-                    if (eventId == 4624 && entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        int lt = ParseLogonType(entry.Message ?? string.Empty);
-                        if (IsRelevantLogonType(lt))
-                        {
-                            has4624Today = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (has4624Today)
-                    return false;
-
-                if (hasLogClearedSignal)
-                    return true;
-
-                // FIX [BUG-4]: Kalau tidak ada 4624 hari ini di Security log tapi ada event lain
-                // hari ini (oldestSeen masih hari ini), cek RawEventStore sebagai tiebreaker.
-                // Kasus ini terjadi saat log rotation membuang 4624 pagi tapi entry lain masih ada.
-                // Kalau RawEventStore punya 4624 hari ini → log cleared/rotated → allow fallback.
-                if (oldestSeen <= workDateStartUtc)
-                {
-                    // oldestSeen sebelum workDate → log punya history hari ini, 4624 memang tidak ada
-                    return false;
-                }
-
-                // oldestSeen setelah workDate start → log tidak punya entry dari awal hari ini.
-                // Cek RawEventStore: kalau ada 4624 tersimpan di sana, berarti log cleared.
-                var rawToday = GetRawEventsFromStore(computerName, workDateStartLocal, 4624);
-                if (rawToday.Count > 0)
-                {
-                    SafeWriteEventLog("Application",
-                        $"[DBG-6005] RawEventStore has {rawToday.Count} 4624 for {computerName} " +
-                        $"on {workDateStartLocal:yyyy-MM-dd} but Security log missing → treating as cleared.",
-                        EventLogEntryType.Information, 2027);
-                    return true;
-                }
-
-                return oldestSeen > workDateStartUtc;
-            }
-            catch
-            {
-                return true;
-            }
         }
 
         private async Task<string?> ResolveFirst4624UsernameForWorkDateAsync(string computerName, DateTime eventTime)
@@ -3930,14 +3661,14 @@ namespace EventLogOutEmployeeService
             catch (Exception ex)
             {
                 SafeWriteEventLog("Application",
-                    $"[DBG-6005] Failed to scan startup anchor for {computerName} at {eventTime:O}: {ex.Message}",
+                    $"[DBG-StartupAnchor] Failed to scan startup anchor for {computerName} at {eventTime:O}: {ex.Message}",
                     EventLogEntryType.Warning, 2029);
                 return false;
             }
         }
 
         private static bool IsStartupAnchorEventId(int eventId)
-            => eventId == 12 || eventId == 6005 || eventId == 6009;
+            => eventId == 12 || eventId == 6009;
 
         private void RegisterFirst4624Logon(string computerName, string username, DateTime eventTime)
         {
@@ -4401,8 +4132,7 @@ namespace EventLogOutEmployeeService
 
         private static bool SupportsPendingSystemResolution(int eventId)
         {
-            return eventId == 1074 || eventId == 6006 || eventId == 4647 ||
-                   eventId == 42 || eventId == 6008 || eventId == 41;
+            return eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 42;
         }
 
         private static string BuildPendingFallbackSource(int eventId)
