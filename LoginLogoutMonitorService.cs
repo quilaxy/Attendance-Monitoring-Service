@@ -2969,18 +2969,31 @@ namespace EventLogOutEmployeeService
                 if (eventId != 4624 && eventId != 4647 && eventId != 4634)
                     return;
 
-                // Untuk 4624: ambil section "New Logon:" saja
-                // Untuk 4647: ambil section "Subject:" saja
+                // Untuk 4624: ambil dari "Logon Information:" (bukan "New Logon:") agar excerpt
+                // mencakup KEDUA field yang dibutuhkan IsAdminSplitTokenLogin:
+                //   - "Elevated Token: Yes/No"  → ada di section "Logon Information:"
+                //   - "Linked Logon ID: 0x..."  → ada di section "New Logon:" (setelah "Logon Information:")
+                // Kalau anchor hanya "New Logon:", "Elevated Token" tidak masuk excerpt
+                // sehingga admin dengan Elevated Token Yes tapi Linked Logon ID = 0x0 lolos filter.
+                // Naikkan limit dari 600 → 1200 char untuk cover kedua section secara penuh.
+                // Untuk 4647: ambil section "Subject:" saja (tidak butuh Elevated Token check).
                 string? excerpt = null;
                 string? message = entry.Message;
                 if (message != null)
                 {
-                    string anchor = eventId == 4624 ? "New Logon:" : "Subject:";
+                    string anchor = eventId == 4624 ? "Logon Information:" : "Subject:";
                     int idx = message.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0 && eventId == 4624)
+                    {
+                        // Fallback: kalau "Logon Information:" tidak ditemukan (locale berbeda),
+                        // coba "New Logon:" agar minimal Linked Logon ID ter-cover.
+                        idx = message.IndexOf("New Logon:", StringComparison.OrdinalIgnoreCase);
+                    }
                     if (idx >= 0)
                     {
-                        // Ambil max 600 char dari anchor untuk dapat Account Name + Security ID
-                        int len = Math.Min(600, message.Length - idx);
+                        // 1200 char: cukup untuk cover "Logon Information:" + "New Logon:"
+                        // termasuk semua field Elevated Token dan Linked Logon ID.
+                        int len = Math.Min(1200, message.Length - idx);
                         excerpt = message.Substring(idx, len);
                     }
                 }
@@ -2990,6 +3003,7 @@ namespace EventLogOutEmployeeService
                 // lalu saat ProcessRawSecurityEventAsync replay — yang tidak punya akses ke
                 // full message — tidak bisa re-check split token dan akun admin lolos masuk queue.
                 // IsAdminSplitTokenLogin cek Linked Logon ID non-0x0 DAN Elevated Token: Yes.
+                // Gunakan full message untuk check ini (bukan excerpt) agar paling akurat.
                 if (eventId == 4624 && IsAdminSplitTokenLogin(message ?? excerpt))
                     return;
 
