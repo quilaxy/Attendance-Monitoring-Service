@@ -928,7 +928,7 @@ namespace EventLogOutEmployeeService
                 // menyimpan metadata Logon ID yang dibutuhkan untuk korelasi 4634.
                 if (eventId == 4624 && entry.Message != null)
                 {
-                    int lt = ParseLogonType(entry.Message);
+                    int lt = SecurityEventParser.ParseLogonType(entry.Message);
                     if (!IsRelevantLogonType(lt))
                         continue;
                 }
@@ -1178,7 +1178,7 @@ namespace EventLogOutEmployeeService
                     // Logon ID disimpan di raw.LogonId (field baru) ATAU di MessageExcerpt.
                     string? logonId4634raw = !string.IsNullOrEmpty(raw.LogonId)
                         ? raw.LogonId
-                        : GetLogonId(raw.MessageExcerpt);
+                        : SecurityEventParser.GetLogonId(raw.MessageExcerpt);
 
                     if (!string.IsNullOrEmpty(logonId4634raw))
                     {
@@ -2947,7 +2947,7 @@ namespace EventLogOutEmployeeService
                 if (eventId == 4634)
                 {
                     // Re-use the 4647 username extraction path — same XML/message structure.
-                    string? username4634 = GetUsernameFromEvent(eventMessage, 4647);
+                    string? username4634 = SecurityEventParser.GetUsernameFromEvent(eventMessage, 4647);
                     if (string.IsNullOrEmpty(username4634) || !IsValidUsername(username4634))
                     {
                         SafeWriteEventLog("Application",
@@ -2956,7 +2956,7 @@ namespace EventLogOutEmployeeService
                         return;
                     }
 
-                    string? sid4634 = GetUserSidFromSecurityEvent(eventMessage, 4647);
+                    string? sid4634 = SecurityEventParser.GetUserSidFromSecurityEvent(eventMessage, 4647);
                     username4634 = ResolveUsernameBySid(username4634, sid4634);
                     if (string.IsNullOrEmpty(username4634) || !IsValidUsername(username4634))
                         return;
@@ -2966,7 +2966,7 @@ namespace EventLogOutEmployeeService
                     // yang ditutup, harus cocok dengan Logon ID dari paired 4624 admin.
                     // 4634 tidak membawa Elevated Token / Linked Logon ID, sehingga satu-satunya
                     // cara deteksi admin adalah via korelasi Logon ID ke 4624 yang sudah disimpan.
-                    string? logonId4634 = GetLogonId(eventMessage);
+                    string? logonId4634 = SecurityEventParser.GetLogonId(eventMessage);
 
                     if (!string.IsNullOrEmpty(logonId4634))
                     {
@@ -3105,7 +3105,7 @@ namespace EventLogOutEmployeeService
                 // Parse logon type (only relevant for 4624)
                 int logonType = 0;
                 if (eventId == 4624)
-                    logonType = ParseLogonType(eventMessage);
+                    logonType = SecurityEventParser.ParseLogonType(eventMessage);
 
                 if (eventId == 4624 && !IsRelevantLogonType(logonType))
                     return;
@@ -3120,17 +3120,10 @@ namespace EventLogOutEmployeeService
                 if (isAdminLogin)
                 {
                     // Ekstrak Logon ID dari section "New Logon:" — ini adalah ID sesi yang dibuka.
-                    string? adminExcerpt = null;
-                    if (eventMessage != null)
-                    {
-                        int newLogonIdx = eventMessage.IndexOf("New Logon:", StringComparison.OrdinalIgnoreCase);
-                        if (newLogonIdx >= 0)
-                        {
-                            int len = Math.Min(600, eventMessage.Length - newLogonIdx);
-                            adminExcerpt = eventMessage.Substring(newLogonIdx, len);
-                        }
-                    }
-                    string? adminLogonId = GetLogonId(adminExcerpt ?? eventMessage);
+                    string? adminExcerpt = eventMessage != null
+                        ? SecurityEventParser.ExtractMessageSection(eventMessage, 4624, 600)
+                        : null;
+                    string? adminLogonId = SecurityEventParser.GetLogonId(adminExcerpt ?? eventMessage);
 
                     // Populate in-memory correlation cache agar 4634 yang tiba nanti
                     // bisa di-korelasikan tanpa disk read.
@@ -3154,7 +3147,7 @@ namespace EventLogOutEmployeeService
                     return;
                 }
 
-                string? username = GetUsernameFromEvent(eventMessage, eventId);
+                string? username = SecurityEventParser.GetUsernameFromEvent(eventMessage, eventId);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
                 {
                     if (eventId == 4647)
@@ -3183,7 +3176,7 @@ namespace EventLogOutEmployeeService
                     return;
                 }
 
-                string? sid = GetUserSidFromSecurityEvent(eventMessage, eventId);
+                string? sid = SecurityEventParser.GetUserSidFromSecurityEvent(eventMessage, eventId);
                 username = ResolveUsernameBySid(username, sid);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
                 {
@@ -3661,24 +3654,13 @@ namespace EventLogOutEmployeeService
         {
             try
             {
-                int eventId = GetNormalizedEventId(entry);
+                ParsedSecurityEvent parsed = SecurityEventParser.Parse(entry);
+                int eventId = parsed.EventId;
                 if (eventId != 4624 && eventId != 4647 && eventId != 4634)
                     return;
 
-                string? message = entry.Message;
-
-                // Slice anchor section untuk excerpt (sama seperti sebelumnya).
-                string? excerpt = null;
-                if (message != null)
-                {
-                    string anchor = eventId == 4624 ? "New Logon:" : "Subject:";
-                    int idx = message.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
-                    if (idx >= 0)
-                    {
-                        int len = Math.Min(600, message.Length - idx);
-                        excerpt = message.Substring(idx, len);
-                    }
-                }
+                string? message = parsed.Message;
+                string? excerpt = parsed.MessageExcerpt;
 
                 // Deteksi admin split-token SEBELUM memutuskan apa yang disimpan —
                 // tapi JANGAN return di sini. Metadata sesi harus dipersist agar
@@ -3687,13 +3669,10 @@ namespace EventLogOutEmployeeService
 
                 // Parse Logon ID dari section "New Logon:" untuk 4624,
                 // sehingga kita mendapat ID dari sesi yang dibuka (bukan Subject/caller).
-                string? logonId = eventId == 4624
-                    ? GetLogonId(excerpt ?? message)
-                    : null;
-
-                string? username = message != null ? GetUsernameFromEvent(message, eventId) : null;
-                string? sid      = message != null ? GetUserSidFromSecurityEvent(message, eventId) : null;
-                int logonType    = (eventId == 4624 && message != null) ? ParseLogonType(message) : 0;
+                string? logonId = parsed.LogonId;
+                string? username = parsed.Username;
+                string? sid = parsed.Sid;
+                int logonType = parsed.LogonType;
 
                 var raw = new RawSecurityEvent
                 {
@@ -3839,12 +3818,12 @@ namespace EventLogOutEmployeeService
                     {
                         if (secEventId == 4624)
                         {
-                            int lt = ParseLogonType(entry.Message);
+                            int lt = SecurityEventParser.ParseLogonType(entry.Message);
                             if (!IsRelevantLogonType(lt))
                                 continue;
                         }
 
-                        string? u = GetUsernameFromEvent(entry.Message, secEventId);
+                        string? u = SecurityEventParser.GetUsernameFromEvent(entry.Message, secEventId);
                         if (!string.IsNullOrEmpty(u) && IsValidUsername(u))
                             return u;
                     }
@@ -3853,19 +3832,6 @@ namespace EventLogOutEmployeeService
             catch { /* silent fail */ }
 
             return null;
-        }
-
-        private int ParseLogonType(string message)
-        {
-            try
-            {
-                // "Logon Type:   11"  — appears under "Logon Information:" section
-                var match = Regex.Match(message, @"Logon Type:\s*(\d+)");
-                if (match.Success && int.TryParse(match.Groups[1].Value, out int lt))
-                    return lt;
-            }
-            catch { /* silent fail */ }
-            return 0;
         }
 
         /// <summary>
@@ -3915,34 +3881,6 @@ namespace EventLogOutEmployeeService
                 return false;
             }
             catch { return false; }
-        }
-
-        /// <summary>
-        /// Ekstrak Windows Logon ID (hex) dari pesan Security event.
-        /// Cocok untuk format "Logon ID:\t\t0x1a3f5c" yang muncul di section
-        /// "New Logon:" pada 4624, dan di section "Subject:" pada 4634/4647.
-        /// Return lowercase hex yang sudah dinormalkan, atau null jika gagal.
-        /// </summary>
-        private static string? GetLogonId(string? message)
-        {
-            if (string.IsNullOrWhiteSpace(message))
-                return null;
-
-            try
-            {
-                var match = Regex.Match(
-                    message,
-                    @"Logon ID:\s*(0x[0-9A-Fa-f]+)",
-                    RegexOptions.IgnoreCase);
-
-                return match.Success
-                    ? match.Groups[1].Value.Trim().ToLowerInvariant()
-                    : null;
-            }
-            catch
-            {
-                return null;
-            }
         }
 
         /// <summary>
@@ -4024,54 +3962,6 @@ namespace EventLogOutEmployeeService
             return "Shutdown/Restart Initiated";
         }
 
-        private string? GetUsernameFromEvent(string message, int eventId)
-        {
-            try
-            {
-                if (eventId == 4624)
-                {
-                    int newLogonIndex = message.IndexOf("New Logon:");
-                    if (newLogonIndex == -1) return null;
-
-                    string section = message.Substring(newLogonIndex);
-                    var match = Regex.Match(section, @"Account Name:\s*([^\r\n]+)");
-                    if (!match.Success) return null;
-
-                    string accountName = match.Groups[1].Value.Trim();
-                    if (string.IsNullOrWhiteSpace(accountName) ||
-                        accountName.Equals("SYSTEM", StringComparison.OrdinalIgnoreCase) ||
-                        accountName.Equals("-", StringComparison.OrdinalIgnoreCase) ||
-                        accountName.EndsWith("$", StringComparison.OrdinalIgnoreCase))
-                        return null;
-
-                    string normalized = NormalizeDisplayUsername(accountName);
-                    return IsValidUsername(normalized) ? normalized : null;
-                }
-
-                if (eventId == 4647)
-                {
-                    int subjectIndex = message.IndexOf("Subject:");
-                    if (subjectIndex == -1) return null;
-
-                    string section = message.Substring(subjectIndex);
-                    var match = Regex.Match(section, @"Account Name:\s*([^\r\n]+)");
-                    if (!match.Success) return null;
-
-                    string accountName = match.Groups[1].Value.Trim();
-                    if (string.IsNullOrWhiteSpace(accountName) ||
-                        accountName.Equals("SYSTEM", StringComparison.OrdinalIgnoreCase) ||
-                        accountName.EndsWith("$", StringComparison.OrdinalIgnoreCase))
-                        return null;
-
-                    string normalized = NormalizeDisplayUsername(accountName);
-                    return IsValidUsername(normalized) ? normalized : null;
-                }
-            }
-            catch { /* silent fail */ }
-
-            return null;
-        }
-
         private string? GetMostRecentUserForComputer(
             DateTime beforeTime,
             string computerName,
@@ -4099,11 +3989,11 @@ namespace EventLogOutEmployeeService
                     if (entryTime < lookbackTime || entryTime > beforeTime || entry.Message == null)
                         continue;
 
-                    int lt = ParseLogonType(entry.Message);
+                    int lt = SecurityEventParser.ParseLogonType(entry.Message);
                     if (requireRelevant4624 && !IsRelevantLogonType(lt))
                         continue;
 
-                    string? u = GetUsernameFromEvent(entry.Message, secEventId);
+                    string? u = SecurityEventParser.GetUsernameFromEvent(entry.Message, secEventId);
                     if (!string.IsNullOrEmpty(u) && IsValidUsername(u))
                         return u;
                 }
@@ -4415,15 +4305,15 @@ namespace EventLogOutEmployeeService
                             continue;
 
                         string message = entry.Message ?? string.Empty;
-                        int lt = ParseLogonType(message);
+                        int lt = SecurityEventParser.ParseLogonType(message);
                         if (!IsRelevantLogonType(lt) || IsAdminSplitTokenLogin(message))
                             continue;
 
-                        string? username = GetUsernameFromEvent(message, 4624);
+                        string? username = SecurityEventParser.GetUsernameFromEvent(message, 4624);
                         if (string.IsNullOrWhiteSpace(username))
                             continue;
 
-                        string? sid = GetUserSidFromSecurityEvent(message, 4624);
+                        string? sid = SecurityEventParser.GetUserSidFromSecurityEvent(message, 4624);
                         username = ResolveUsernameBySid(username, sid);
                         if (!IsValidUsername(username))
                             continue;
@@ -4657,41 +4547,9 @@ namespace EventLogOutEmployeeService
         private static string BuildDeviceWorkDateKey(string computerName, string workDate)
             => $"{computerName}::{workDate}";
 
-        private string? GetUserSidFromSecurityEvent(string message, int securityEventId)
-        {
-            try
-            {
-                // Security event only: 4624 (New Logon) and 4647 (Subject).
-                string anchor = securityEventId == 4624 ? "New Logon:" :
-                                securityEventId == 4647 ? "Subject:" : string.Empty;
-                if (string.IsNullOrEmpty(anchor))
-                    return null;
-
-                int anchorIndex = message.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
-                if (anchorIndex == -1)
-                    return null;
-
-                var regex = new Regex(@"Security ID:\s*([^\r\n]+)", RegexOptions.IgnoreCase);
-                var match = regex.Match(message, anchorIndex);
-                if (!match.Success)
-                    return null;
-
-                string sid = match.Groups[1].Value.Trim();
-                if (string.IsNullOrWhiteSpace(sid) ||
-                    sid.Equals("-", StringComparison.OrdinalIgnoreCase) ||
-                    sid.Equals("NULL SID", StringComparison.OrdinalIgnoreCase))
-                    return null;
-
-                return sid.StartsWith("S-", StringComparison.OrdinalIgnoreCase) ? sid : null;
-            }
-            catch { /* silent fail */ }
-
-            return null;
-        }
-
         private string ResolveUsernameBySid(string username, string? sid)
         {
-            string fallback = NormalizeDisplayUsername(username);
+            string fallback = SecurityEventParser.NormalizeDisplayUsername(username);
             if (string.IsNullOrWhiteSpace(sid))
                 return fallback;
 
@@ -4705,7 +4563,7 @@ namespace EventLogOutEmployeeService
             {
                 var securityId = new SecurityIdentifier(sid);
                 var ntAccount = securityId.Translate(typeof(NTAccount)) as NTAccount;
-                string translated = NormalizeDisplayUsername(ntAccount?.Value ?? string.Empty);
+                string translated = SecurityEventParser.NormalizeDisplayUsername(ntAccount?.Value ?? string.Empty);
 
                 if (IsValidUsername(translated))
                 {
@@ -4717,44 +4575,6 @@ namespace EventLogOutEmployeeService
             catch { /* fallback to parsed account name */ }
 
             return fallback;
-        }
-
-        private static string NormalizeDisplayUsername(string username)
-        {
-            if (string.IsNullOrWhiteSpace(username))
-                return string.Empty;
-
-            string normalized = username.Trim();
-
-            if (normalized.Contains("\\"))
-            {
-                int slashIndex = normalized.LastIndexOf('\\');
-                normalized = normalized.Substring(slashIndex + 1).Trim();
-            }
-
-            if (normalized.Contains("@"))
-                normalized = normalized.Split('@')[0].Trim();
-
-            // FIX BUG-1: On Azure AD joined devices, 4624 Account Name is UPN prefix
-            // (e.g. "nyoman.maheswari") while 4647 and 1074 produce SAMAccountName
-            // (e.g. "NyomanMaheswari"). SID.Translate() always fails on AzureAD → no
-            // other canonicalization path exists. Convert dot-separated UPN prefix to
-            // TitleCase so all event sources produce an identical username string.
-            // Examples:
-            //   nyoman.maheswari  → NyomanMaheswari   ✓
-            //   nabilla.nilawati  → NabillaNilawati    ✓
-            //   chaerunisa.izati  → ChaerunisaIzati    ✓
-            //   NyomanMaheswari   → NyomanMaheswari    ✓ (no dot → unchanged)
-            if (normalized.Contains('.'))
-            {
-                normalized = string.Concat(
-                    normalized.Split('.')
-                              .Select(part => part.Length > 0
-                                  ? char.ToUpperInvariant(part[0]) + part.Substring(1)
-                                  : part));
-            }
-
-            return normalized;
         }
 
         private bool IsRelevantLogonType(int logonType)
@@ -4795,7 +4615,7 @@ namespace EventLogOutEmployeeService
                         RegexOptions.IgnoreCase);
                     candidate = trailingPattern.Replace(candidate, string.Empty).Trim();
 
-                    candidate = NormalizeDisplayUsername(candidate);
+                    candidate = SecurityEventParser.NormalizeDisplayUsername(candidate);
 
                     if (IsValidUsername(candidate))
                         return candidate;
@@ -4825,7 +4645,7 @@ namespace EventLogOutEmployeeService
                         // FIX: NormalizeDisplayUsername wajib dipanggil di sini seperti Pattern 1 & 2.
                         // Tanpa ini, UPN prefix (nyoman.maheswari) dari Pattern 3 tidak di-TitleCase
                         // sehingga username tidak konsisten dengan output 4647 dan 1074 Pattern 1.
-                        string candidate = NormalizeDisplayUsername(domainMatch.Groups[1].Value.Trim());
+                        string candidate = SecurityEventParser.NormalizeDisplayUsername(domainMatch.Groups[1].Value.Trim());
                         if (IsValidUsername(candidate))
                         {
                             SafeWriteEventLog("Application",
@@ -5052,41 +4872,10 @@ namespace EventLogOutEmployeeService
         private static string BuildPendingFallbackSource(int eventId)
             => $"Event{eventId}_Pending";
 
-        private static readonly HashSet<string> _invalidUsernames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            // Akun sistem Windows standar
-            "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "NETWORK SERVICE",
-            "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator",
-            // Nama Windows path component yang terbukti lolos lewat Pattern 3
-            // karena ada di path executable di baris pertama event 1074
-            // (misal C:\WINDOWS\servicing\TrustedInstaller.exe → "servicing")
-            "system32", "syswow64", "servicing", "winsxs", "uus",
-            "trustedinstaller", "svchost", "services", "lsass", "winlogon",
-            "explorer", "consent", "credpro"
-        };
-
-        private static readonly string[] _invalidUsernamePrefixes =
-        {
-            "DWM-", "UMFD-", "NT Service",
-            // Path-relative prefixes yang kadang tersisa setelah NormalizeDisplayUsername
-            "NT AUTHORITY", "BUILTIN"
-        };
-
-        // #3: IsValidUsername static — _invalidUsernames dan _invalidUsernamePrefixes sudah
-        // static readonly, method-nya juga harus static agar tidak ada implicit instance capture.
+        // #3: IsValidUsername static agar tidak ada implicit instance capture.
         private static bool IsValidUsername(string username)
         {
-            if (string.IsNullOrWhiteSpace(username))
-                return false;
-
-            if (_invalidUsernames.Contains(username)) return false;
-            if (username.EndsWith("$")) return false;
-
-            foreach (var prefix in _invalidUsernamePrefixes)
-                if (username.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                    return false;
-
-            return true;
+            return SecurityEventParser.IsValidUsername(username);
         }
     }
 }
