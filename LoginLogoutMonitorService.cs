@@ -135,6 +135,12 @@ namespace EventLogOutEmployeeService
             // Without this, ServiceBase never invokes OnShutdown() and the checkpoint is lost.
             CanShutdown = true;
 
+            // GAP FIX [POWER]: Terima notifikasi resume dari SCM saat PC keluar dari
+            // hibernate / suspend. Tanpa ini, OnPowerEvent tidak pernah dipanggil dan
+            // subscription drop pasca-resume baru dideteksi oleh startup probe 90 detik —
+            // ada window buta di mana 4624 login setelah wake tidak tertangkap.
+            CanHandlePowerEvent = true;
+
             // FIX [CRASH]: Tangkap unhandled exception sebelum process mati.
             // Tanpa ini, crash 0xe0434352 tidak ter-log sama sekali dan
             // event-stop.checkpoint tidak tersimpan sehingga window replay
@@ -214,6 +220,7 @@ namespace EventLogOutEmployeeService
             // Catat kapan subscription diaktifkan — startup probe butuh referensi ini
             // untuk menghitung berapa lama subscription sudah aktif tanpa menerima event.
             Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, DateTime.UtcNow.Ticks);
+            Interlocked.Exchange(ref _systemSubscriptionEnabledTicksUtc, DateTime.UtcNow.Ticks);
 
             int maxRetries = 5;
             int currentRetry = 0;
@@ -1448,6 +1455,91 @@ namespace EventLogOutEmployeeService
         /// </summary>
         protected override void OnShutdown() => HandleServiceStopping("OnShutdown", 1051);
 
+        /// <summary>
+        /// Called by SCM on power state changes (requires CanHandlePowerEvent = true in constructor).
+        ///
+        /// Tujuan utama: tangkap resume dari hibernate/suspend sebelum startup probe (90–120 detik)
+        /// sempat mendeteksinya — memperkecil window buta dari ~90–120 detik menjadi ~2 detik.
+        ///
+        /// Saat PC resume dari hibernate, Windows dapat me-rotate Security dan/atau System log
+        /// sebelum service sempat re-subscribe. Kedua subscription bisa drop tanpa notifikasi.
+        /// Handler ini:
+        ///   1. Reset ticks kedua subscription agar health check tahu ini adalah "fresh startup"
+        ///      (bukan mid-day drop) dan startup probe aktif kembali.
+        ///   2. Kick off re-subscribe + mini-replay untuk keduanya setelah delay 2 detik
+        ///      (memberi Windows waktu commit log rotation sebelum kita re-attach).
+        /// </summary>
+        protected override bool OnPowerEvent(PowerBroadcastStatus powerStatus)
+        {
+            try
+            {
+                if (powerStatus == PowerBroadcastStatus.ResumeSuspend ||
+                    powerStatus == PowerBroadcastStatus.ResumeAutomatic)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[POWER] Resume detected ({powerStatus}) — resetting subscription ticks " +
+                        $"and scheduling re-subscribe + mini-replay for Security and System logs.",
+                        EventLogEntryType.Information, 1086);
+
+                    // Reset Security log counters — startup probe Security akan aktif kembali
+                    Interlocked.Exchange(ref _subscriptionEnabledTicksUtc,   DateTime.UtcNow.Ticks);
+                    Interlocked.Exchange(ref _lastSecurityEventTicksUtc,      DateTime.MinValue.Ticks);
+
+                    // Reset System log counters — startup probe System akan aktif kembali
+                    Interlocked.Exchange(ref _systemSubscriptionEnabledTicksUtc, DateTime.UtcNow.Ticks);
+                    Interlocked.Exchange(ref _lastSystemEventTicksUtc,           DateTime.MinValue.Ticks);
+
+                    var ct = cancellationToken ?? CancellationToken.None;
+
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            // Delay 2 detik — beri Windows waktu untuk commit log rotation
+                            // sebelum kita re-attach ke EventLog subscription.
+                            await Task.Delay(2000, ct);
+
+                            // Buffer 10 menit sebelum wake untuk tangkap event yang terjadi
+                            // tepat saat resume sebelum service berhasil re-subscribe.
+                            DateTime replayFrom = DateTime.UtcNow.AddMinutes(-10);
+                            DateTime replayTo   = DateTime.UtcNow;
+
+                            // Re-subscribe dan mini-replay Security log
+                            await ResubscribeAndMiniReplayAsync(replayFrom, replayTo, 3, ct);
+
+                            // Re-subscribe dan mini-replay System log
+                            await ResubscribeSystemLogAndMiniReplayAsync(replayFrom, replayTo, 3, ct);
+                        }
+                        catch (OperationCanceledException) { /* service stopping */ }
+                        catch (Exception ex)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[POWER] Resume re-subscribe error: {ex.Message}",
+                                EventLogEntryType.Warning, 1087);
+                        }
+                    }, ct);
+                }
+                else if (powerStatus == PowerBroadcastStatus.Suspend)
+                {
+                    // Simpan checkpoint sebelum suspend — kalau PC tidak resume normal
+                    // (misal battery dead), replay berikutnya punya referensi yang benar.
+                    SafeWriteEventLog("Application",
+                        "[POWER] Suspend detected — saving stop checkpoint.",
+                        EventLogEntryType.Information, 1086);
+
+                    SaveStopCheckpoint(DateTime.UtcNow.AddSeconds(-5));
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[POWER] OnPowerEvent error ({powerStatus}): {ex.Message}",
+                    EventLogEntryType.Warning, 1087);
+            }
+
+            return true; // Must return true for ServiceBase to continue receiving power events
+        }
+
         private void HandleServiceStopping(string caller, int stopEventId)
         {
             try
@@ -1541,6 +1633,10 @@ namespace EventLogOutEmployeeService
 
                 // FIX [HEALTH]: Monitor Security log subscription — bisa drop silent setelah log rotate.
                 Task.Run(() => SecurityLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
+
+                // FIX [HEALTH-SYSTEM]: Monitor System log subscription — sumber event 42, 1074, 6006.
+                // Shutdown detection path seluruhnya bergantung pada System log ini.
+                Task.Run(() => SystemLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
 
                 while (!cancellationToken.IsCancellationRequested)
                     Thread.Sleep(5000);
@@ -1854,6 +1950,298 @@ namespace EventLogOutEmployeeService
                 SafeWriteEventLog("Application",
                     $"[HEALTH] Mini-replay error: {ex.Message}",
                     EventLogEntryType.Warning, 1084);
+            }
+        }
+
+        /// <summary>
+        /// Mendeteksi dan memulihkan System log subscription yang drop secara silent.
+        ///
+        /// Berbeda dari SecurityLogSubscriptionHealthCheckTask:
+        ///   - System log jarang menulis event di luar jam kerja → threshold berbasis
+        ///     frekuensi ("30 menit tanpa event") tidak tepat. PC idle di luar jam kerja
+        ///     memang tidak menghasilkan 1074/6006/42.
+        ///   - Pendekatan: verifikasi eksplisit setiap N menit — query satu entry terbaru
+        ///     dari System log secara manual (poll) dan bandingkan timestamp-nya dengan
+        ///     waktu terakhir subscription kita menerima event. Kalau log ada entry baru
+        ///     tapi subscription tidak pernah firing → drop terdeteksi.
+        ///
+        /// Dua skenario yang di-handle:
+        ///   1. STARTUP DROP — tidak ada System event dalam probeStartupWindowSeconds,
+        ///      tapi log secara manual punya entry baru (subscription drop, bukan idle).
+        ///   2. POLL DROP — subscription mati di tengah sesi. Log punya entry lebih baru
+        ///      dari _lastSystemEventTicksUtc dengan gap melebihi pollDropThresholdSeconds.
+        ///
+        /// Re-subscribe selalu diikuti mini-replay System log untuk event yang missed.
+        /// </summary>
+        private async Task SystemLogSubscriptionHealthCheckTask(CancellationToken cancellationToken)
+        {
+            // Cek setiap 5 menit — System log jarang menulis sehingga polling lebih jarang
+            // dari Security (30 detik). Cukup responsif tanpa membebani EventLog API.
+            const int checkIntervalSeconds      = 300;  // 5 menit
+            const int probeStartupWindowSeconds = 120;  // 2 menit — lebih longgar dari Security (90s)
+            const int pollDropThresholdSeconds  = 600;  // 10 menit gap log entry vs last kita terima
+            const int maxResubscribeAttempts    = 3;
+            const int workHourStart             = 7;
+            const int workHourEnd               = 19;
+
+            bool startupProbeCompleted = false;
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(checkIntervalSeconds), cancellationToken);
+
+                    if (systemEventLog == null)
+                        continue;
+
+                    long enabledTicks   = Interlocked.Read(ref _systemSubscriptionEnabledTicksUtc);
+                    long lastEventTicks = Interlocked.Read(ref _lastSystemEventTicksUtc);
+                    DateTime nowUtc     = DateTime.UtcNow;
+
+                    double secondsSinceEnabled = (nowUtc.Ticks - enabledTicks) / (double)TimeSpan.TicksPerSecond;
+
+                    // ── PROBE STARTUP ──────────────────────────────────────────────────────
+                    // Tunggu probeStartupWindowSeconds setelah subscription di-enable.
+                    // Kalau belum ada event, verifikasi eksplisit apakah log punya entry baru
+                    // — membedakan "subscription drop" dari "log memang idle".
+                    if (!startupProbeCompleted && secondsSinceEnabled >= probeStartupWindowSeconds)
+                    {
+                        startupProbeCompleted = true;
+
+                        if (lastEventTicks == DateTime.MinValue.Ticks)
+                        {
+                            bool logHasRecentEntry = SystemLogHasRecentEntry(
+                                new DateTime(enabledTicks, DateTimeKind.Utc).AddMinutes(-10),
+                                nowUtc);
+
+                            if (logHasRecentEntry)
+                            {
+                                SafeWriteEventLog("Application",
+                                    $"[HEALTH-SYS] Startup probe: no System event in {probeStartupWindowSeconds}s " +
+                                    $"but log has recent entries — subscription likely dropped. " +
+                                    $"Force re-subscribe + mini-replay.",
+                                    EventLogEntryType.Warning, 1088);
+
+                                DateTime missedSince = new DateTime(enabledTicks, DateTimeKind.Utc)
+                                    .Subtract(TimeSpan.FromMinutes(10));
+
+                                await ResubscribeSystemLogAndMiniReplayAsync(
+                                    missedSince, nowUtc, maxResubscribeAttempts, cancellationToken);
+                            }
+                            else
+                            {
+                                SafeWriteEventLog("Application",
+                                    $"[HEALTH-SYS] Startup probe OK: no System event in {probeStartupWindowSeconds}s " +
+                                    $"and log has no recent entries — likely idle/off-hours, subscription intact.",
+                                    EventLogEntryType.Information, 1089);
+                            }
+                        }
+                        else
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[HEALTH-SYS] Startup probe OK: System event received within " +
+                                $"{secondsSinceEnabled:F0}s of subscription enable.",
+                                EventLogEntryType.Information, 1089);
+                        }
+
+                        continue;
+                    }
+
+                    // ── POLL DROP CHECK ────────────────────────────────────────────────────
+                    // Setelah startup probe selesai, polling berkala untuk mid-run drop.
+                    // Hanya enforced saat jam kerja — di luar jam kerja System log memang idle.
+                    if (!startupProbeCompleted)
+                        continue;
+
+                    int hour        = DateTime.Now.Hour;
+                    bool isWorkHour = hour >= workHourStart && hour < workHourEnd;
+
+                    if (!isWorkHour)
+                        continue;
+
+                    // Query entry terbaru dari System log secara manual.
+                    // Kalau ada entry lebih baru dari _lastSystemEventTicksUtc dengan gap
+                    // melebihi threshold → subscription tidak firing padahal ada event baru.
+                    DateTime? latestLogEntry = GetLatestSystemLogEntryTime();
+                    if (latestLogEntry == null)
+                        continue;
+
+                    long baselineTicks   = lastEventTicks == DateTime.MinValue.Ticks ? enabledTicks : lastEventTicks;
+                    DateTime baselineUtc = new DateTime(baselineTicks, DateTimeKind.Utc);
+
+                    double gapSeconds = (latestLogEntry.Value - baselineUtc).TotalSeconds;
+
+                    if (gapSeconds > pollDropThresholdSeconds && latestLogEntry.Value > baselineUtc)
+                    {
+                        int gapMinutes = (int)(gapSeconds / 60);
+                        SafeWriteEventLog("Application",
+                            $"[HEALTH-SYS] Poll drop detected: System log latest entry={latestLogEntry.Value:O} " +
+                            $"but last subscription event was {gapMinutes} min ago " +
+                            $"(threshold={pollDropThresholdSeconds / 60} min). Re-subscribe + mini-replay.",
+                            EventLogEntryType.Warning, 1088);
+
+                        await ResubscribeSystemLogAndMiniReplayAsync(
+                            baselineUtc, nowUtc, maxResubscribeAttempts, cancellationToken);
+                    }
+                }
+                catch (TaskCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH-SYS] SystemLogSubscriptionHealthCheckTask error: {ex.Message}",
+                        EventLogEntryType.Warning, 1090);
+
+                    try { await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken); }
+                    catch (TaskCanceledException) { break; }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Cek apakah System log punya setidaknya satu entry dalam rentang [fromUtc, toUtc].
+        /// Dipakai oleh startup probe untuk membedakan "subscription drop" vs "log memang idle".
+        /// Scan partial dari belakang (max 200 entry) — berhenti segera setelah menemukan satu match.
+        /// </summary>
+        private bool SystemLogHasRecentEntry(DateTime fromUtc, DateTime toUtc)
+        {
+            try
+            {
+                if (systemEventLog == null) return false;
+
+                int count = systemEventLog.Entries.Count;
+                for (int i = count - 1; i >= Math.Max(0, count - 200); i--)
+                {
+                    EventLogEntry entry = systemEventLog.Entries[i];
+                    DateTime entryTime  = entry.TimeGenerated.ToUniversalTime();
+
+                    if (entryTime < fromUtc)
+                        break; // Entry sudah lebih lama dari fromUtc — tidak perlu scan lagi
+
+                    if (entryTime <= toUtc)
+                        return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH-SYS] SystemLogHasRecentEntry error: {ex.Message}",
+                    EventLogEntryType.Warning, 1090);
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Ambil timestamp entry terbaru dari System log (entry index terakhir).
+        /// Return null kalau log kosong atau tidak bisa dibaca.
+        /// </summary>
+        private DateTime? GetLatestSystemLogEntryTime()
+        {
+            try
+            {
+                if (systemEventLog == null) return null;
+
+                int count = systemEventLog.Entries.Count;
+                if (count == 0) return null;
+
+                EventLogEntry latest = systemEventLog.Entries[count - 1];
+                return latest.TimeGenerated.ToUniversalTime();
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH-SYS] GetLatestSystemLogEntryTime error: {ex.Message}",
+                    EventLogEntryType.Warning, 1090);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Re-subscribe System log dan jalankan mini-replay System events untuk window yang missed.
+        /// Analog dengan ResubscribeAndMiniReplayAsync untuk Security log.
+        ///
+        /// Setelah re-subscribe berhasil:
+        ///   - _lastSystemEventTicksUtc          → poll drop cooldown dihitung ulang dari UtcNow.
+        ///   - _systemSubscriptionEnabledTicksUtc → startup probe tidak aktif di iterasi berikutnya.
+        ///
+        /// System replay diperpanjang 30 detik lebih awal agar 1074 yang terjadi tepat sebelum
+        /// window tetap ter-load ke memory sebelum 6006 di-replay (sama seperti startup replay).
+        /// </summary>
+        private async Task ResubscribeSystemLogAndMiniReplayAsync(
+            DateTime missedSinceUtc,
+            DateTime replayToUtc,
+            int maxAttempts,
+            CancellationToken cancellationToken)
+        {
+            bool resubscribed = false;
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    if (systemEventLog == null)
+                    {
+                        SafeWriteEventLog("Application",
+                            "[HEALTH-SYS] systemEventLog is null — cannot re-subscribe.",
+                            EventLogEntryType.Warning, 1091);
+                        break;
+                    }
+
+                    systemEventLog.EnableRaisingEvents = false;
+                    await Task.Delay(300, cancellationToken);
+                    systemEventLog.EnableRaisingEvents = true;
+
+                    long nowTicks = DateTime.UtcNow.Ticks;
+                    Interlocked.Exchange(ref _lastSystemEventTicksUtc,           nowTicks);
+                    Interlocked.Exchange(ref _systemSubscriptionEnabledTicksUtc, nowTicks);
+
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH-SYS] Re-subscribed System log OK (attempt {attempt}/{maxAttempts}).",
+                        EventLogEntryType.Information, 1091);
+
+                    resubscribed = true;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH-SYS] Re-subscribe System log attempt {attempt}/{maxAttempts} failed: {ex.Message}",
+                        EventLogEntryType.Warning, 1091);
+
+                    if (attempt < maxAttempts)
+                        await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                }
+            }
+
+            if (!resubscribed)
+                return;
+
+            try
+            {
+                // Extend 30 detik lebih awal agar 1074 yang terjadi tepat di batas window
+                // sudah ada di memory sebelum 6006 di-replay — konsisten dengan ReplayMissedEventsFromCheckpoint.
+                DateTime extendedFrom = missedSinceUtc.AddSeconds(-30);
+
+                SafeWriteEventLog("Application",
+                    $"[HEALTH-SYS] Mini-replay System: from={extendedFrom:O} to={replayToUtc:O}",
+                    EventLogEntryType.Information, 1092);
+
+                // ReplaySystemEvents memanggil ProcessSystemEntryAsync secara sync (.GetAwaiter().GetResult())
+                // → jalankan di thread pool untuk hindari deadlock dari async context.
+                await Task.Run(
+                    () => ReplaySystemEvents(extendedFrom, replayToUtc),
+                    cancellationToken);
+
+                SafeWriteEventLog("Application",
+                    $"[HEALTH-SYS] Mini-replay System done: from={extendedFrom:O} to={replayToUtc:O}",
+                    EventLogEntryType.Information, 1092);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH-SYS] Mini-replay System error: {ex.Message}",
+                    EventLogEntryType.Warning, 1092);
             }
         }
 
@@ -2313,6 +2701,19 @@ namespace EventLogOutEmployeeService
         private long _lastSecurityEventTicksUtc   = DateTime.MinValue.Ticks;
         private long _subscriptionEnabledTicksUtc = DateTime.MinValue.Ticks;
 
+        // ── System log subscription health check ────────────────────────────────
+        // Sama seperti Security log health check, tapi untuk System log (sumber event
+        // 42, 1074, 6006 — seluruh shutdown detection path bergantung padanya).
+        //
+        // Berbeda dari Security:
+        //   - System log jarang menulis event di luar jam kerja → threshold berbasis
+        //     frekuensi tidak cocok. Pakai verifikasi eksplisit (poll terbaru dari log).
+        //   - _lastSystemEventTicksUtc dan _systemSubscriptionEnabledTicksUtc
+        //     juga di-reset saat OnPowerEvent resume agar health check tahu ini
+        //     fresh startup pasca-wake, bukan mid-day drop biasa.
+        private long _lastSystemEventTicksUtc          = DateTime.MinValue.Ticks;
+        private long _systemSubscriptionEnabledTicksUtc = DateTime.MinValue.Ticks;
+
         private void OnSecurityEventWritten(object sender, EntryWrittenEventArgs e)
         {
             if (e?.Entry == null) return;
@@ -2588,6 +2989,11 @@ namespace EventLogOutEmployeeService
         private void OnSystemEventWritten(object sender, EntryWrittenEventArgs e)
         {
             if (e?.Entry == null) return;
+
+            // Reset System log health check counter — subscription masih hidup.
+            // Dipakai oleh SystemLogSubscriptionHealthCheckTask untuk mendeteksi
+            // subscription drop pasca log-rotate atau resume dari hibernate.
+            Interlocked.Exchange(ref _lastSystemEventTicksUtc, DateTime.UtcNow.Ticks);
 
             EventLogEntry entry = e.Entry;
             if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime()))
