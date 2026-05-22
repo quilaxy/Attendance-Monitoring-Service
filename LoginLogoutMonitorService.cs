@@ -58,6 +58,22 @@ namespace EventLogOutEmployeeService
             new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> startupAnchorByDeviceWorkDate =
             new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        // ── Admin session correlation cache ──────────────────────────────────────
+        // Key:   BuildAdminSessionKey(computerName, logonId)  →  "{COMPUTER}::{0xlogonid}"
+        // Value: selalu true — hanya admin session yang disimpan di sini.
+        // Tujuan: korelasikan 4634 logout ke 4624 admin login via Logon ID.
+        //         4634 tidak membawa Elevated Token / Linked Logon ID, sehingga
+        //         tanpa cache ini konteks admin hilang sepenuhnya.
+        // Thread-safety: dilindungi oleh _adminSessionLock.
+        private readonly Dictionary<string, bool> _adminLogonIdCache =
+            new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> _adminLogonIdExpiry =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _adminSessionLock = new object();
+        private DateTime _lastAdminCachePrune = DateTime.MinValue;
+        private static readonly TimeSpan AdminSessionRetention = TimeSpan.FromHours(48);
+
         private int queueAlertThreshold = 500;
         private bool queueThresholdAlerted = false;
         private int[] dispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
@@ -906,11 +922,14 @@ namespace EventLogOutEmployeeService
                 if (eventId != 4624 && eventId != 4647 && eventId != 4634)
                     continue;
 
-                // Pre-filter 4624: skip irrelevant logon types dan admin split token early
+                // Pre-filter 4624: skip irrelevant logon types saja.
+                // Admin split-token filtering TIDAK dilakukan di sini — deferral ke
+                // ProcessSecurityEntryAsync agar SaveRawSecurityEventAsync sempat
+                // menyimpan metadata Logon ID yang dibutuhkan untuk korelasi 4634.
                 if (eventId == 4624 && entry.Message != null)
                 {
                     int lt = ParseLogonType(entry.Message);
-                    if (!IsRelevantLogonType(lt) || IsAdminSplitTokenLogin(entry.Message))
+                    if (!IsRelevantLogonType(lt))
                         continue;
                 }
 
@@ -929,12 +948,13 @@ namespace EventLogOutEmployeeService
                     $"ReplaySecurityEvents: processing EventId={eventId} at {time:O}",
                     EventLogEntryType.Information, 1033);
 
-                // Opt 3: simpan raw event ke RawEventStore selama replay startup,
-                // bukan hanya saat live (OnSecurityEventWritten).
-                // Tanpa ini, kalau 4624 pagi ketahuan saat replay (bukan live) dan Security log
-                // kemudian ter-rotate sebelum besok, data hilang lagi dari RawEventStore.
-                _ = Task.Run(() => SaveRawSecurityEventAsync(entry));
-
+                // SaveRawSecurityEventAsync dipanggil di dalam ProcessSecurityEntryAsync
+                // via writeRawRecord=true path — tidak perlu panggil lagi secara eksplisit.
+                // Sebelumnya ada dua panggilan terpisah (eksplisit Task.Run + writeRawRecord),
+                // yang menyebabkan double-write ke RawEventStore. RawEventStore.SaveAsync
+                // memang idempotent via File.Exists, tapi race condition masih bisa terjadi
+                // di window antara File.Exists check dan File.Move final.
+                // Solusi: satu panggilan saja, lewat ProcessSecurityEntryAsync.
                 ProcessSecurityEntryAsync(entry, writeRawRecord: true).GetAwaiter().GetResult();
             }
         }
@@ -1090,13 +1110,34 @@ namespace EventLogOutEmployeeService
                 if (eventId == 4624 && !IsRelevantLogonType(logonType))
                     return;
 
-                // FIX (defense-in-depth): skip admin split token saat replay dari RawEventStore.
-                // Normalnya SaveRawSecurityEventAsync sudah tidak menyimpan event admin ke disk,
-                // tapi file lama (sebelum fix) mungkin masih ada di rawevents\ dan akan di-replay.
-                // MessageExcerpt berisi section "New Logon:" yang include "Linked Logon ID:" dan
-                // "Elevated Token:" — cukup untuk re-detect tanpa full message.
-                if (eventId == 4624 && IsAdminSplitTokenLogin(raw.MessageExcerpt))
+                // Admin session detection — gabungkan IsAdminLogon (field baru) dengan
+                // IsAdminSplitTokenLogin dari MessageExcerpt (backward-compat file lama).
+                bool isAdminRaw = raw.IsAdminLogon ||
+                                  (eventId == 4624 && IsAdminSplitTokenLogin(raw.MessageExcerpt));
+
+                if (eventId == 4624 && isAdminRaw)
+                {
+                    // Re-hydrate in-memory cache dari disk agar 4634 live yang datang
+                    // setelah replay bisa dikorelasikan tanpa disk read lagi.
+                    if (!string.IsNullOrEmpty(raw.LogonId))
+                    {
+                        string cacheKeyRaw = BuildAdminSessionKey(computerName, raw.LogonId);
+                        lock (_adminSessionLock)
+                        {
+                            _adminLogonIdCache[cacheKeyRaw]  = true;
+                            _adminLogonIdExpiry[cacheKeyRaw] = DateTime.UtcNow.Add(AdminSessionRetention);
+                            PruneAdminSessionCache();
+                        }
+
+                        SafeWriteEventLog("Application",
+                            $"[ADMIN] Admin session re-hydrated from RawStore: " +
+                            $"user={raw.Username} logonId={raw.LogonId} computer={computerName}",
+                            EventLogEntryType.Information, 2041);
+                    }
+
+                    // Gate: tidak di-enqueue, tidak di-dispatch, tidak ke SharePoint.
                     return;
+                }
 
                 string? username = raw.Username;
                 string? sid      = raw.Sid;
@@ -1130,10 +1171,79 @@ namespace EventLogOutEmployeeService
                     RegisterFirst4624Logon(computerName, username, eventTime);
                 }
 
-                // 4634 dari RawEventStore: jalankan cek duplikat 4647 sebelum enqueue,
-                // sama seperti di ProcessSecurityEntryAsync live path.
+                // 4634 dari RawEventStore: admin correlation gate + cek duplikat 4647.
                 if (eventId == 4634)
                 {
+                    // ── Admin correlation gate (replay path) ─────────────────────────
+                    // Logon ID disimpan di raw.LogonId (field baru) ATAU di MessageExcerpt.
+                    string? logonId4634raw = !string.IsNullOrEmpty(raw.LogonId)
+                        ? raw.LogonId
+                        : GetLogonId(raw.MessageExcerpt);
+
+                    if (!string.IsNullOrEmpty(logonId4634raw))
+                    {
+                        bool isAdminSession4634raw = false;
+                        string cacheKey4634raw = BuildAdminSessionKey(computerName, logonId4634raw);
+
+                        // 1. In-memory cache (fast path) — validasi expiry secara eksplisit.
+                        lock (_adminSessionLock)
+                        {
+                            if (_adminLogonIdCache.TryGetValue(cacheKey4634raw, out _) &&
+                                _adminLogonIdExpiry.TryGetValue(cacheKey4634raw, out DateTime expiryRaw) &&
+                                expiryRaw > DateTime.UtcNow)
+                            {
+                                isAdminSession4634raw = true;
+                            }
+                            else if (_adminLogonIdCache.ContainsKey(cacheKey4634raw))
+                            {
+                                // Expired — bersihkan sekarang
+                                _adminLogonIdCache.Remove(cacheKey4634raw);
+                                _adminLogonIdExpiry.Remove(cacheKey4634raw);
+                            }
+                        }
+
+                        // 2. RawEventStore disk lookup — retention-based range, reboot boundary.
+                        if (!isAdminSession4634raw)
+                        {
+                            try
+                            {
+                                DateTime localDateRaw    = eventTime.ToLocalTime().Date;
+                                DateTime retentionCutoff = eventTime - AdminSessionRetention;
+
+                                for (int dayOffset = 0;
+                                     localDateRaw.AddDays(-dayOffset) >= retentionCutoff.Date;
+                                     dayOffset++)
+                                {
+                                    DateTime searchDate = localDateRaw.AddDays(-dayOffset);
+                                    var rawLogins4634r = rawEventStore.GetEventsForDate(computerName, searchDate, 4624);
+                                    isAdminSession4634raw = rawLogins4634r.Any(r =>
+                                        r.IsAdminLogon &&
+                                        !string.IsNullOrEmpty(r.LogonId) &&
+                                        r.LogonId.Equals(logonId4634raw, StringComparison.OrdinalIgnoreCase) &&
+                                        r.EventTimeUtc >= retentionCutoff);
+                                    if (isAdminSession4634raw)
+                                        break;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                SafeWriteEventLog("Application",
+                                    $"[ADMIN] RawStore lookup failed for 4634 raw replay correlation: {ex.Message}",
+                                    EventLogEntryType.Warning, 2043);
+                            }
+                        }
+
+                        if (isAdminSession4634raw)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[ADMIN] Skipping 4634 (raw replay) — paired 4624 is admin. " +
+                                $"logonId={logonId4634raw} user={username} computer={computerName} time={eventTime:O}",
+                                EventLogEntryType.Information, 2042);
+                            return;
+                        }
+                    }
+                    // ── End admin correlation gate ────────────────────────────────────
+
                     string workDate4634raw = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
                     var allQueue4634raw = await eventQueue.GetAllAsync();
 
@@ -2725,10 +2835,11 @@ namespace EventLogOutEmployeeService
             if (ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime(), isSecurityEvent: true))
                 return;
 
-            // Opsi 3: simpan raw event ke disk SEBELUM diproses, agar tidak hilang
-            // kalau Security log ter-rotate/clear sebelum service sempat replay.
-            _ = Task.Run(() => SaveRawSecurityEventAsync(entry));
-
+            // Opsi 3: raw event dipersist di dalam ProcessSecurityEntryAsync (awal method,
+            // sebelum semua gate) via writeRawRecord=true — tidak perlu panggil terpisah di sini.
+            // Memindahkan save ke dalam ProcessSecurityEntryAsync menjamin:
+            //   - tidak ada double-write (satu call path, satu save)
+            //   - save dilakukan await sebelum admin cache dipopulate, menghilangkan race condition
             _ = Task.Run(async () =>
             {
                 try
@@ -2809,6 +2920,24 @@ namespace EventLogOutEmployeeService
                 string computerName = log.MachineName;
                 string eventMessage = log.Message;
 
+                // Persistensi ke RawEventStore dilakukan PERTAMA, sebelum semua gate.
+                // Ini menjamin dua properti penting:
+                //
+                // 1. Anti double-write: satu-satunya tempat SaveRawSecurityEventAsync dipanggil
+                //    untuk path ini. OnSecurityEventWritten tidak lagi memanggil secara terpisah,
+                //    dan ReplaySecurityEvents juga tidak lagi memanggil eksplisit — keduanya
+                //    bergantung pada panggilan di sini via writeRawRecord=true.
+                //
+                // 2. Race condition 4624→4634: save dilakukan secara await (bukan Task.Run fire-
+                //    and-forget) agar admin LogonId sudah di disk DAN di in-memory cache sebelum
+                //    proses berlanjut. Jika 4634 datang sangat cepat setelah 4624, RawStore
+                //    lookup di gate 4634 sudah punya data yang dibutuhkan.
+                //    SaveRawSecurityEventAsync juga populate _adminLogonIdCache secara sinkron
+                //    di dalam lock, sehingga cache read di gate 4634 (yang berjalan di thread
+                //    lain) tidak bisa mendahului write.
+                if (writeRawRecord)
+                    await SaveRawSecurityEventAsync(log);
+
                 // 4634 — Logoff (unreliable, used as fallback for 4647 when 4647 is absent).
                 // Windows fires 4634 for every logoff including background/system sessions,
                 // so it is inherently noisy. We only promote it as a logout event when
@@ -2831,6 +2960,89 @@ namespace EventLogOutEmployeeService
                     username4634 = ResolveUsernameBySid(username4634, sid4634);
                     if (string.IsNullOrEmpty(username4634) || !IsValidUsername(username4634))
                         return;
+
+                    // ── Admin session correlation gate ────────────────────────────────────
+                    // Parse Logon ID dari section "Subject:" pada 4634 — ini adalah ID sesi
+                    // yang ditutup, harus cocok dengan Logon ID dari paired 4624 admin.
+                    // 4634 tidak membawa Elevated Token / Linked Logon ID, sehingga satu-satunya
+                    // cara deteksi admin adalah via korelasi Logon ID ke 4624 yang sudah disimpan.
+                    string? logonId4634 = GetLogonId(eventMessage);
+
+                    if (!string.IsNullOrEmpty(logonId4634))
+                    {
+                        bool isAdminSession4634 = false;
+                        string cacheKey4634 = BuildAdminSessionKey(computerName, logonId4634);
+
+                        // 1. Cek in-memory cache (fast path — proses yang sama).
+                        // Validasi expiry secara eksplisit: TryGetValue saja tidak cukup karena
+                        // PruneAdminSessionCache hanya jalan setiap 5 menit. Entry bisa expired
+                        // tapi belum terhapus — harus treat sebagai cache miss dan lanjut ke disk.
+                        lock (_adminSessionLock)
+                        {
+                            if (_adminLogonIdCache.TryGetValue(cacheKey4634, out _) &&
+                                _adminLogonIdExpiry.TryGetValue(cacheKey4634, out DateTime expiry4634) &&
+                                expiry4634 > DateTime.UtcNow)
+                            {
+                                isAdminSession4634 = true;
+                            }
+                            else if (_adminLogonIdCache.ContainsKey(cacheKey4634))
+                            {
+                                // Entry ada tapi expired — bersihkan sekarang
+                                _adminLogonIdCache.Remove(cacheKey4634);
+                                _adminLogonIdExpiry.Remove(cacheKey4634);
+                            }
+                        }
+
+                        // 2. Jika tidak ada di memory, cek RawEventStore.
+                        // Pakai AdminSessionRetention sebagai lookback window (bukan hardcode 2 hari)
+                        // agar sesi sleep/hibernate/weekend yang panjang tetap bisa terkorelasi.
+                        // Reboot boundary: 4624 yang lebih tua dari AdminSessionRetention sudah tidak
+                        // valid — Windows me-reset LogonId space setiap reboot, sehingga LogonId lama
+                        // bisa collision dengan LogonId baru dari reboot berikutnya.
+                        if (!isAdminSession4634)
+                        {
+                            try
+                            {
+                                DateTime localDate4634   = eventTime.ToLocalTime().Date;
+                                DateTime retentionCutoff = eventTime - AdminSessionRetention;
+
+                                // Iterasi mundur per-hari sejauh AdminSessionRetention.
+                                for (int dayOffset = 0;
+                                     localDate4634.AddDays(-dayOffset) >= retentionCutoff.Date;
+                                     dayOffset++)
+                                {
+                                    DateTime searchDate = localDate4634.AddDays(-dayOffset);
+                                    var rawLogins4634 = rawEventStore.GetEventsForDate(computerName, searchDate, 4624);
+                                    isAdminSession4634 = rawLogins4634.Any(r =>
+                                        r.IsAdminLogon &&
+                                        !string.IsNullOrEmpty(r.LogonId) &&
+                                        r.LogonId.Equals(logonId4634, StringComparison.OrdinalIgnoreCase) &&
+                                        // Reboot boundary: tolak 4624 yang terlalu lama.
+                                        // LogonId hanya unique dalam satu boot cycle.
+                                        r.EventTimeUtc >= retentionCutoff);
+
+                                    if (isAdminSession4634)
+                                        break;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                SafeWriteEventLog("Application",
+                                    $"[ADMIN] RawStore lookup failed for 4634 correlation: {ex.Message}",
+                                    EventLogEntryType.Warning, 2043);
+                            }
+                        }
+
+                        if (isAdminSession4634)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[ADMIN] Skipping 4634 — paired 4624 session is admin. " +
+                                $"logonId={logonId4634} user={username4634} computer={computerName} time={eventTime:O}",
+                                EventLogEntryType.Information, 2042);
+                            return; // tidak di-enqueue, tidak di-dispatch, tidak ke SharePoint
+                        }
+                    }
+                    // ── End admin correlation gate ────────────────────────────────────────
 
                     // Check: apakah 4647 untuk user+computer+workDate ini sudah ada di queue?
                     // Kalau ada, 4634 tidak diperlukan — skip.
@@ -2898,14 +3110,49 @@ namespace EventLogOutEmployeeService
                 if (eventId == 4624 && !IsRelevantLogonType(logonType))
                     return;
 
-                // Skip admin (UAC split token) logins.
+                // Deteksi admin (UAC split token) login.
                 // Windows membuat 2 event 4624 untuk admin login:
                 //   - Elevated Token: Yes  (high integrity token)
                 //   - Elevated Token: No   (filtered standard token)
                 // Keduanya punya Linked Logon ID non-zero yang saling pointing.
-                // Kalau Linked Logon ID != 0x0 → ini bagian dari admin split token → skip.
-                if (eventId == 4624 && IsAdminSplitTokenLogin(eventMessage))
+                bool isAdminLogin = eventId == 4624 && IsAdminSplitTokenLogin(eventMessage);
+
+                if (isAdminLogin)
+                {
+                    // Ekstrak Logon ID dari section "New Logon:" — ini adalah ID sesi yang dibuka.
+                    string? adminExcerpt = null;
+                    if (eventMessage != null)
+                    {
+                        int newLogonIdx = eventMessage.IndexOf("New Logon:", StringComparison.OrdinalIgnoreCase);
+                        if (newLogonIdx >= 0)
+                        {
+                            int len = Math.Min(600, eventMessage.Length - newLogonIdx);
+                            adminExcerpt = eventMessage.Substring(newLogonIdx, len);
+                        }
+                    }
+                    string? adminLogonId = GetLogonId(adminExcerpt ?? eventMessage);
+
+                    // Populate in-memory correlation cache agar 4634 yang tiba nanti
+                    // bisa di-korelasikan tanpa disk read.
+                    if (!string.IsNullOrEmpty(adminLogonId))
+                    {
+                        string cacheKey = BuildAdminSessionKey(computerName, adminLogonId);
+                        lock (_adminSessionLock)
+                        {
+                            _adminLogonIdCache[cacheKey]  = true;
+                            _adminLogonIdExpiry[cacheKey] = DateTime.UtcNow.Add(AdminSessionRetention);
+                            PruneAdminSessionCache();
+                        }
+
+                        SafeWriteEventLog("Application",
+                            $"[ADMIN] Admin session cached for correlation (live 4624): " +
+                            $"logonId={adminLogonId} computer={computerName}",
+                            EventLogEntryType.Information, 2041);
+                    }
+
+                    // Gate: jangan enqueue atau dispatch — admin session tidak boleh sampai ke SharePoint.
                     return;
+                }
 
                 string? username = GetUsernameFromEvent(eventMessage, eventId);
                 if (string.IsNullOrEmpty(username) || !IsValidUsername(username))
@@ -3418,29 +3665,31 @@ namespace EventLogOutEmployeeService
                 if (eventId != 4624 && eventId != 4647 && eventId != 4634)
                     return;
 
-                // Untuk 4624: ambil section "New Logon:" saja
-                // Untuk 4647: ambil section "Subject:" saja
-                string? excerpt = null;
                 string? message = entry.Message;
+
+                // Slice anchor section untuk excerpt (sama seperti sebelumnya).
+                string? excerpt = null;
                 if (message != null)
                 {
                     string anchor = eventId == 4624 ? "New Logon:" : "Subject:";
                     int idx = message.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
                     if (idx >= 0)
                     {
-                        // Ambil max 600 char dari anchor untuk dapat Account Name + Security ID
                         int len = Math.Min(600, message.Length - idx);
                         excerpt = message.Substring(idx, len);
                     }
                 }
 
-                // FIX: jangan simpan event admin/privileged ke RawEventStore sama sekali.
-                // Tanpa ini, event 4624 admin tersimpan ke disk dengan Username sudah ter-extract,
-                // lalu saat ProcessRawSecurityEventAsync replay — yang tidak punya akses ke
-                // full message — tidak bisa re-check split token dan akun admin lolos masuk queue.
-                // IsAdminSplitTokenLogin cek Linked Logon ID non-0x0 DAN Elevated Token: Yes.
-                if (eventId == 4624 && IsAdminSplitTokenLogin(message ?? excerpt))
-                    return;
+                // Deteksi admin split-token SEBELUM memutuskan apa yang disimpan —
+                // tapi JANGAN return di sini. Metadata sesi harus dipersist agar
+                // korelasi 4634 tetap bekerja setelah service restart.
+                bool isAdmin = eventId == 4624 && IsAdminSplitTokenLogin(message ?? excerpt);
+
+                // Parse Logon ID dari section "New Logon:" untuk 4624,
+                // sehingga kita mendapat ID dari sesi yang dibuka (bukan Subject/caller).
+                string? logonId = eventId == 4624
+                    ? GetLogonId(excerpt ?? message)
+                    : null;
 
                 string? username = message != null ? GetUsernameFromEvent(message, eventId) : null;
                 string? sid      = message != null ? GetUserSidFromSecurityEvent(message, eventId) : null;
@@ -3455,10 +3704,34 @@ namespace EventLogOutEmployeeService
                     Username       = username,
                     Sid            = sid,
                     MessageExcerpt = excerpt,
-                    Source         = "Security"
+                    Source         = "Security",
+                    // Field baru — membawa identitas admin session ke disk
+                    LogonId        = logonId,
+                    IsAdminLogon   = isAdmin
                 };
 
+                // SELALU simpan — termasuk admin session.
+                // RawEventStore kini berfungsi ganda: replay storage DAN session-correlation cache.
+                // Menyimpan admin event ke disk TIDAK berarti di-enqueue atau di-dispatch.
                 await rawEventStore.SaveAsync(raw);
+
+                // Populate in-memory admin cache agar 4634 yang tiba di proses yang sama
+                // bisa dikorelasikan tanpa disk read. Disk copy menangani skenario cross-restart.
+                if (isAdmin && !string.IsNullOrEmpty(logonId))
+                {
+                    string cacheKey = BuildAdminSessionKey(entry.MachineName, logonId);
+                    lock (_adminSessionLock)
+                    {
+                        _adminLogonIdCache[cacheKey]  = true;
+                        _adminLogonIdExpiry[cacheKey] = DateTime.UtcNow.Add(AdminSessionRetention);
+                        PruneAdminSessionCache();
+                    }
+
+                    SafeWriteEventLog("Application",
+                        $"[ADMIN] Admin session saved for correlation: " +
+                        $"user={username} logonId={logonId} computer={entry.MachineName}",
+                        EventLogEntryType.Information, 2041);
+                }
             }
             catch { /* jangan crash service */ }
         }
@@ -3642,6 +3915,68 @@ namespace EventLogOutEmployeeService
                 return false;
             }
             catch { return false; }
+        }
+
+        /// <summary>
+        /// Ekstrak Windows Logon ID (hex) dari pesan Security event.
+        /// Cocok untuk format "Logon ID:\t\t0x1a3f5c" yang muncul di section
+        /// "New Logon:" pada 4624, dan di section "Subject:" pada 4634/4647.
+        /// Return lowercase hex yang sudah dinormalkan, atau null jika gagal.
+        /// </summary>
+        private static string? GetLogonId(string? message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return null;
+
+            try
+            {
+                var match = Regex.Match(
+                    message,
+                    @"Logon ID:\s*(0x[0-9A-Fa-f]+)",
+                    RegexOptions.IgnoreCase);
+
+                return match.Success
+                    ? match.Groups[1].Value.Trim().ToLowerInvariant()
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Bangun composite key untuk _adminLogonIdCache.
+        /// Format: "{COMPUTER}::{logonid}" — case-insensitive di kedua bagian.
+        /// </summary>
+        private static string BuildAdminSessionKey(string computerName, string logonId)
+            => $"{computerName.ToUpperInvariant()}::{logonId.ToLowerInvariant()}";
+
+        /// <summary>
+        /// Hapus entry expired dari _adminLogonIdCache.
+        /// HARUS dipanggil di dalam _adminSessionLock.
+        /// Rate-limited: maksimal sekali per 5 menit untuk menekan overhead.
+        /// </summary>
+        private void PruneAdminSessionCache()
+        {
+            // Rate-limit: prune paling sering sekali per 5 menit.
+            if ((DateTime.UtcNow - _lastAdminCachePrune).TotalMinutes < 5)
+                return;
+
+            _lastAdminCachePrune = DateTime.UtcNow;
+
+            var expired = new List<string>();
+            foreach (var kv in _adminLogonIdExpiry)
+            {
+                if (kv.Value < DateTime.UtcNow)
+                    expired.Add(kv.Key);
+            }
+
+            foreach (string k in expired)
+            {
+                _adminLogonIdCache.Remove(k);
+                _adminLogonIdExpiry.Remove(k);
+            }
         }
 
         /// <summary>
