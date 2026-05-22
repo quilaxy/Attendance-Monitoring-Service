@@ -1129,6 +1129,27 @@ namespace EventLogOutEmployeeService
                 {
                     string workDate4634raw = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
                     var allQueue4634raw = await eventQueue.GetAllAsync();
+
+                    // Temporal dedup: sama dengan live path — skip 4634 yang fire
+                    // dalam 30 detik setelah 4624 (stale session close saat unlock/CachedInteractive).
+                    const int staleWindowSecondsRaw = 30;
+                    bool isStaleRaw = allQueue4634raw.Any(x =>
+                        x.EventId == 4624 &&
+                        x.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
+                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634raw &&
+                        eventTime >= x.EventTime &&
+                        (eventTime - x.EventTime).TotalSeconds <= staleWindowSecondsRaw);
+                    if (isStaleRaw)
+                    {
+                        SafeWriteEventLog("Attendance-Service",
+                            $"[DBG-4634] RawReplay skipped — stale session close within " +
+                            $"{staleWindowSecondsRaw}s of 4624. " +
+                            $"user='{username}' computer='{computerName}' time={eventTime:O}",
+                            EventLogEntryType.Information, 2033);
+                        return;
+                    }
+
                     bool has4647raw = allQueue4634raw.Any(x =>
                         x.EventId == 4647 &&
                         x.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
@@ -1136,7 +1157,7 @@ namespace EventLogOutEmployeeService
                         x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634raw);
                     if (has4647raw)
                     {
-                        SafeWriteEventLog("Application",
+                        SafeWriteEventLog("Attendance-Service",
                             $"[DBG-4634] RawReplay skipped — 4647 already queued for user='{username}' " +
                             $"computer='{computerName}' at {eventTime:O}",
                             EventLogEntryType.Information, 2033);
@@ -2412,11 +2433,33 @@ namespace EventLogOutEmployeeService
 
                     // Check: apakah 4647 untuk user+computer+workDate ini sudah ada di queue?
                     // Kalau ada, 4634 tidak diperlukan — skip.
-                    // Menggunakan GetAllAsync karena HasEventForUserComputerWorkDateAsync mungkin
-                    // belum ada di PersistentEventQueue — lihat catatan di bawah untuk implementasi
-                    // method tersebut di PersistentEventQueue.
                     string workDate4634 = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
                     var allQueue4634 = await eventQueue.GetAllAsync();
+
+                    // Temporal dedup: skip 4634 yang fire dalam 30 detik setelah 4624 user yang sama.
+                    // Ini adalah Windows behavior normal untuk logon type 11 (CachedInteractive /
+                    // unlock screen) — Windows menutup sesi lama dan membuka sesi baru hampir
+                    // bersamaan, menyebabkan 4634 (sesi lama ditutup) fire tepat setelah 4624 baru.
+                    // 4634 seperti ini BUKAN logout user — jangan dispatch ke SharePoint.
+                    // Window 30 detik aman: logout sesungguhnya selalu punya gap >> 30 detik dari login.
+                    const int staleSessionWindowSeconds = 30;
+                    bool isStaleSessionClose = allQueue4634.Any(x =>
+                        x.EventId == 4624 &&
+                        x.Username.Equals(username4634, StringComparison.OrdinalIgnoreCase) &&
+                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634 &&
+                        eventTime >= x.EventTime &&
+                        (eventTime - x.EventTime).TotalSeconds <= staleSessionWindowSeconds);
+                    if (isStaleSessionClose)
+                    {
+                        SafeWriteEventLog("Attendance-Service",
+                            $"[DBG-4634] Skipped — stale session close: 4634 fired within " +
+                            $"{staleSessionWindowSeconds}s of 4624 login. " +
+                            $"user='{username4634}' computer='{computerName}' time={eventTime:O}",
+                            EventLogEntryType.Information, 2033);
+                        return;
+                    }
+
                     bool has4647 = allQueue4634.Any(x =>
                         x.EventId == 4647 &&
                         x.Username.Equals(username4634, StringComparison.OrdinalIgnoreCase) &&
@@ -2424,14 +2467,14 @@ namespace EventLogOutEmployeeService
                         x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634);
                     if (has4647)
                     {
-                        SafeWriteEventLog("Application",
+                        SafeWriteEventLog("Attendance-Service",
                             $"[DBG-4634] Skipped — 4647 already queued for user='{username4634}' " +
                             $"computer='{computerName}' at {eventTime:O}",
                             EventLogEntryType.Information, 2033);
                         return;
                     }
 
-                    SafeWriteEventLog("Application",
+                    SafeWriteEventLog("Attendance-Service",
                         $"[DBG-4634] Promoting as fallback logout: user='{username4634}' " +
                         $"computer='{computerName}' at {eventTime:O} (no 4647 found in queue)",
                         EventLogEntryType.Information, 2033);
@@ -2969,31 +3012,18 @@ namespace EventLogOutEmployeeService
                 if (eventId != 4624 && eventId != 4647 && eventId != 4634)
                     return;
 
-                // Untuk 4624: ambil dari "Logon Information:" (bukan "New Logon:") agar excerpt
-                // mencakup KEDUA field yang dibutuhkan IsAdminSplitTokenLogin:
-                //   - "Elevated Token: Yes/No"  → ada di section "Logon Information:"
-                //   - "Linked Logon ID: 0x..."  → ada di section "New Logon:" (setelah "Logon Information:")
-                // Kalau anchor hanya "New Logon:", "Elevated Token" tidak masuk excerpt
-                // sehingga admin dengan Elevated Token Yes tapi Linked Logon ID = 0x0 lolos filter.
-                // Naikkan limit dari 600 → 1200 char untuk cover kedua section secara penuh.
-                // Untuk 4647: ambil section "Subject:" saja (tidak butuh Elevated Token check).
+                // Untuk 4624: ambil section "New Logon:" saja
+                // Untuk 4647: ambil section "Subject:" saja
                 string? excerpt = null;
                 string? message = entry.Message;
                 if (message != null)
                 {
-                    string anchor = eventId == 4624 ? "Logon Information:" : "Subject:";
+                    string anchor = eventId == 4624 ? "New Logon:" : "Subject:";
                     int idx = message.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
-                    if (idx < 0 && eventId == 4624)
-                    {
-                        // Fallback: kalau "Logon Information:" tidak ditemukan (locale berbeda),
-                        // coba "New Logon:" agar minimal Linked Logon ID ter-cover.
-                        idx = message.IndexOf("New Logon:", StringComparison.OrdinalIgnoreCase);
-                    }
                     if (idx >= 0)
                     {
-                        // 1200 char: cukup untuk cover "Logon Information:" + "New Logon:"
-                        // termasuk semua field Elevated Token dan Linked Logon ID.
-                        int len = Math.Min(1200, message.Length - idx);
+                        // Ambil max 600 char dari anchor untuk dapat Account Name + Security ID
+                        int len = Math.Min(600, message.Length - idx);
                         excerpt = message.Substring(idx, len);
                     }
                 }
@@ -3003,7 +3033,6 @@ namespace EventLogOutEmployeeService
                 // lalu saat ProcessRawSecurityEventAsync replay — yang tidak punya akses ke
                 // full message — tidak bisa re-check split token dan akun admin lolos masuk queue.
                 // IsAdminSplitTokenLogin cek Linked Logon ID non-0x0 DAN Elevated Token: Yes.
-                // Gunakan full message untuk check ini (bukan excerpt) agar paling akurat.
                 if (eventId == 4624 && IsAdminSplitTokenLogin(message ?? excerpt))
                     return;
 

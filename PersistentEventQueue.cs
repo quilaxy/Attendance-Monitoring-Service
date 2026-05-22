@@ -29,6 +29,22 @@ namespace EventLogOutEmployeeService
         /// <summary>Subset message yang dibutuhkan untuk re-process: section "New Logon:" atau "Subject:"</summary>
         public string? MessageExcerpt { get; set; }
         public string  Source       { get; set; } = "Security";
+
+        /// <summary>
+        /// Logon ID (hex string, misal "0x9dc2c3a") dari section "New Logon:" (4624)
+        /// atau "Subject:" (4634/4647). Dipakai untuk cross-reference 4634 → 4624:
+        /// kalau 4624 dengan Logon ID yang sama sudah difilter sebagai admin,
+        /// 4634-nya juga harus di-skip.
+        /// </summary>
+        public string? LogonId { get; set; }
+
+        /// <summary>
+        /// True kalau event 4624 ini difilter oleh IsAdminSplitTokenLogin.
+        /// Disimpan ke disk agar path replay bisa tahu bahwa Logon ID ini milik admin
+        /// tanpa perlu re-parse full message yang sudah tidak ada.
+        /// Selalu false untuk 4634 dan 4647.
+        /// </summary>
+        public bool IsAdminLogon { get; set; } = false;
     }
 
     public class RawEventStore
@@ -251,7 +267,7 @@ namespace EventLogOutEmployeeService
         {
             if (!LoginLogoutMonitorService.VerboseLogging && eventId == 5011)
                 return;
-            try { EventLog.WriteEntry("Attendance-Service", message, type, eventId); }
+            try { EventLog.WriteEntry("Application", message, type, eventId); }
             catch { }
         }
 
