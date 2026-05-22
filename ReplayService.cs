@@ -178,7 +178,7 @@ namespace EventLogOutEmployeeService
                 // memang idempotent via File.Exists, tapi race condition masih bisa terjadi
                 // di window antara File.Exists check dan File.Move final.
                 // Solusi: satu panggilan saja, lewat ProcessSecurityEntryAsync.
-                _processSecurityEntryAsync(entry, writeRawRecord: true).GetAwaiter().GetResult();
+                _processSecurityEntryAsync(entry, true).GetAwaiter().GetResult();
             }
         }
 
@@ -232,7 +232,7 @@ namespace EventLogOutEmployeeService
                     $"ReplaySystemEvents: processing EventId={eventId} at {time:O} Source={entry.Source}",
                     EventLogEntryType.Information, 1031);
 
-                _processSystemEntryAsync(entry, writeRawRecord: true).GetAwaiter().GetResult();
+                _processSystemEntryAsync(entry, true).GetAwaiter().GetResult();
             }
         }
 
@@ -269,7 +269,7 @@ namespace EventLogOutEmployeeService
 
                         try
                         {
-                            await _processRawSecurityEventAsync(raw, writeRawRecord: true);
+                            await _processRawSecurityEventAsync(raw, true);
                             totalProcessed++;
                         }
                         catch (Exception ex)
