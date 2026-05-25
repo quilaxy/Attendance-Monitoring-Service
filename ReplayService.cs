@@ -252,8 +252,8 @@ namespace EventLogOutEmployeeService
                 for (DateTime date = localFrom; date <= localTo; date = date.AddDays(1))
                 {
                     // Struktur flat: rawevents\{yyyyMMdd}\ — tidak ada subfolder per PC
-                    var events4624 = _rawEventStore.GetEventsForDate(date, 4624);
-                    var events4647 = _rawEventStore.GetEventsForDate(date, 4647);
+                    var events4624 = _rawEventStore.GetEventsForDate(Environment.MachineName, date, 4624);
+                    var events4647 = _rawEventStore.GetEventsForDate(Environment.MachineName, date, 4647);
 
                     var allEvents = events4624.Concat(events4647)
                         .Where(e => e.EventTimeUtc >= replayFrom && e.EventTimeUtc <= replayTo)
