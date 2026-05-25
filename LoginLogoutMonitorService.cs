@@ -229,8 +229,10 @@ namespace EventLogOutEmployeeService
 
             // Catat kapan subscription diaktifkan — startup probe butuh referensi ini
             // untuk menghitung berapa lama subscription sudah aktif tanpa menerima event.
-            Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, DateTime.UtcNow.Ticks);
-            Interlocked.Exchange(ref _systemSubscriptionEnabledTicksUtc, DateTime.UtcNow.Ticks);
+            long subscriptionEnabledTicks = DateTime.UtcNow.Ticks;
+            Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, subscriptionEnabledTicks);
+            Interlocked.Exchange(ref _systemSubscriptionEnabledTicksUtc, subscriptionEnabledTicks);
+            Interlocked.Exchange(ref _securityProbeEpochTicks, subscriptionEnabledTicks);
 
             int maxRetries = 5;
             int currentRetry = 0;
@@ -274,6 +276,8 @@ namespace EventLogOutEmployeeService
                             // selama kita kirim RequestAdditionalTime sebelum deadline.
                             RequestAdditionalTime(120_000);
 
+                            // MUST be first — configure sc failure actions before any other startup work
+                            // so that even if startup crashes, the service will be restarted by SCM.
                             // Self-healing: pastikan startup type tetap Automatic dan
                             // sc failure recovery action tetap terkonfigurasi.
                             // Dijalankan setiap service start agar Windows Update atau
@@ -383,7 +387,13 @@ namespace EventLogOutEmployeeService
             try
             {
                 // Query current start type
-                string qcOutput = RunSc($"qc \"{serviceName}\"");
+                var (qcOutput, qcExitCode) = RunSc($"qc \"{serviceName}\"");
+                if (qcExitCode != 0)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RESILIENCE] sc qc exit code {qcExitCode}. Output: '{qcOutput.Trim()}'",
+                        EventLogEntryType.Warning, 1064);
+                }
 
                 // "2   AUTO_START"  → sudah auto, tidak perlu apa-apa
                 // "2   AUTO_START  (DELAYED)" → auto delayed, juga acceptable
@@ -402,7 +412,13 @@ namespace EventLogOutEmployeeService
                     $"memperbaiki ke auto...",
                     EventLogEntryType.Warning, 1062);
 
-                string configOutput = RunSc($"config \"{serviceName}\" start= auto");
+                var (configOutput, configExitCode) = RunSc($"config \"{serviceName}\" start= auto");
+                if (configExitCode != 0)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RESILIENCE] sc config exit code {configExitCode}. Output: '{configOutput.Trim()}'",
+                        EventLogEntryType.Warning, 1064);
+                }
 
                 SafeWriteEventLog("Application",
                     $"[RESILIENCE] StartupType diperbaiki ke AUTO. sc config output: '{configOutput.Trim()}'",
@@ -421,14 +437,20 @@ namespace EventLogOutEmployeeService
         /// Kalau belum ada recovery action (reset= 0, actions kosong), set ulang.
         ///
         /// Target config:
-        ///   reset= 86400 (counter reset setelah 24 jam normal)
-        ///   actions= restart/5000/restart/15000/restart/60000
+        ///   reset= 3600 (counter reset setelah 1 jam normal)
+        ///   actions= restart/5000/restart/30000/restart/60000/restart/120000
         /// </summary>
         private void EnsureFailureActions(string serviceName)
         {
             try
             {
-                string qfailureOutput = RunSc($"qfailure \"{serviceName}\"");
+                var (qfailureOutput, qfailureExitCode) = RunSc($"qfailure \"{serviceName}\"");
+                if (qfailureExitCode != 0)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RESILIENCE] sc qfailure exit code {qfailureExitCode}. Output: '{qfailureOutput.Trim()}'",
+                        EventLogEntryType.Warning, 1068);
+                }
 
                 // Kalau sudah ada "RESTART -- Delay" di output, sc failure sudah terkonfigurasi
                 bool alreadyConfigured = qfailureOutput.Contains("RESTART", StringComparison.OrdinalIgnoreCase) &&
@@ -446,9 +468,15 @@ namespace EventLogOutEmployeeService
                     $"[RESILIENCE] sc failure belum terkonfigurasi — memperbaiki...",
                     EventLogEntryType.Warning, 1066);
 
-                string failureOutput = RunSc(
-                    $"failure \"{serviceName}\" reset= 86400 " +
-                    $"actions= restart/5000/restart/15000/restart/60000");
+                var (failureOutput, failureExitCode) = RunSc(
+                    $"failure \"{serviceName}\" reset= 3600 " +
+                    $"actions= restart/5000/restart/30000/restart/60000/restart/120000");
+                if (failureExitCode != 0)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RESILIENCE] sc failure exit code {failureExitCode}. Output: '{failureOutput.Trim()}'",
+                        EventLogEntryType.Warning, 1068);
+                }
 
                 SafeWriteEventLog("Application",
                     $"[RESILIENCE] sc failure dikonfigurasi ulang. Output: '{failureOutput.Trim()}'",
@@ -463,10 +491,10 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Jalankan sc.exe dengan argumen tertentu, return stdout+stderr sebagai string.
+        /// Jalankan sc.exe dengan argumen tertentu, return stdout+stderr + exit code.
         /// Timeout 10 detik — sc.exe lokal hampir selalu selesai dalam < 1 detik.
         /// </summary>
-        private static string RunSc(string arguments)
+        private static (string Output, int ExitCode) RunSc(string arguments)
         {
             using var process = new System.Diagnostics.Process
             {
@@ -484,8 +512,9 @@ namespace EventLogOutEmployeeService
             process.Start();
             string output = process.StandardOutput.ReadToEnd() +
                             process.StandardError.ReadToEnd();
-            process.WaitForExit(10_000); // timeout 10 detik
-            return output;
+            bool exited = process.WaitForExit(10_000); // timeout 10 detik
+            int exitCode = exited ? process.ExitCode : -1;
+            return (output, exitCode);
         }
 
         // ─── Crash handler ───────────────────────────────────────────────────────
@@ -1084,12 +1113,15 @@ namespace EventLogOutEmployeeService
                         $"and scheduling re-subscribe + mini-replay for Security and System logs.",
                         EventLogEntryType.Information, 1086);
 
+                    long resumeTicks = DateTime.UtcNow.Ticks;
+
                     // Reset Security log counters — startup probe Security akan aktif kembali
-                    Interlocked.Exchange(ref _subscriptionEnabledTicksUtc,   DateTime.UtcNow.Ticks);
-                    Interlocked.Exchange(ref _lastSecurityEventTicksUtc,      DateTime.MinValue.Ticks);
+                    Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, resumeTicks);
+                    Interlocked.Exchange(ref _securityProbeEpochTicks,     resumeTicks);
+                    Interlocked.Exchange(ref _lastSecurityEventTicksUtc,   DateTime.MinValue.Ticks);
 
                     // Reset System log counters — startup probe System akan aktif kembali
-                    Interlocked.Exchange(ref _systemSubscriptionEnabledTicksUtc, DateTime.UtcNow.Ticks);
+                    Interlocked.Exchange(ref _systemSubscriptionEnabledTicksUtc, resumeTicks);
                     Interlocked.Exchange(ref _lastSystemEventTicksUtc,           DateTime.MinValue.Ticks);
 
                     var ct = cancellationToken ?? CancellationToken.None;
@@ -1231,18 +1263,49 @@ namespace EventLogOutEmployeeService
                 // dimulai. Tidak perlu diaktifkan lagi di sini untuk menghindari double-enable.
                 // HandleServiceStopping() masih meng-disable dengan benar saat service berhenti.
 
-                Task.Run(() => CleanupOldRecordsTask(cancellationToken), cancellationToken);
-                Task.Run(() => ProcessQueuedEventsTask(cancellationToken), cancellationToken);
+                _ = Task.Run(() => CleanupOldRecordsTask(cancellationToken), cancellationToken);
+                Task queueTask = Task.Run(() => ProcessQueuedEventsTask(cancellationToken), cancellationToken);
 
                 // FIX [HEALTH]: Monitor Security log subscription — bisa drop silent setelah log rotate.
-                Task.Run(() => SecurityLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
+                Task secHealthTask = Task.Run(() => SecurityLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
 
                 // FIX [HEALTH-SYSTEM]: Monitor System log subscription — sumber event 42, 1074, 6006.
                 // Shutdown detection path seluruhnya bergantung pada System log ini.
-                Task.Run(() => SystemLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
+                Task sysHealthTask = Task.Run(() => SystemLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
 
                 while (!cancellationToken.IsCancellationRequested)
+                {
                     Thread.Sleep(5000);
+
+                    // Watchdog: restart health check tasks if they have faulted or completed unexpectedly.
+                    // Each task should run indefinitely until cancellation — if they exit early, something crashed.
+                    if (secHealthTask.IsCompleted && !cancellationToken.IsCancellationRequested)
+                    {
+                        SafeWriteEventLog("Application",
+                            "[WATCHDOG] Security log health check task exited unexpectedly — restarting.",
+                            EventLogEntryType.Warning, 1093);
+                        secHealthTask = Task.Run(
+                            () => SecurityLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
+                    }
+
+                    if (sysHealthTask.IsCompleted && !cancellationToken.IsCancellationRequested)
+                    {
+                        SafeWriteEventLog("Application",
+                            "[WATCHDOG] System log health check task exited unexpectedly — restarting.",
+                            EventLogEntryType.Warning, 1093);
+                        sysHealthTask = Task.Run(
+                            () => SystemLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
+                    }
+
+                    if (queueTask.IsCompleted && !cancellationToken.IsCancellationRequested)
+                    {
+                        SafeWriteEventLog("Application",
+                            "[WATCHDOG] Queue processor task exited unexpectedly — restarting.",
+                            EventLogEntryType.Warning, 1093);
+                        queueTask = Task.Run(
+                            () => ProcessQueuedEventsTask(cancellationToken), cancellationToken);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -1369,7 +1432,7 @@ namespace EventLogOutEmployeeService
             const int workHourStart             = 7;
             const int workHourEnd               = 19;
 
-            bool startupProbeCompleted = false;
+            long lastProbeEpochHandled = DateTime.MinValue.Ticks;
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -1379,6 +1442,7 @@ namespace EventLogOutEmployeeService
 
                     long enabledTicks   = Interlocked.Read(ref _subscriptionEnabledTicksUtc);
                     long lastEventTicks = Interlocked.Read(ref _lastSecurityEventTicksUtc);
+                    long probeEpoch     = Interlocked.Read(ref _securityProbeEpochTicks);
                     DateTime nowUtc     = DateTime.UtcNow;
 
                     double secondsSinceEnabled   = (nowUtc.Ticks - enabledTicks) / (double)TimeSpan.TicksPerSecond;
@@ -1391,11 +1455,16 @@ namespace EventLogOutEmployeeService
                     // Kalau tidak ada Security event sama sekali dalam window itu → subscription
                     // kemungkinan besar drop (fast startup / hibernate / log sudah penuh saat wake).
                     // Tidak peduli jam kerja — startup bisa terjadi kapan saja.
-                    if (!startupProbeCompleted && secondsSinceEnabled >= probeStartupWindowSeconds)
+                    bool startupProbeCompleted = probeEpoch != DateTime.MinValue.Ticks
+                        && (nowUtc.Ticks - probeEpoch) / (double)TimeSpan.TicksPerSecond
+                           >= probeStartupWindowSeconds;
+                    if (startupProbeCompleted && lastProbeEpochHandled != probeEpoch)
                     {
-                        startupProbeCompleted = true;
+                        lastProbeEpochHandled = probeEpoch;
 
-                        if (lastEventTicks == DateTime.MinValue.Ticks)
+                        bool hasNoEventSinceEnable = lastEventTicks == DateTime.MinValue.Ticks ||
+                                                     lastEventTicks <= probeEpoch;
+                        if (hasNoEventSinceEnable)
                         {
                             // Tidak ada Security event sama sekali sejak subscription di-enable
                             SafeWriteEventLog("Application",
@@ -1425,7 +1494,7 @@ namespace EventLogOutEmployeeService
 
                     // ── MID-DAY DROP CHECK ─────────────────────────────────────────────────
                     // Setelah startup probe selesai, monitor terus untuk mid-day drop.
-                    if (!startupProbeCompleted)
+                    if (lastProbeEpochHandled != probeEpoch)
                         continue; // masih dalam window startup probe, belum saatnya cek mid-day
 
                     int hour        = DateTime.Now.Hour;
@@ -1498,12 +1567,14 @@ namespace EventLogOutEmployeeService
                     await Task.Delay(300, cancellationToken);
                     securityEventLog.EnableRaisingEvents = true;
 
-                    // Reset kedua counter setelah re-subscribe berhasil:
+                    // Reset counter setelah re-subscribe berhasil:
                     //   _lastSecurityEventTicksUtc   → mid-day cooldown dihitung ulang dari sini
-                    //   _subscriptionEnabledTicksUtc → probe startup tidak aktif di iterasi berikutnya
+                    //   _subscriptionEnabledTicksUtc → referensi enable untuk startup probe
+                    //   _securityProbeEpochTicks     → reset epoch startup probe
                     long nowTicks = DateTime.UtcNow.Ticks;
                     Interlocked.Exchange(ref _lastSecurityEventTicksUtc,   nowTicks);
                     Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, nowTicks);
+                    Interlocked.Exchange(ref _securityProbeEpochTicks,     nowTicks);
 
                     SafeWriteEventLog("Application",
                         $"[HEALTH] Re-subscribed OK (attempt {attempt}/{maxAttempts}).",
@@ -1582,7 +1653,7 @@ namespace EventLogOutEmployeeService
             // dari Security (30 detik). Cukup responsif tanpa membebani EventLog API.
             const int checkIntervalSeconds      = 300;  // 5 menit
             const int probeStartupWindowSeconds = 120;  // 2 menit — lebih longgar dari Security (90s)
-            const int pollDropThresholdSeconds  = 600;  // 10 menit gap log entry vs last kita terima
+            const int pollDropThresholdSeconds  = 1200; // 20 menit gap log entry vs last kita terima
             const int maxResubscribeAttempts    = 3;
             const int workHourStart             = 7;
             const int workHourEnd               = 19;
@@ -1677,11 +1748,16 @@ namespace EventLogOutEmployeeService
 
                     if (gapSeconds > pollDropThresholdSeconds && latestLogEntry.Value > baselineUtc)
                     {
+                        // Confirm: does the System log actually have entries we haven't seen?
+                        // This guards against the case where System log is genuinely idle.
+                        bool hasNewEntries = SystemLogHasRecentEntry(baselineUtc, nowUtc);
+                        if (!hasNewEntries)
+                            continue; // log is idle, not dropped — skip re-subscribe
+
                         int gapMinutes = (int)(gapSeconds / 60);
                         SafeWriteEventLog("Application",
-                            $"[HEALTH-SYS] Poll drop detected: System log latest entry={latestLogEntry.Value:O} " +
-                            $"but last subscription event was {gapMinutes} min ago " +
-                            $"(threshold={pollDropThresholdSeconds / 60} min). Re-subscribe + mini-replay.",
+                            $"[HEALTH-SYS] Poll drop CONFIRMED: System log has entries since {baselineUtc:O} " +
+                            $"but subscription has been silent {gapMinutes} min. Re-subscribe + mini-replay.",
                             EventLogEntryType.Warning, 1088);
 
                         await ResubscribeSystemLogAndMiniReplayAsync(
@@ -1704,7 +1780,7 @@ namespace EventLogOutEmployeeService
         /// <summary>
         /// Cek apakah System log punya setidaknya satu entry dalam rentang [fromUtc, toUtc].
         /// Dipakai oleh startup probe untuk membedakan "subscription drop" vs "log memang idle".
-        /// Scan partial dari belakang (max 200 entry) — berhenti segera setelah menemukan satu match.
+        /// Scan partial dari belakang (max 500 entry) — berhenti segera setelah menemukan satu match.
         /// </summary>
         private bool SystemLogHasRecentEntry(DateTime fromUtc, DateTime toUtc)
         {
@@ -1713,7 +1789,7 @@ namespace EventLogOutEmployeeService
                 if (systemEventLog == null) return false;
 
                 int count = systemEventLog.Entries.Count;
-                for (int i = count - 1; i >= Math.Max(0, count - 200); i--)
+                for (int i = count - 1; i >= Math.Max(0, count - 500); i--)
                 {
                     EventLogEntry entry = systemEventLog.Entries[i];
                     DateTime entryTime  = entry.TimeGenerated.ToUniversalTime();
@@ -2301,8 +2377,10 @@ namespace EventLogOutEmployeeService
         // _subscriptionEnabledTicksUtc: kapan EnableRaisingEvents = true terakhir dipanggil.
         //   Diset di OnStart() dan ResubscribeAndMiniReplayAsync() setiap kali
         //   subscription di-enable ulang.
+        // _securityProbeEpochTicks: epoch untuk startup probe Security log (reset tiap re-subscribe).
         private long _lastSecurityEventTicksUtc   = DateTime.MinValue.Ticks;
         private long _subscriptionEnabledTicksUtc = DateTime.MinValue.Ticks;
+        private long _securityProbeEpochTicks     = DateTime.MinValue.Ticks;
 
         // ── System log subscription health check ────────────────────────────────
         // Sama seperti Security log health check, tapi untuk System log (sumber event
