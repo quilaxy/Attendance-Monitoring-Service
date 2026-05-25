@@ -46,13 +46,16 @@ namespace EventLogOutEmployeeService
             if (!string.IsNullOrEmpty(message))
                 excerpt = ExtractMessageSection(message, eventId, 600);
 
-            int logonType = (eventId == 4624 && message != null)
+            int logonType = ((eventId == 4624 || eventId == 4634 || eventId == 4647) && message != null)
                 ? ParseLogonType(message)
                 : 0;
 
             string? username = message != null ? GetUsernameFromEvent(message, eventId) : null;
             string? sid = message != null ? GetUserSidFromSecurityEvent(message, eventId) : null;
-            string? logonId = eventId == 4624 ? GetLogonId(excerpt ?? message) : null;
+            string? logonId =
+                (eventId == 4624 || eventId == 4634 || eventId == 4647)
+                    ? GetLogonId(excerpt ?? message)
+                    : null;
 
             return new ParsedSecurityEvent
             {
@@ -115,8 +118,11 @@ namespace EventLogOutEmployeeService
             try
             {
                 // Security event only: 4624 (New Logon) and 4647 (Subject).
-                string anchor = securityEventId == 4624 ? "New Logon:" :
-                                securityEventId == 4647 ? "Subject:" : string.Empty;
+                string anchor = securityEventId == 4624
+                    ? "New Logon:"
+                    : (securityEventId == 4634 || securityEventId == 4647)
+                        ? "Subject:"
+                        : string.Empty;
                 if (string.IsNullOrEmpty(anchor))
                     return null;
 
@@ -168,7 +174,7 @@ namespace EventLogOutEmployeeService
                     return IsValidUsername(normalized) ? normalized : null;
                 }
 
-                if (eventId == 4647)
+                if (eventId == 4634 || eventId == 4647)
                 {
                     string? section = ExtractMessageSection(message, "Subject:", comparison: StringComparison.CurrentCulture);
                     if (string.IsNullOrEmpty(section)) return null;
