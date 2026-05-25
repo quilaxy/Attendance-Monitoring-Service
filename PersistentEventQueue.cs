@@ -816,6 +816,41 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        public async Task<(int PendingRetryCount, DateTime? OldestRetryEventUtc)> GetRetryStatsAsync(
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                int pendingRetryCount = 0;
+                DateTime? oldestRetryUtc = null;
+
+                foreach (var item in _cache.Values)
+                {
+                    if (item.DispatchRetryCount <= 0 && !item.NextRetryAtUtc.HasValue)
+                        continue;
+
+                    pendingRetryCount++;
+                    DateTime eventUtc = item.EventTime.Kind switch
+                    {
+                        DateTimeKind.Utc => item.EventTime,
+                        DateTimeKind.Unspecified => DateTime.SpecifyKind(item.EventTime, DateTimeKind.Utc),
+                        _ => item.EventTime.ToUniversalTime()
+                    };
+
+                    if (!oldestRetryUtc.HasValue || eventUtc < oldestRetryUtc.Value)
+                        oldestRetryUtc = eventUtc;
+                }
+
+                return (pendingRetryCount, oldestRetryUtc);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
         public async Task<List<QueuedAttendanceEvent>> GetAllAsync(CancellationToken cancellationToken = default)
         {
             await fileLock.WaitAsync(cancellationToken);

@@ -10,6 +10,8 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Serialization;
 
 namespace EventLogOutEmployeeService
 {
@@ -66,6 +68,7 @@ namespace EventLogOutEmployeeService
         private Task? queueTask;
         private Task? securityHealthTask;
         private Task? systemHealthTask;
+        private Task? operationalHealthTask;
         private Task? supervisorTask;
         private Task? watchdogTask;
 
@@ -73,17 +76,30 @@ namespace EventLogOutEmployeeService
         private CancellationTokenSource? _queueTaskCts;
         private CancellationTokenSource? _securityHealthTaskCts;
         private CancellationTokenSource? _systemHealthTaskCts;
+        private CancellationTokenSource? _operationalHealthTaskCts;
 
         private readonly object _backgroundTaskLock = new object();
         private readonly Queue<DateTime> _cleanupRestartHistory = new Queue<DateTime>();
         private readonly Queue<DateTime> _queueRestartHistory = new Queue<DateTime>();
         private readonly Queue<DateTime> _securityHealthRestartHistory = new Queue<DateTime>();
         private readonly Queue<DateTime> _systemHealthRestartHistory = new Queue<DateTime>();
+        private readonly Queue<DateTime> _operationalHealthRestartHistory = new Queue<DateTime>();
         private const int RestartFailureThreshold = 5;
         private static readonly TimeSpan RestartFailureWindow = TimeSpan.FromMinutes(30);
 
         private int queueAlertThreshold = 500;
         private bool queueThresholdAlerted = false;
+        private int _queuePressureLevel = (int)QueuePressureLevel.Normal;
+        private bool _retryStormAlerted = false;
+        private bool _retryThrottleActive = false;
+        private bool _pauseReplayWork = false;
+        private bool _isDegradedMode = false;
+        private bool _configValid = true;
+        private bool _securitySubscriptionHealthy = true;
+        private bool _systemSubscriptionHealthy = true;
+        private long _lastReplayUtcTicks = DateTime.MinValue.Ticks;
+        private long _lastOperationalHealthHeartbeatUtc = DateTime.MinValue.Ticks;
+        private long _lastHealthSnapshotWriteTicks = DateTime.MinValue.Ticks;
         private int[] dispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
         private HashSet<string> systemFallbackTriggerAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -117,6 +133,22 @@ namespace EventLogOutEmployeeService
 
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
         private static readonly TimeSpan PendingQueueRetention = TimeSpan.FromDays(7);
+        private static readonly TimeSpan RetryStormAgeThreshold = TimeSpan.FromHours(24);
+        private static readonly TimeSpan RetryThrottleDelay = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan OperationalHealthInterval = TimeSpan.FromMinutes(1);
+        private static readonly TimeSpan HealthSnapshotInterval = TimeSpan.FromMinutes(5);
+        private const int QueuePressureWarningThreshold = 500;
+        private const int QueuePressureCriticalThreshold = 2000;
+        private const int QueuePressureEscalationThreshold = 5000;
+        private const string HealthSnapshotFileName = "service-health.json";
+
+        private enum QueuePressureLevel
+        {
+            Normal = 0,
+            Warning = 1,
+            Critical = 2,
+            Escalation = 3
+        }
 
         private sealed class Last1074State
         {
@@ -305,6 +337,7 @@ namespace EventLogOutEmployeeService
                             // Dijalankan setiap service start agar Windows Update atau
                             // Group Policy yang me-reset konfigurasi ini langsung diperbaiki.
                             EnsureServiceResilience();
+                            RunStartupValidation();
 
                             PrimeFirstLogonIndexFromQueueAsync(ct).GetAwaiter().GetResult();
                             RetryPendingQueueOnStartupAsync(ct).GetAwaiter().GetResult();
@@ -313,6 +346,9 @@ namespace EventLogOutEmployeeService
                             // dan sebelum background thread ini jalan — tidak perlu set lagi di sini.
 
                             _replayService.ReplayMissedEventsFromCheckpoint().GetAwaiter().GetResult();
+                            if (_replayService.IsDegradedReplayMode)
+                                _isDegradedMode = true;
+                            Interlocked.Exchange(ref _lastReplayUtcTicks, DateTime.UtcNow.Ticks);
 
                             StartCheckpointHeartbeat();
 
@@ -537,6 +573,117 @@ namespace EventLogOutEmployeeService
             bool exited = process.WaitForExit(10_000); // timeout 10 detik
             int exitCode = exited ? process.ExitCode : -1;
             return (output, exitCode);
+        }
+
+        // ─── Startup validation ─────────────────────────────────────────────────
+
+        private void RunStartupValidation()
+        {
+            bool degraded = false;
+            bool criticalFailure = false;
+
+            bool securityLogOk = ValidateEventLogAccess(securityEventLog, "Security", isCritical: true,
+                ref degraded, ref criticalFailure);
+            if (!securityLogOk)
+                _securitySubscriptionHealthy = false;
+
+            bool systemLogOk = ValidateEventLogAccess(systemEventLog, "System", isCritical: false,
+                ref degraded, ref criticalFailure);
+            if (!systemLogOk)
+                _systemSubscriptionHealthy = false;
+
+            ValidateWritableDirectory(DataDirectory, "checkpoint", isCritical: true, ref degraded, ref criticalFailure);
+            ValidateWritableDirectory(Path.Combine(DataDirectory, "queue"), "queue", isCritical: true, ref degraded, ref criticalFailure);
+            ValidateWritableDirectory(Path.Combine(DataDirectory, "rawevents"), "RawEventStore", isCritical: false, ref degraded, ref criticalFailure);
+
+            if (!_configValid)
+            {
+                degraded = true;
+                SafeWriteEventLog("Application",
+                    "[STARTUP] Validation warning: config has missing critical fields — dispatch will fail until fixed.",
+                    EventLogEntryType.Warning, 1104);
+            }
+
+            if (criticalFailure)
+            {
+                FailFastResilience("[STARTUP] Critical validation failure — cannot start safely.");
+                return;
+            }
+
+            if (degraded)
+            {
+                _isDegradedMode = true;
+                SafeWriteEventLog("Application",
+                    "[STARTUP] Validation completed with degraded state — check previous startup warnings.",
+                    EventLogEntryType.Warning, 1104);
+            }
+        }
+
+        private static bool ValidateEventLogAccess(
+            EventLog? log,
+            string logName,
+            bool isCritical,
+            ref bool degraded,
+            ref bool criticalFailure)
+        {
+            if (log == null)
+            {
+                LogStartupValidationFailure($"{logName} EventLog unavailable (null).", isCritical,
+                    ref degraded, ref criticalFailure);
+                return false;
+            }
+
+            try
+            {
+                _ = log.Entries.Count;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogStartupValidationFailure($"{logName} EventLog access failed: {ex.GetType().Name}: {ex.Message}",
+                    isCritical, ref degraded, ref criticalFailure);
+                return false;
+            }
+        }
+
+        private static bool ValidateWritableDirectory(
+            string path,
+            string label,
+            bool isCritical,
+            ref bool degraded,
+            ref bool criticalFailure)
+        {
+            try
+            {
+                Directory.CreateDirectory(path);
+                string testPath = Path.Combine(path, $".write-test-{Guid.NewGuid():N}.tmp");
+                File.WriteAllText(testPath, DateTime.UtcNow.ToString("O"));
+                File.Delete(testPath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogStartupValidationFailure(
+                    $"{label} path not writable ('{path}'): {ex.GetType().Name}: {ex.Message}",
+                    isCritical, ref degraded, ref criticalFailure);
+                return false;
+            }
+        }
+
+        private static void LogStartupValidationFailure(
+            string message,
+            bool isCritical,
+            ref bool degraded,
+            ref bool criticalFailure)
+        {
+            SafeWriteEventLog("Application",
+                $"[STARTUP] Validation {(isCritical ? "CRITICAL" : "WARNING")}: {message}",
+                isCritical ? EventLogEntryType.Error : EventLogEntryType.Warning, 1104);
+
+            if (isCritical)
+                criticalFailure = true;
+            else
+                degraded = true;
         }
 
         // ─── Crash handler ───────────────────────────────────────────────────────
@@ -935,7 +1082,7 @@ namespace EventLogOutEmployeeService
             dispatchBackoffSeconds = ReadIntListFromEnvironment(
                 "DISPATCH_BACKOFF_SECONDS", new[] { 30, 60, 120, 300, 600 });
 
-            ValidateConfiguration(config);
+            _configValid = ValidateConfiguration(config);
 
             return config;
         }
@@ -960,7 +1107,7 @@ namespace EventLogOutEmployeeService
         /// Tidak throw — validasi gagal tidak boleh mencegah service start sama sekali,
         /// karena RawEventStore + queue masih bisa menampung event meski SharePoint belum siap.
         /// </summary>
-        private static void ValidateConfiguration(IConfiguration config)
+        private static bool ValidateConfiguration(IConfiguration config)
         {
             bool hasError = false;
 
@@ -1058,6 +1205,8 @@ namespace EventLogOutEmployeeService
                     "[CONFIG] Validasi konfigurasi OK — semua field kritis terisi.",
                     EventLogEntryType.Information, 1075);
             }
+
+            return !hasError;
         }
 
         private static int ReadIntFromEnvironment(string key, int fallback)
@@ -1330,6 +1479,8 @@ namespace EventLogOutEmployeeService
                     StartSecurityHealthTask(cancellationToken);
                 if (IsTaskStopped(systemHealthTask))
                     StartSystemHealthTask(cancellationToken);
+                if (IsTaskStopped(operationalHealthTask))
+                    StartOperationalHealthTask(cancellationToken);
 
                 if (IsTaskStopped(supervisorTask))
                     supervisorTask = Task.Run(() => BackgroundTaskSupervisorLoop(cancellationToken), cancellationToken);
@@ -1383,6 +1534,15 @@ namespace EventLogOutEmployeeService
                 ref _systemHealthTaskCts,
                 ref _lastSystemHealthHeartbeatUtc,
                 SystemLogSubscriptionHealthCheckTask,
+                serviceToken);
+
+        private bool StartOperationalHealthTask(CancellationToken serviceToken)
+            => TryStartTask(
+                "Operational health task",
+                ref operationalHealthTask,
+                ref _operationalHealthTaskCts,
+                ref _lastOperationalHealthHeartbeatUtc,
+                OperationalHealthMonitorTask,
                 serviceToken);
 
         private bool TryStartTask(
@@ -1439,12 +1599,17 @@ namespace EventLogOutEmployeeService
 
                 if (history.Count > RestartFailureThreshold)
                 {
-                    SafeWriteEventLog("Application",
+                    FailFastResilience(
                         $"[FATAL] {taskName} restarted {history.Count} times within " +
-                        $"{RestartFailureWindow.TotalMinutes:F0} minutes — failing fast to trigger SCM recovery.",
-                        EventLogEntryType.Error, 1095);
-                    Environment.FailFast($"{taskName} restart instability detected.");
+                        $"{RestartFailureWindow.TotalMinutes:F0} minutes — failing fast to trigger SCM recovery.");
                 }
+            }
+
+            private static void FailFastResilience(string message, Exception? ex = null)
+            {
+                string details = ex == null ? message : $"{message} Exception={ex.GetType().Name}: {ex.Message}";
+                SafeWriteEventLog("Application", details, EventLogEntryType.Error, 1099);
+                Environment.FailFast(details, ex);
             }
             catch (Exception ex)
             {
@@ -1617,6 +1782,14 @@ namespace EventLogOutEmployeeService
                         SystemLogSubscriptionHealthCheckTask,
                         _systemHealthRestartHistory,
                         cancellationToken);
+                    RestartStoppedTask(
+                        "Operational health task",
+                        ref operationalHealthTask,
+                        ref _operationalHealthTaskCts,
+                        ref _lastOperationalHealthHeartbeatUtc,
+                        OperationalHealthMonitorTask,
+                        _operationalHealthRestartHistory,
+                        cancellationToken);
                 }
                 catch (TaskCanceledException)
                 {
@@ -1639,6 +1812,7 @@ namespace EventLogOutEmployeeService
             TimeSpan securityTimeout = TimeSpan.FromMinutes(15);
             TimeSpan systemTimeout = TimeSpan.FromMinutes(30);
             TimeSpan cleanupTimeout = TimeSpan.FromHours(6);
+            TimeSpan operationalHealthTimeout = TimeSpan.FromMinutes(15);
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -1682,6 +1856,15 @@ namespace EventLogOutEmployeeService
                         CleanupOldRecordsTask,
                         _cleanupRestartHistory,
                         cancellationToken);
+                    RestartStalledTask(
+                        "Operational health task",
+                        operationalHealthTimeout,
+                        ref _lastOperationalHealthHeartbeatUtc,
+                        ref operationalHealthTask,
+                        ref _operationalHealthTaskCts,
+                        OperationalHealthMonitorTask,
+                        _operationalHealthRestartHistory,
+                        cancellationToken);
                 }
                 catch (TaskCanceledException)
                 {
@@ -1706,11 +1889,13 @@ namespace EventLogOutEmployeeService
                 CancelTask(ref _queueTaskCts);
                 CancelTask(ref _securityHealthTaskCts);
                 CancelTask(ref _systemHealthTaskCts);
+                CancelTask(ref _operationalHealthTaskCts);
 
                 cleanupTask = null;
                 queueTask = null;
                 securityHealthTask = null;
                 systemHealthTask = null;
+                operationalHealthTask = null;
                 supervisorTask = null;
                 watchdogTask = null;
             }
@@ -1735,6 +1920,9 @@ namespace EventLogOutEmployeeService
                 Interlocked.Exchange(ref _lastQueueProcessorHeartbeatUtc, DateTime.UtcNow.Ticks);
                 try
                 {
+                    if (_retryThrottleActive)
+                        await Task.Delay(RetryThrottleDelay, cancellationToken);
+
                     DateTime nowUtc = DateTime.UtcNow;
                     QueuedAttendanceEvent? next = await eventQueue.PeekNextReadyAsync(nowUtc, cancellationToken);
                     if (next == null)
@@ -1804,6 +1992,211 @@ namespace EventLogOutEmployeeService
                     catch (TaskCanceledException) { break; }
                 }
             }
+        }
+
+        private async Task OperationalHealthMonitorTask(CancellationToken cancellationToken)
+        {
+            DateTime nextSnapshotUtc = DateTime.UtcNow;
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    Interlocked.Exchange(ref _lastOperationalHealthHeartbeatUtc, DateTime.UtcNow.Ticks);
+
+                    int queueSize = await eventQueue.GetCountAsync(cancellationToken);
+                    var retryStats = await eventQueue.GetRetryStatsAsync(cancellationToken);
+
+                    UpdateQueuePressureState(queueSize);
+                    UpdateRetryStormState(queueSize, retryStats.OldestRetryEventUtc);
+
+                    DateTime nowUtc = DateTime.UtcNow;
+                    if (nowUtc >= nextSnapshotUtc)
+                    {
+                        await WriteHealthSnapshotAsync(
+                            queueSize,
+                            retryStats.PendingRetryCount,
+                            retryStats.OldestRetryEventUtc,
+                            cancellationToken);
+                        nextSnapshotUtc = nowUtc.Add(HealthSnapshotInterval);
+                    }
+
+                    await Task.Delay(OperationalHealthInterval, cancellationToken);
+                }
+                catch (TaskCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH] OperationalHealthMonitorTask error: {ex.Message}",
+                        EventLogEntryType.Warning, 1093);
+                    try { await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken); }
+                    catch (TaskCanceledException) { break; }
+                }
+            }
+        }
+
+        private void UpdateQueuePressureState(int queueSize)
+        {
+            QueuePressureLevel level = queueSize > QueuePressureEscalationThreshold
+                ? QueuePressureLevel.Escalation
+                : queueSize > QueuePressureCriticalThreshold
+                    ? QueuePressureLevel.Critical
+                    : queueSize > QueuePressureWarningThreshold
+                        ? QueuePressureLevel.Warning
+                        : QueuePressureLevel.Normal;
+
+            QueuePressureLevel previous =
+                (QueuePressureLevel)Interlocked.Exchange(ref _queuePressureLevel, (int)level);
+            if (level == previous || level == QueuePressureLevel.Normal)
+                return;
+
+            if (level == QueuePressureLevel.Warning)
+            {
+                SafeWriteEventLog("Application",
+                    $"[QUEUE] Pressure warning: pending={queueSize} (> {QueuePressureWarningThreshold}).",
+                    EventLogEntryType.Warning, 1096);
+                return;
+            }
+
+            SafeWriteEventLog("Application",
+                $"[QUEUE] Pressure {(level == QueuePressureLevel.Escalation ? "escalation" : "critical")}: " +
+                $"pending={queueSize} (> {(level == QueuePressureLevel.Escalation ? QueuePressureEscalationThreshold : QueuePressureCriticalThreshold)}).",
+                EventLogEntryType.Error, 1097);
+        }
+
+        private void UpdateRetryStormState(int queueSize, DateTime? oldestRetryUtc)
+        {
+            bool shouldThrottle = queueSize > QueuePressureEscalationThreshold &&
+                                  oldestRetryUtc.HasValue &&
+                                  DateTime.UtcNow - oldestRetryUtc.Value > RetryStormAgeThreshold;
+
+            if (shouldThrottle && !_retryStormAlerted)
+            {
+                _retryStormAlerted = true;
+                _retryThrottleActive = true;
+                _pauseReplayWork = true;
+
+                SafeWriteEventLog("Application",
+                    $"[QUEUE] Retry backlog critical: pending={queueSize}, " +
+                    $"oldestRetryUtc={oldestRetryUtc:O} (> {RetryStormAgeThreshold.TotalHours:F0}h). " +
+                    $"Throttling retry loop and pausing non-essential replay.",
+                    EventLogEntryType.Error, 1097);
+                return;
+            }
+
+            if (!shouldThrottle && _retryStormAlerted)
+            {
+                _retryStormAlerted = false;
+                _retryThrottleActive = false;
+                _pauseReplayWork = false;
+
+                SafeWriteEventLog("Application",
+                    "[QUEUE] Retry backlog normalized — resuming normal dispatch and replay.",
+                    EventLogEntryType.Information, 1096);
+            }
+        }
+
+        private async Task WriteHealthSnapshotAsync(
+            int queueSize,
+            int pendingRetry,
+            DateTime? oldestPendingRetryUtc,
+            CancellationToken cancellationToken)
+        {
+            DateTime? lastSecurityEventUtc = ReadUtcTicks(_lastSecurityEventTicksUtc);
+            DateTime? lastSystemEventUtc = ReadUtcTicks(_lastSystemEventTicksUtc);
+            DateTime? lastReplayUtc = ReadUtcTicks(_lastReplayUtcTicks);
+
+            var snapshot = new ServiceHealthSnapshot
+            {
+                ServiceStartUtc = serviceStartTime,
+                LastSecurityEventUtc = lastSecurityEventUtc,
+                LastSystemEventUtc = lastSystemEventUtc,
+                QueueSize = queueSize,
+                PendingRetry = pendingRetry,
+                SubscriptionHealthy = _securitySubscriptionHealthy && _systemSubscriptionHealthy,
+                BackgroundTasksHealthy = AreBackgroundTasksHealthy(),
+                DegradedMode = _isDegradedMode,
+                LastReplayUtc = lastReplayUtc,
+                OldestPendingRetryUtc = oldestPendingRetryUtc
+            };
+
+            string json = JsonConvert.SerializeObject(
+                snapshot,
+                Formatting.Indented,
+                new JsonSerializerSettings
+                {
+                    ContractResolver = new CamelCasePropertyNamesContractResolver()
+                });
+
+            try
+            {
+                Directory.CreateDirectory(DataDirectory);
+                string path = Path.Combine(DataDirectory, HealthSnapshotFileName);
+                string tempPath = path + ".tmp";
+                await File.WriteAllTextAsync(tempPath, json, cancellationToken);
+                File.Move(tempPath, path, overwrite: true);
+                Interlocked.Exchange(ref _lastHealthSnapshotWriteTicks, DateTime.UtcNow.Ticks);
+
+                SafeWriteEventLog("Application",
+                    $"[HEALTH] Snapshot updated: queue={queueSize} pendingRetry={pendingRetry}.",
+                    EventLogEntryType.Information, 1100);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH] Snapshot update failed: {ex.GetType().Name}: {ex.Message}",
+                    EventLogEntryType.Warning, 1093);
+            }
+        }
+
+        private bool AreBackgroundTasksHealthy()
+        {
+            if (IsTaskStopped(queueTask) ||
+                IsTaskStopped(cleanupTask) ||
+                IsTaskStopped(securityHealthTask) ||
+                IsTaskStopped(systemHealthTask) ||
+                IsTaskStopped(operationalHealthTask))
+                return false;
+
+            DateTime nowUtc = DateTime.UtcNow;
+            bool queueHealthy = !IsHeartbeatStale(nowUtc, _lastQueueProcessorHeartbeatUtc, TimeSpan.FromMinutes(10));
+            bool cleanupHealthy = !IsHeartbeatStale(nowUtc, _lastCleanupHeartbeatUtc, TimeSpan.FromHours(6));
+            bool securityHealthy = !IsHeartbeatStale(nowUtc, _lastSecurityHealthHeartbeatUtc, TimeSpan.FromMinutes(15));
+            bool systemHealthy = !IsHeartbeatStale(nowUtc, _lastSystemHealthHeartbeatUtc, TimeSpan.FromMinutes(30));
+            bool operationalHealthy = !IsHeartbeatStale(nowUtc, _lastOperationalHealthHeartbeatUtc, TimeSpan.FromMinutes(15));
+
+            return queueHealthy && cleanupHealthy && securityHealthy && systemHealthy && operationalHealthy;
+        }
+
+        private static bool IsHeartbeatStale(DateTime nowUtc, long heartbeatTicks, TimeSpan timeout)
+        {
+            if (heartbeatTicks == DateTime.MinValue.Ticks)
+                return true;
+
+            DateTime heartbeatUtc = new DateTime(heartbeatTicks, DateTimeKind.Utc);
+            return nowUtc - heartbeatUtc > timeout;
+        }
+
+        private static DateTime? ReadUtcTicks(long ticks)
+        {
+            if (ticks <= DateTime.MinValue.Ticks)
+                return null;
+
+            return new DateTime(ticks, DateTimeKind.Utc);
+        }
+
+        private sealed class ServiceHealthSnapshot
+        {
+            public DateTime ServiceStartUtc { get; set; }
+            public DateTime? LastSecurityEventUtc { get; set; }
+            public DateTime? LastSystemEventUtc { get; set; }
+            public int QueueSize { get; set; }
+            public int PendingRetry { get; set; }
+            public bool SubscriptionHealthy { get; set; }
+            public bool BackgroundTasksHealthy { get; set; }
+            public bool DegradedMode { get; set; }
+            public DateTime? LastReplayUtc { get; set; }
+            public DateTime? OldestPendingRetryUtc { get; set; }
         }
 
         private TimeSpan GetDispatchBackoffDelay(int retryCount)

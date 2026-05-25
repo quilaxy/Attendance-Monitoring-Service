@@ -33,6 +33,11 @@ namespace EventLogOutEmployeeService
         // other. The 4647 comes from Security log, 42 from System log. Without the grace period,
         // 4647 at the boundary is dropped while 42 passes → missing logout records.
         private static readonly TimeSpan LiveEventGracePeriod = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan ReplayWarningGap = TimeSpan.FromHours(12);
+        private static readonly TimeSpan ReplayCriticalGap = TimeSpan.FromDays(2);
+        private static readonly TimeSpan ReplayDegradedGap = TimeSpan.FromDays(7);
+
+        public bool IsDegradedReplayMode { get; private set; } = false;
 
         public ReplayService(
             CheckpointService checkpointService,
@@ -69,6 +74,7 @@ namespace EventLogOutEmployeeService
             try
             {
                 DateTime? replayFrom = _checkpointService.LoadStopCheckpoint();
+                EvaluateReplayGap(replayFrom, replayTo);
 
                 _writeEventLog("Application",
                     $"ReplayMissedEvents: replayFrom={replayFrom?.ToString("O") ?? "(none)"} replayTo={replayTo:O}",
@@ -90,6 +96,41 @@ namespace EventLogOutEmployeeService
                     // DedupWindow 30 detik akan tangkap duplikat kalau 1074 sudah ada di queue.
                     DateTime systemReplayFrom = replayFrom.Value.AddSeconds(-30);
                     ReplaySystemEvents(systemReplayFrom, replayTo);
+                }
+
+                private void EvaluateReplayGap(DateTime? replayFrom, DateTime replayTo)
+                {
+                    if (!replayFrom.HasValue)
+                        return;
+
+                    TimeSpan replayGap = replayTo - replayFrom.Value;
+                    if (replayGap <= ReplayWarningGap)
+                        return;
+
+                    if (replayGap > ReplayDegradedGap)
+                    {
+                        IsDegradedReplayMode = true;
+                        _writeEventLog("Application",
+                            $"[REPLAY] Degraded mode: replay gap {replayGap.TotalHours:F1}h exceeds retention window. " +
+                            $"Possible data loss for events older than {ReplayDegradedGap.TotalDays:F0} days. " +
+                            $"replayFrom={replayFrom:O} replayTo={replayTo:O}",
+                            EventLogEntryType.Error, 1098);
+                        return;
+                    }
+
+                    if (replayGap > ReplayCriticalGap)
+                    {
+                        _writeEventLog("Application",
+                            $"[REPLAY] Large replay gap detected ({replayGap.TotalHours:F1}h > {ReplayCriticalGap.TotalDays:F0} days). " +
+                            $"replayFrom={replayFrom:O} replayTo={replayTo:O}",
+                            EventLogEntryType.Error, 1102);
+                        return;
+                    }
+
+                    _writeEventLog("Application",
+                        $"[REPLAY] Replay gap warning ({replayGap.TotalHours:F1}h > {ReplayWarningGap.TotalHours:F0} hours). " +
+                        $"replayFrom={replayFrom:O} replayTo={replayTo:O}",
+                        EventLogEntryType.Warning, 1101);
                 }
                 else
                 {
