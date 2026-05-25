@@ -40,7 +40,7 @@ namespace EventLogOutEmployeeService
         /// di hari ke-8 tidak tahu row untuk user+workDate itu sudah ada → bisa bikin duplikat.
         /// Dengan 6 bulan: 100 user × 180 hari × ~30 byte/entry ≈ 540KB — masih sangat kecil.
         /// </summary>
-        private static readonly TimeSpan RetentionWindow = TimeSpan.FromDays(180); // ~6 bulan
+        private const int RetentionMonths = 6; // must match SharePointIntegration.CleanupOldRecordsAsync
 
         public SummaryCache(string filePath)
         {
@@ -89,7 +89,7 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Hapus entry yang workDate-nya lebih dari RetentionWindow (180 hari / ~6 bulan).
+        /// Hapus entry yang workDate-nya lebih dari RetentionMonths (6 bulan).
         /// Dipanggil dari CleanupOldRecordsTask bersamaan dengan cleanup SharePoint.
         /// Retention sengaja disamakan dengan SharePoint agar cache tidak expired
         /// sebelum data SharePoint-nya sendiri dihapus — kalau cache expired duluan,
@@ -101,7 +101,7 @@ namespace EventLogOutEmployeeService
             try
             {
                 var keys = await ReadAllInternalAsync();
-                DateTime cutoff = DateTime.Today.Subtract(RetentionWindow);
+                DateTime cutoff = DateTime.Today.AddMonths(-RetentionMonths);
                 int before = keys.Count;
 
                 keys.RemoveAll(key =>
