@@ -45,6 +45,25 @@ namespace EventLogOutEmployeeService
         /// Selalu false untuk 4634 dan 4647.
         /// </summary>
         public bool IsAdminLogon { get; set; } = false;
+
+        /// <summary>
+        /// Linked Logon ID (hex string, misal "0xdef456") dari event 4624 admin split-token.
+        ///
+        /// Windows UAC split-token menghasilkan DUA event 4624 saat admin login:
+        ///   - Elevated token  : LogonId=0xABC, LinkedLogonId=0xDEF
+        ///   - Standard token  : LogonId=0xDEF, LinkedLogonId=0xABC
+        ///
+        /// Keduanya menghasilkan 4634 saat session ditutup — masing-masing 4634 membawa
+        /// LogonId dari sesinya sendiri. Agar kedua 4634 terblokir di admin gate (termasuk
+        /// setelah service restart via replay path), kita harus register KEDUANYA ke
+        /// AdminSessionCorrelationService:
+        ///   - LogonId utama  → di-register via field LogonId (sudah ada sebelumnya)
+        ///   - LinkedLogonId  → di-register via field ini (FIX baru)
+        ///
+        /// Null untuk non-admin (IsAdminLogon = false), untuk 4634, dan untuk 4647.
+        /// Null juga kalau LinkedLogonId dari message adalah 0x0 (tidak ada linked session).
+        /// </summary>
+        public string? LinkedLogonId { get; set; }
     }
 
     public class RawEventStore

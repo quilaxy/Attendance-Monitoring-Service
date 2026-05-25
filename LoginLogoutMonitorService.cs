@@ -729,11 +729,29 @@ namespace EventLogOutEmployeeService
                     // setelah replay bisa dikorelasikan tanpa disk read lagi.
                     if (!string.IsNullOrEmpty(raw.LogonId))
                     {
+                        // Register LogonId utama (sisi standard-token atau elevated-token)
                         _adminCorrelationService.RegisterAdminSession(
                             computerName,
                             raw.LogonId,
                             $"[ADMIN] Admin session re-hydrated from RawStore: " +
                             $"user={raw.Username} logonId={raw.LogonId} computer={computerName}");
+
+                        // FIX: Register LinkedLogonId (sisi pasangan split-token) dari disk.
+                        // Tanpa ini, 4634 yang membawa LogonId = LinkedLogonId dari 4624 admin
+                        // lolos admin gate di replay path karena in-memory cache hanya berisi
+                        // LogonId utama setelah service restart.
+                        // Skenario: 4624 elevated (LogonId=0xABC, LinkedLogonId=0xDEF) tersimpan
+                        // di disk. Saat replay, tanpa fix ini hanya 0xABC yang ter-register.
+                        // 4634 untuk sesi elevated membawa 0xABC → terblokir ✓
+                        // 4634 untuk sesi standard membawa 0xDEF → LOLOS (bug) → fix: register 0xDEF juga
+                        if (!string.IsNullOrEmpty(raw.LinkedLogonId))
+                        {
+                            _adminCorrelationService.RegisterAdminSession(
+                                computerName,
+                                raw.LinkedLogonId,
+                                $"[ADMIN] Admin session linked ID re-hydrated from RawStore: " +
+                                $"user={raw.Username} linkedLogonId={raw.LinkedLogonId} computer={computerName}");
+                        }
                     }
 
                     // Gate: tidak di-enqueue, tidak di-dispatch, tidak ke SharePoint.
@@ -3461,9 +3479,17 @@ namespace EventLogOutEmployeeService
                     Sid            = sid,
                     MessageExcerpt = excerpt,
                     Source         = "Security",
-                    // Field baru — membawa identitas admin session ke disk
+                    // Field existing — membawa identitas admin session ke disk
                     LogonId        = logonId,
-                    IsAdminLogon   = isAdmin
+                    IsAdminLogon   = isAdmin,
+                    // FIX: Persist LinkedLogonId agar replay path bisa register kedua sisi
+                    // split-token ke AdminSessionCorrelationService setelah service restart.
+                    // Tanpa ini, 4634 yang membawa LogonId = LinkedLogonId dari 4624 admin
+                    // lolos admin gate di replay karena in-memory cache hanya berisi LogonId
+                    // utama. Null untuk non-admin dan untuk 4634/4647.
+                    LinkedLogonId  = isAdmin
+                        ? SecurityEventParser.GetLinkedLogonId(parsed.Message ?? parsed.MessageExcerpt)
+                        : null
                 };
 
                 // SELALU simpan — termasuk admin session.
