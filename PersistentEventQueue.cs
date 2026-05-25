@@ -234,40 +234,35 @@ namespace EventLogOutEmployeeService
         {
             try
             {
+                var rawEvents = new List<(int EventId, string ComputerName, DateTime EventTimeUtc)>();
                 foreach (string file in Directory.GetFiles(dateDir, "*.json", SearchOption.TopDirectoryOnly))
                 {
                     try
                     {
                         string content = File.ReadAllText(file);
                         var evt = Newtonsoft.Json.JsonConvert.DeserializeObject<RawSecurityEvent>(content);
-                        if (evt == null) continue;
-
-                        // Cek di queue — kalau masih ada dan belum dispatched, block cleanup
-                        bool dispatched = await eventQueue.IsFullyDispatchedAsync(
-                            evt.EventId, evt.ComputerName, evt.EventTimeUtc, cancellationToken);
-
-                        // IsFullyDispatchedAsync return false kalau:
-                        // (a) event masih di queue dan belum selesai → block
-                        // (b) event sudah tidak ada di queue (sudah dihapus setelah dispatch) → anggap done
-                        // Bedakan (a) dan (b) dengan cek apakah event ada di queue sama sekali
-                        bool existsInQueue = await eventQueue.ExistsInQueueAsync(
-                            evt.EventId, evt.ComputerName, evt.EventTimeUtc, cancellationToken);
-
-                        if (existsInQueue && !dispatched)
-                            return false;
+                        if (evt != null)
+                            rawEvents.Add((evt.EventId, evt.ComputerName, evt.EventTimeUtc));
                     }
                     catch { /* skip corrupt file */ }
                 }
-                return true;
+
+                if (rawEvents.Count == 0)
+                    return true;
+
+                return await eventQueue.AllEventsDispatchedBulkAsync(rawEvents, cancellationToken);
             }
             catch { return true; } // kalau tidak bisa baca folder, anggap aman untuk dihapus
         }
 
         private static void SafeRawLog(string message, EventLogEntryType type, int eventId)
         {
+            // 5011 = normal "deleted, all dispatched" — verbose only
+            // 5010 = "skipped, not all dispatched" — always show (indicates pending data)
+            // 5012 = hard cap deletion — always show (indicates persistent SP issue)
             if (!LoginLogoutMonitorService.VerboseLogging && eventId == 5011)
                 return;
-            try { EventLog.WriteEntry("Application", message, type, eventId); }
+            try { EventLog.WriteEntry("Attendance-Service", message, type, eventId); }
             catch { }
         }
 
@@ -540,6 +535,42 @@ namespace EventLogOutEmployeeService
                     x.EventId == eventId &&
                     x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
                     Math.Abs((x.EventTime - eventTimeUtc).TotalSeconds) < 5);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Bulk check: returns true if ALL provided events are either fully dispatched
+        /// or no longer present in the queue (already removed after dispatch).
+        /// Single lock acquisition — more efficient than per-event IsFullyDispatchedAsync calls.
+        /// </summary>
+        public async Task<bool> AllEventsDispatchedBulkAsync(
+            IEnumerable<(int EventId, string ComputerName, DateTime EventTimeUtc)> events,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+
+                foreach (var (eventId, computerName, eventTimeUtc) in events)
+                {
+                    var match = _cache.Values.FirstOrDefault(x =>
+                        x.EventId == eventId &&
+                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                        Math.Abs((x.EventTime - eventTimeUtc).TotalSeconds) < 5);
+
+                    if (match == null)
+                        continue;
+
+                    if (!match.RawRecordDispatched || !match.SummaryDispatched)
+                        return false;
+                }
+
+                return true;
             }
             finally
             {

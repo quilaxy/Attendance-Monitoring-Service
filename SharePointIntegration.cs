@@ -989,17 +989,15 @@ namespace EventLogOutEmployeeService
 
             while (!string.IsNullOrWhiteSpace(url))
             {
-                var response = await client.GetAsync(url);
+                var response = await GetWithThrottleRetryAsync(client, url);
                 if (!response.IsSuccessStatusCode)
                 {
                     SafeWriteEventLog("Application",
-                        $"[CLEANUP] Failed to fetch items from listId='{listId}' — " +
-                        $"HTTP {(int)response.StatusCode}",
+                        $"[CLEANUP] Page fetch failed for listId='{listId}' — " +
+                        $"HTTP {(int)response.StatusCode}. Stopping pagination, " +
+                        $"{deletedCount} items deleted so far.",
                         EventLogEntryType.Warning, 5004);
-                    SafeWriteEventLog("Application",
-                        $"[CLEANUP] listId='{listId}' partial progress: fetched={totalFetched}, deleted={deletedCount}.",
-                        EventLogEntryType.Warning, 5005);
-                    return deletedCount;
+                    break;
                 }
 
                 var result = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
@@ -1017,7 +1015,8 @@ namespace EventLogOutEmployeeService
                             if (string.IsNullOrWhiteSpace(itemId))
                                 continue;
 
-                            var deleteResponse = await client.DeleteAsync(
+                            var deleteResponse = await DeleteWithThrottleRetryAsync(
+                                client,
                                 $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{listId}/items/{itemId}");
 
                             if (deleteResponse.IsSuccessStatusCode)
@@ -1067,6 +1066,68 @@ namespace EventLogOutEmployeeService
                 EventLogEntryType.Information, 5001);
 
             return deletedCount;
+        }
+
+        private static async Task<HttpResponseMessage> GetWithThrottleRetryAsync(
+            HttpClient client, string url, int maxRetries = 3)
+        {
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                var response = await client.GetAsync(url);
+
+                if ((int)response.StatusCode == 429)
+                {
+                    int retryAfterSeconds = 30 * attempt;
+                    if (response.Headers.TryGetValues("Retry-After", out var values) &&
+                        int.TryParse(values.FirstOrDefault(), out int headerSeconds))
+                    {
+                        retryAfterSeconds = Math.Min(headerSeconds, 120);
+                    }
+
+                    SafeWriteEventLog("Application",
+                        $"[CLEANUP] SharePoint throttle (429) — waiting {retryAfterSeconds}s before retry " +
+                        $"(attempt {attempt}/{maxRetries}).",
+                        EventLogEntryType.Warning, 5007);
+
+                    await Task.Delay(TimeSpan.FromSeconds(retryAfterSeconds));
+                    continue;
+                }
+
+                return response;
+            }
+
+            return await client.GetAsync(url);
+        }
+
+        private static async Task<HttpResponseMessage> DeleteWithThrottleRetryAsync(
+            HttpClient client, string url, int maxRetries = 3)
+        {
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                var response = await client.DeleteAsync(url);
+
+                if ((int)response.StatusCode == 429)
+                {
+                    int retryAfterSeconds = 30 * attempt;
+                    if (response.Headers.TryGetValues("Retry-After", out var values) &&
+                        int.TryParse(values.FirstOrDefault(), out int headerSeconds))
+                    {
+                        retryAfterSeconds = Math.Min(headerSeconds, 120);
+                    }
+
+                    SafeWriteEventLog("Application",
+                        $"[CLEANUP] Delete throttled (429) — waiting {retryAfterSeconds}s " +
+                        $"(attempt {attempt}/{maxRetries}).",
+                        EventLogEntryType.Warning, 5007);
+
+                    await Task.Delay(TimeSpan.FromSeconds(retryAfterSeconds));
+                    continue;
+                }
+
+                return response;
+            }
+
+            return await client.DeleteAsync(url);
         }
 
         /// <summary>

@@ -2279,12 +2279,24 @@ namespace EventLogOutEmployeeService
                     // Tidak perlu koordinasi — jalan segera kalau belum cleanup hari ini.
                     if (lastLocalCleanupDate.Date < now.Date)
                     {
-                        await summaryCache.CleanupOldEntriesAsync(cancellationToken);
-                        await rawEventStore.CleanupOldDatesAsync(eventQueue, cancellationToken);
-                        lastLocalCleanupDate = now.Date;
-                        SafeWriteEventLog("Application",
-                            $"[CLEANUP] Local cleanup done (summaryCache + rawEvents) for {now.Date:yyyy-MM-dd}.",
-                            EventLogEntryType.Information, 5006);
+                        try
+                        {
+                            await summaryCache.CleanupOldEntriesAsync(cancellationToken);
+                            await rawEventStore.CleanupOldDatesAsync(eventQueue, cancellationToken);
+                            SafeWriteEventLog("Application",
+                                $"[CLEANUP] Local cleanup done for {now.Date:yyyy-MM-dd}.",
+                                EventLogEntryType.Information, 5006);
+                        }
+                        catch (Exception ex)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[CLEANUP] Local cleanup error: {ex.Message} — will retry tomorrow.",
+                                EventLogEntryType.Warning, 5008);
+                        }
+                        finally
+                        {
+                            lastLocalCleanupDate = now.Date;
+                        }
                     }
 
                     // ── SHAREPOINT CLEANUP (setiap 3 hari, slot deterministik) ────
