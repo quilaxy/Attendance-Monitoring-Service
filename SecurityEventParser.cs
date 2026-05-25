@@ -113,6 +113,50 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        /// <summary>
+        /// Ekstrak Linked Logon ID dari event 4624 admin split-token.
+        ///
+        /// Windows menulis dua event 4624 untuk setiap admin login (UAC split token):
+        ///   - Elevated token  (Elevated Token: Yes)  → punya Linked Logon ID menunjuk ke standard token
+        ///   - Standard token  (Elevated Token: No)   → punya Linked Logon ID menunjuk ke elevated token
+        ///
+        /// Keduanya juga menghasilkan 4634 saat session ditutup:
+        ///   - 4634 untuk elevated token session  → LogonId = LogonId dari 4624 elevated
+        ///   - 4634 untuk standard token session  → LogonId = LinkedLogonId dari 4624 elevated
+        ///
+        /// Supaya kedua 4634 bisa diblokir, kita harus register KEDUANYA ke admin
+        /// correlation cache:
+        ///   - LogonId utama  → dihandle GetLogonId()
+        ///   - LinkedLogonId  → dihandle method ini
+        ///
+        /// Return null jika tidak ditemukan atau nilainya 0x0 (tidak ada linked session).
+        /// </summary>
+        public static string? GetLinkedLogonId(string? message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return null;
+
+            try
+            {
+                var match = SafeRegexMatch(
+                    message,
+                    @"Linked Logon ID:\s*(0x[0-9A-Fa-f]+)",
+                    RegexOptions.IgnoreCase);
+
+                if (!match.Success)
+                    return null;
+
+                string value = match.Groups[1].Value.Trim().ToLowerInvariant();
+
+                // 0x0 = tidak ada linked session, bukan admin split token
+                return Convert.ToInt64(value, 16) != 0 ? value : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         public static string? GetUserSidFromSecurityEvent(string message, int securityEventId)
         {
             try
