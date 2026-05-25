@@ -61,6 +61,27 @@ namespace EventLogOutEmployeeService
         private readonly CheckpointService _checkpointService;
         private readonly ReplayService _replayService;
 
+        // ── Background task supervision ─────────────────────────────────────────
+        private Task? cleanupTask;
+        private Task? queueTask;
+        private Task? securityHealthTask;
+        private Task? systemHealthTask;
+        private Task? supervisorTask;
+        private Task? watchdogTask;
+
+        private CancellationTokenSource? _cleanupTaskCts;
+        private CancellationTokenSource? _queueTaskCts;
+        private CancellationTokenSource? _securityHealthTaskCts;
+        private CancellationTokenSource? _systemHealthTaskCts;
+
+        private readonly object _backgroundTaskLock = new object();
+        private readonly Queue<DateTime> _cleanupRestartHistory = new Queue<DateTime>();
+        private readonly Queue<DateTime> _queueRestartHistory = new Queue<DateTime>();
+        private readonly Queue<DateTime> _securityHealthRestartHistory = new Queue<DateTime>();
+        private readonly Queue<DateTime> _systemHealthRestartHistory = new Queue<DateTime>();
+        private const int RestartFailureThreshold = 5;
+        private static readonly TimeSpan RestartFailureWindow = TimeSpan.FromMinutes(30);
+
         private int queueAlertThreshold = 500;
         private bool queueThresholdAlerted = false;
         private int[] dispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
@@ -1228,6 +1249,7 @@ namespace EventLogOutEmployeeService
                 }
 
                 cancellationTokenSource?.Cancel();
+                StopBackgroundTasks();
 
                 checkpointHeartbeatTimer?.Dispose();
                 checkpointHeartbeatTimer = null;
@@ -1265,50 +1287,10 @@ namespace EventLogOutEmployeeService
                 // FIX [GAP]: EnableRaisingEvents sudah diaktifkan di OnStart() sebelum replay
                 // dimulai. Tidak perlu diaktifkan lagi di sini untuk menghindari double-enable.
                 // HandleServiceStopping() masih meng-disable dengan benar saat service berhenti.
-
-                _ = Task.Run(() => CleanupOldRecordsTask(cancellationToken), cancellationToken);
-                Task queueTask = Task.Run(() => ProcessQueuedEventsTask(cancellationToken), cancellationToken);
-
-                // FIX [HEALTH]: Monitor Security log subscription — bisa drop silent setelah log rotate.
-                Task secHealthTask = Task.Run(() => SecurityLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
-
-                // FIX [HEALTH-SYSTEM]: Monitor System log subscription — sumber event 42, 1074, 6006.
-                // Shutdown detection path seluruhnya bergantung pada System log ini.
-                Task sysHealthTask = Task.Run(() => SystemLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
+                StartBackgroundTasks(cancellationToken);
 
                 while (!cancellationToken.IsCancellationRequested)
-                {
                     Thread.Sleep(5000);
-
-                    // Watchdog: restart health check tasks if they have faulted or completed unexpectedly.
-                    // Each task should run indefinitely until cancellation — if they exit early, something crashed.
-                    if (secHealthTask.IsCompleted && !cancellationToken.IsCancellationRequested)
-                    {
-                        SafeWriteEventLog("Application",
-                            "[WATCHDOG] Security log health check task exited unexpectedly — restarting.",
-                            EventLogEntryType.Warning, 1093);
-                        secHealthTask = Task.Run(
-                            () => SecurityLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
-                    }
-
-                    if (sysHealthTask.IsCompleted && !cancellationToken.IsCancellationRequested)
-                    {
-                        SafeWriteEventLog("Application",
-                            "[WATCHDOG] System log health check task exited unexpectedly — restarting.",
-                            EventLogEntryType.Warning, 1093);
-                        sysHealthTask = Task.Run(
-                            () => SystemLogSubscriptionHealthCheckTask(cancellationToken), cancellationToken);
-                    }
-
-                    if (queueTask.IsCompleted && !cancellationToken.IsCancellationRequested)
-                    {
-                        SafeWriteEventLog("Application",
-                            "[WATCHDOG] Queue processor task exited unexpectedly — restarting.",
-                            EventLogEntryType.Warning, 1093);
-                        queueTask = Task.Run(
-                            () => ProcessQueuedEventsTask(cancellationToken), cancellationToken);
-                    }
-                }
             }
             catch (Exception ex)
             {
@@ -1318,12 +1300,427 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        private void StartBackgroundTasks(CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            lock (_backgroundTaskLock)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
+                if (IsTaskStopped(cleanupTask))
+                    StartCleanupTask(cancellationToken);
+                if (IsTaskStopped(queueTask))
+                    StartQueueTask(cancellationToken);
+                if (IsTaskStopped(securityHealthTask))
+                    StartSecurityHealthTask(cancellationToken);
+                if (IsTaskStopped(systemHealthTask))
+                    StartSystemHealthTask(cancellationToken);
+
+                if (IsTaskStopped(supervisorTask))
+                    supervisorTask = Task.Run(() => BackgroundTaskSupervisorLoop(cancellationToken), cancellationToken);
+                if (IsTaskStopped(watchdogTask))
+                    watchdogTask = Task.Run(() => InternalWatchdogTask(cancellationToken), cancellationToken);
+            }
+        }
+
+        private static bool IsTaskStopped(Task? task)
+            => task == null || task.IsCompleted || task.IsCanceled || task.IsFaulted;
+
+        private CancellationToken CreateLinkedToken(ref CancellationTokenSource? taskCts, CancellationToken serviceToken)
+        {
+            taskCts?.Cancel();
+            taskCts?.Dispose();
+            taskCts = CancellationTokenSource.CreateLinkedTokenSource(serviceToken);
+            return taskCts.Token;
+        }
+
+        private bool StartCleanupTask(CancellationToken serviceToken)
+            => TryStartTask(
+                "Cleanup task",
+                ref cleanupTask,
+                ref _cleanupTaskCts,
+                ref _lastCleanupHeartbeatUtc,
+                CleanupOldRecordsTask,
+                serviceToken);
+
+        private bool StartQueueTask(CancellationToken serviceToken)
+            => TryStartTask(
+                "Queue processor task",
+                ref queueTask,
+                ref _queueTaskCts,
+                ref _lastQueueProcessorHeartbeatUtc,
+                ProcessQueuedEventsTask,
+                serviceToken);
+
+        private bool StartSecurityHealthTask(CancellationToken serviceToken)
+            => TryStartTask(
+                "Security health task",
+                ref securityHealthTask,
+                ref _securityHealthTaskCts,
+                ref _lastSecurityHealthHeartbeatUtc,
+                SecurityLogSubscriptionHealthCheckTask,
+                serviceToken);
+
+        private bool StartSystemHealthTask(CancellationToken serviceToken)
+            => TryStartTask(
+                "System health task",
+                ref systemHealthTask,
+                ref _systemHealthTaskCts,
+                ref _lastSystemHealthHeartbeatUtc,
+                SystemLogSubscriptionHealthCheckTask,
+                serviceToken);
+
+        private bool TryStartTask(
+            string taskName,
+            ref Task? taskField,
+            ref CancellationTokenSource? taskCts,
+            ref long heartbeatTicks,
+            Func<CancellationToken, Task> taskFactory,
+            CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return false;
+
+            try
+            {
+                CancellationToken linkedToken = CreateLinkedToken(ref taskCts, cancellationToken);
+                Interlocked.Exchange(ref heartbeatTicks, DateTime.UtcNow.Ticks);
+                taskField = Task.Run(() => taskFactory(linkedToken), linkedToken);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[SUPERVISOR] Failed to start {taskName}: {ex.Message}",
+                    EventLogEntryType.Error, 1093);
+                return false;
+            }
+        }
+
+        private static string DescribeTaskState(Task? task)
+        {
+            if (task == null)
+                return "not started";
+            if (task.IsFaulted)
+                return "faulted";
+            if (task.IsCanceled)
+                return "canceled";
+            if (task.IsCompleted)
+                return "completed";
+            return "running";
+        }
+
+        private void RecordRestartAttempt(string taskName, Queue<DateTime> history, CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            try
+            {
+                DateTime now = DateTime.UtcNow;
+                history.Enqueue(now);
+                while (history.Count > 0 && now - history.Peek() > RestartFailureWindow)
+                    history.Dequeue();
+
+                if (history.Count > RestartFailureThreshold)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[FATAL] {taskName} restarted {history.Count} times within " +
+                        $"{RestartFailureWindow.TotalMinutes:F0} minutes — failing fast to trigger SCM recovery.",
+                        EventLogEntryType.Error, 1095);
+                    Environment.FailFast($"{taskName} restart instability detected.");
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[SUPERVISOR] Restart history tracking failed for {taskName}: {ex.Message}",
+                    EventLogEntryType.Warning, 1093);
+            }
+        }
+
+        private void RestartStoppedTask(
+            string taskName,
+            ref Task? taskField,
+            ref CancellationTokenSource? taskCts,
+            ref long heartbeatTicks,
+            Func<CancellationToken, Task> taskFactory,
+            Queue<DateTime> restartHistory,
+            CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            if (!IsTaskStopped(taskField))
+                return;
+
+            lock (_backgroundTaskLock)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
+                if (!IsTaskStopped(taskField))
+                    return;
+
+                string reason = DescribeTaskState(taskField);
+                SafeWriteEventLog("Application",
+                    $"[SUPERVISOR] {taskName} stopped ({reason}) — restarting.",
+                    EventLogEntryType.Warning, 1091);
+
+                bool started = TryStartTask(
+                    taskName,
+                    ref taskField,
+                    ref taskCts,
+                    ref heartbeatTicks,
+                    taskFactory,
+                    cancellationToken);
+                if (started)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[SUPERVISOR] {taskName} restarted.",
+                        EventLogEntryType.Information, 1092);
+                }
+
+                RecordRestartAttempt(taskName, restartHistory, cancellationToken);
+            }
+        }
+
+        private void RestartStalledTask(
+            string taskName,
+            TimeSpan timeout,
+            ref long heartbeatTicks,
+            ref Task? taskField,
+            ref CancellationTokenSource? taskCts,
+            Func<CancellationToken, Task> taskFactory,
+            Queue<DateTime> restartHistory,
+            CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            DateTime nowUtc = DateTime.UtcNow;
+            long lastTicks = Interlocked.Read(ref heartbeatTicks);
+            TimeSpan elapsed = lastTicks == DateTime.MinValue.Ticks
+                ? TimeSpan.MaxValue
+                : nowUtc - new DateTime(lastTicks, DateTimeKind.Utc);
+            if (elapsed <= timeout)
+                return;
+
+            lock (_backgroundTaskLock)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
+                long latestTicks = Interlocked.Read(ref heartbeatTicks);
+                TimeSpan latestElapsed = latestTicks == DateTime.MinValue.Ticks
+                    ? TimeSpan.MaxValue
+                    : DateTime.UtcNow - new DateTime(latestTicks, DateTimeKind.Utc);
+                if (latestElapsed <= timeout)
+                    return;
+
+                string ageLabel = latestTicks == DateTime.MinValue.Ticks
+                    ? "no heartbeat"
+                    : $"{latestElapsed.TotalMinutes:F0} min";
+
+                SafeWriteEventLog("Application",
+                    $"[WATCHDOG] {taskName} heartbeat stale ({ageLabel}, timeout={timeout.TotalMinutes:F0} min) — restarting.",
+                    EventLogEntryType.Warning, 1094);
+
+                try
+                {
+                    taskCts?.Cancel();
+                }
+                catch
+                {
+                    // non-critical
+                }
+
+                bool started = true;
+                if (taskField != null && !IsTaskStopped(taskField))
+                {
+                    started = false;
+                }
+                else
+                {
+                    started = TryStartTask(
+                        taskName,
+                        ref taskField,
+                        ref taskCts,
+                        ref heartbeatTicks,
+                        taskFactory,
+                        cancellationToken);
+                }
+
+                if (started)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[WATCHDOG] {taskName} restarted.",
+                        EventLogEntryType.Information, 1092);
+                }
+
+                RecordRestartAttempt(taskName, restartHistory, cancellationToken);
+            }
+        }
+
+        private async Task BackgroundTaskSupervisorLoop(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken);
+
+                    RestartStoppedTask(
+                        "Cleanup task",
+                        ref cleanupTask,
+                        ref _cleanupTaskCts,
+                        ref _lastCleanupHeartbeatUtc,
+                        CleanupOldRecordsTask,
+                        _cleanupRestartHistory,
+                        cancellationToken);
+                    RestartStoppedTask(
+                        "Queue processor task",
+                        ref queueTask,
+                        ref _queueTaskCts,
+                        ref _lastQueueProcessorHeartbeatUtc,
+                        ProcessQueuedEventsTask,
+                        _queueRestartHistory,
+                        cancellationToken);
+                    RestartStoppedTask(
+                        "Security health task",
+                        ref securityHealthTask,
+                        ref _securityHealthTaskCts,
+                        ref _lastSecurityHealthHeartbeatUtc,
+                        SecurityLogSubscriptionHealthCheckTask,
+                        _securityHealthRestartHistory,
+                        cancellationToken);
+                    RestartStoppedTask(
+                        "System health task",
+                        ref systemHealthTask,
+                        ref _systemHealthTaskCts,
+                        ref _lastSystemHealthHeartbeatUtc,
+                        SystemLogSubscriptionHealthCheckTask,
+                        _systemHealthRestartHistory,
+                        cancellationToken);
+                }
+                catch (TaskCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[SUPERVISOR] BackgroundTaskSupervisorLoop error: {ex.Message}",
+                        EventLogEntryType.Error, 1093);
+                    try { await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken); }
+                    catch (TaskCanceledException) { break; }
+                }
+            }
+        }
+
+        private async Task InternalWatchdogTask(CancellationToken cancellationToken)
+        {
+            TimeSpan queueTimeout = TimeSpan.FromMinutes(10);
+            TimeSpan securityTimeout = TimeSpan.FromMinutes(15);
+            TimeSpan systemTimeout = TimeSpan.FromMinutes(30);
+            TimeSpan cleanupTimeout = TimeSpan.FromHours(6);
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(5), cancellationToken);
+
+                    RestartStalledTask(
+                        "Queue processor task",
+                        queueTimeout,
+                        ref _lastQueueProcessorHeartbeatUtc,
+                        ref queueTask,
+                        ref _queueTaskCts,
+                        ProcessQueuedEventsTask,
+                        _queueRestartHistory,
+                        cancellationToken);
+                    RestartStalledTask(
+                        "Security health task",
+                        securityTimeout,
+                        ref _lastSecurityHealthHeartbeatUtc,
+                        ref securityHealthTask,
+                        ref _securityHealthTaskCts,
+                        SecurityLogSubscriptionHealthCheckTask,
+                        _securityHealthRestartHistory,
+                        cancellationToken);
+                    RestartStalledTask(
+                        "System health task",
+                        systemTimeout,
+                        ref _lastSystemHealthHeartbeatUtc,
+                        ref systemHealthTask,
+                        ref _systemHealthTaskCts,
+                        SystemLogSubscriptionHealthCheckTask,
+                        _systemHealthRestartHistory,
+                        cancellationToken);
+                    RestartStalledTask(
+                        "Cleanup task",
+                        cleanupTimeout,
+                        ref _lastCleanupHeartbeatUtc,
+                        ref cleanupTask,
+                        ref _cleanupTaskCts,
+                        CleanupOldRecordsTask,
+                        _cleanupRestartHistory,
+                        cancellationToken);
+                }
+                catch (TaskCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[WATCHDOG] InternalWatchdogTask error: {ex.Message}",
+                        EventLogEntryType.Error, 1093);
+                    try { await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken); }
+                    catch (TaskCanceledException) { break; }
+                }
+            }
+        }
+
+        private void StopBackgroundTasks()
+        {
+            lock (_backgroundTaskLock)
+            {
+                CancelTask(ref _cleanupTaskCts);
+                CancelTask(ref _queueTaskCts);
+                CancelTask(ref _securityHealthTaskCts);
+                CancelTask(ref _systemHealthTaskCts);
+
+                cleanupTask = null;
+                queueTask = null;
+                securityHealthTask = null;
+                systemHealthTask = null;
+                supervisorTask = null;
+                watchdogTask = null;
+            }
+        }
+
+        private static void CancelTask(ref CancellationTokenSource? taskCts)
+        {
+            if (taskCts == null)
+                return;
+
+            try { taskCts.Cancel(); } catch { }
+            try { taskCts.Dispose(); } catch { }
+            taskCts = null;
+        }
+
         // ─── Queue processor ─────────────────────────────────────────────────────
 
         private async Task ProcessQueuedEventsTask(CancellationToken cancellationToken)
         {
             while (!cancellationToken.IsCancellationRequested)
             {
+                Interlocked.Exchange(ref _lastQueueProcessorHeartbeatUtc, DateTime.UtcNow.Ticks);
                 try
                 {
                     DateTime nowUtc = DateTime.UtcNow;
@@ -1442,6 +1839,8 @@ namespace EventLogOutEmployeeService
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(checkIntervalSeconds), cancellationToken);
+
+                    Interlocked.Exchange(ref _lastSecurityHealthHeartbeatUtc, DateTime.UtcNow.Ticks);
 
                     long enabledTicks   = Interlocked.Read(ref _subscriptionEnabledTicksUtc);
                     long lastEventTicks = Interlocked.Read(ref _lastSecurityEventTicksUtc);
@@ -1668,6 +2067,8 @@ namespace EventLogOutEmployeeService
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(checkIntervalSeconds), cancellationToken);
+
+                    Interlocked.Exchange(ref _lastSystemHealthHeartbeatUtc, DateTime.UtcNow.Ticks);
 
                     if (systemEventLog == null)
                         continue;
@@ -2274,6 +2675,7 @@ namespace EventLogOutEmployeeService
 
             while (!cancellationToken.IsCancellationRequested)
             {
+                Interlocked.Exchange(ref _lastCleanupHeartbeatUtc, DateTime.UtcNow.Ticks);
                 try
                 {
                     DateTime now = DateTime.Now;
@@ -2409,6 +2811,12 @@ namespace EventLogOutEmployeeService
         //     fresh startup pasca-wake, bukan mid-day drop biasa.
         private long _lastSystemEventTicksUtc          = DateTime.MinValue.Ticks;
         private long _systemSubscriptionEnabledTicksUtc = DateTime.MinValue.Ticks;
+
+        // ── Background task heartbeats ──────────────────────────────────────────
+        private long _lastQueueProcessorHeartbeatUtc = DateTime.MinValue.Ticks;
+        private long _lastCleanupHeartbeatUtc = DateTime.MinValue.Ticks;
+        private long _lastSecurityHealthHeartbeatUtc = DateTime.MinValue.Ticks;
+        private long _lastSystemHealthHeartbeatUtc = DateTime.MinValue.Ticks;
 
         private void OnSecurityEventWritten(object sender, EntryWrittenEventArgs e)
         {

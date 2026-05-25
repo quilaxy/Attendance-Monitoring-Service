@@ -1,7 +1,7 @@
 # Attendance Monitoring Service — Technical Documentation
 
 > **Stack:** .NET 8, Windows Service, SharePoint (Microsoft Graph API)  
-> **Last updated:** 2026-05-08
+> **Last updated:** 2026-05-25
 
 ---
 
@@ -498,6 +498,11 @@ Semua log ditulis ke **Windows Application Event Log**.
 | 1040 | Warning | Queue: recovered from backup setelah JsonException |
 | 1041 | Warning | Queue: backup recovery failed |
 | 1042 | Warning | Queue: JSON corrupted, resetting queue |
+| 1091 | Warning | Background task stopped (faulted/canceled/completed) |
+| 1092 | Info | Background task restarted |
+| 1093 | Error | Supervisor / watchdog failure |
+| 1094 | Warning | Watchdog timeout (heartbeat stale) |
+| 1095 | Error | Fatal escalation: subsystem restart instability |
 
 ### 6.5 Debug System Event Parsing
 
