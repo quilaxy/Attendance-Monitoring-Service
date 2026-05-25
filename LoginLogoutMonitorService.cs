@@ -126,6 +126,7 @@ namespace EventLogOutEmployeeService
         public LoginLogoutMonitorService()
         {
             _adminCorrelationService = new AdminSessionCorrelationService(rawEventStore, WriteAdminCorrelationLog);
+            _adminCorrelationService.InitBootSessionId(DataDirectory);
             _checkpointService = new CheckpointService(DataDirectory, MaxReplayLookback, SafeWriteEventLog);
 
             // Allow OnShutdown() to be called during system shutdown/restart.
@@ -1184,6 +1185,8 @@ namespace EventLogOutEmployeeService
                 SafeWriteEventLog("Attendance-Service",
                     $"Service stopping ({caller}).",
                     EventLogEntryType.Information, stopEventId);
+
+                _adminCorrelationService.InvalidateBootSession();
 
                 // ── Step 1: Request extra shutdown time from SCM immediately.
                 // Windows system shutdown gives services only ~5 seconds by default.
