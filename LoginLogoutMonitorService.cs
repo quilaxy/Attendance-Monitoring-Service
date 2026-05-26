@@ -787,6 +787,8 @@ namespace EventLogOutEmployeeService
             // Self-healing: "already OK" confirmations — verbose only (tidak perlu tampil setiap boot normal)
             // Warning/fix IDs (1062, 1063, 1066, 1067) sengaja TIDAK di sini agar selalu tampil.
             1061, 1065,
+            // Startup index-load info detail (warning/error tetap pakai ID lain agar selalu tampil)
+            1058,
             // Config validation: "OK" confirmation — verbose only.
             // Error/warning IDs (1070, 1071, 1072, 1073) sengaja TIDAK di sini agar selalu tampil.
             1075,
@@ -806,26 +808,29 @@ namespace EventLogOutEmployeeService
             // 1089 = mini-replay start/done → verbose
             // 1090 = health check fatal → selalu tampil
             // 1098 = external heartbeat OK → verbose
-            1080, 1082, 1083, 1087, 1089, 1098,
+            // 1092 = supervisor/watchdog restarted confirmation → verbose
+            // 1096 = power resume/suspend info detail → verbose
+            1080, 1082, 1083, 1087, 1089, 1092, 1096, 1098,
             // Debug system event parsing — semua [DBG-*]
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
             // Debug fallback resolution detail — [DBG-1074] resolved
             2013,
             // Debug RawEventStore fallback — [DBG-4624], [DBG-GetMRU], [DBG-42], [DBG-4634]
-            2028, 2031, 2032, 2033,
+            // 2026 = unresolved 4647 queued as pending (debug process detail)
+            2026, 2028, 2031, 2032, 2033,
             // Admin correlation process detail (info-only)
             // 2043 (warning: lookup failure) sengaja TIDAK di sini agar selalu tampil.
             2041, 2042,
             // 4634 deferred retry pipeline — [4634-RETRY] / [4634-FILTER]
             // 2050 = deferring (info, verbose — terjadi setiap 4634 saat startup)
             // 2051 = queue full warning → TIDAK di sini (selalu tampil)
-            // 2052 = drain start/selesai summary → TIDAK di sini (lifecycle, selalu tampil)
+            // 2052 = drain start/selesai summary → verbose (proses internal)
             // 2053 = expired/retry-limit fallback warning → TIDAK di sini (selalu tampil)
             // 2054 = per-event reprocess progress → verbose (terlalu sering di production)
             // 2055 = error saat reprocess → TIDAK di sini (selalu tampil)
             // 2056 = warmup masih berlangsung saat retry → TIDAK di sini (warning, selalu tampil)
             // 2057 = drain dibatalkan → TIDAK di sini (selalu tampil)
-            2050, 2054,
+            2050, 2052, 2054,
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
             3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
@@ -4815,7 +4820,7 @@ namespace EventLogOutEmployeeService
 
                 SafeWriteEventLog("Application",
                     $"[INDEX-4624] Loaded persisted allLogon4624 index: keys={loadedKeys}.",
-                    EventLogEntryType.Information, 1055);
+                    EventLogEntryType.Information, 1058);
             }
             catch (Exception ex)
             {
