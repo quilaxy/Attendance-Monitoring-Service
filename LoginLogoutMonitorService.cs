@@ -66,6 +66,7 @@ namespace EventLogOutEmployeeService
         private Task? queueTask;
         private Task? securityHealthTask;
         private Task? systemHealthTask;
+        private Task? heartbeatTask;
         private Task? supervisorTask;
         private Task? watchdogTask;
 
@@ -73,18 +74,21 @@ namespace EventLogOutEmployeeService
         private CancellationTokenSource? _queueTaskCts;
         private CancellationTokenSource? _securityHealthTaskCts;
         private CancellationTokenSource? _systemHealthTaskCts;
+        private CancellationTokenSource? _heartbeatTaskCts;
 
         private readonly object _backgroundTaskLock = new object();
         private readonly Queue<DateTime> _cleanupRestartHistory = new Queue<DateTime>();
         private readonly Queue<DateTime> _queueRestartHistory = new Queue<DateTime>();
         private readonly Queue<DateTime> _securityHealthRestartHistory = new Queue<DateTime>();
         private readonly Queue<DateTime> _systemHealthRestartHistory = new Queue<DateTime>();
+        private readonly Queue<DateTime> _heartbeatRestartHistory = new Queue<DateTime>();
         private const int RestartFailureThreshold = 5;
         private static readonly TimeSpan RestartFailureWindow = TimeSpan.FromMinutes(30);
 
         private int queueAlertThreshold = 500;
         private bool queueThresholdAlerted = false;
         private int[] dispatchBackoffSeconds = new[] { 30, 60, 120, 300, 600 };
+        private string? _heartbeatListId;
         private HashSet<string> systemFallbackTriggerAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "NT AUTHORITY\\SYSTEM",
@@ -327,8 +331,10 @@ namespace EventLogOutEmployeeService
                         catch (Exception ex)
                         {
                             SafeWriteEventLog("Application",
-                                $"[STARTUP] Background startup thread failed: {ex.Message}",
+                                $"[STARTUP] Background startup thread failed: {ex}",
                                 EventLogEntryType.Error, 1002);
+                            try { _checkpointService.SaveStopCheckpoint(DateTime.UtcNow.AddSeconds(-5)); } catch { }
+                            try { Stop(); } catch { }
                         }
                     });
                     startupThread.IsBackground = true;
@@ -642,6 +648,18 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        private static void SafeWriteEventLogAlways(string source, string message, EventLogEntryType type, int eventId)
+        {
+            try
+            {
+                EventLog.WriteEntry("Attendance-Service", message, type, eventId);
+            }
+            catch
+            {
+                // Ignore EventLog failures during shutdown windows.
+            }
+        }
+
         private void WriteAdminCorrelationLog(string message, EventLogEntryType type, int eventId)
             => SafeWriteEventLog("Application", message, type, eventId);
 
@@ -680,7 +698,8 @@ namespace EventLogOutEmployeeService
             // 1088 = re-subscribe attempt failed → selalu tampil (warning)
             // 1089 = mini-replay start/done → verbose
             // 1090 = health check fatal → selalu tampil
-            1080, 1082, 1083, 1087, 1089,
+            // 1098 = external heartbeat OK → verbose
+            1080, 1082, 1083, 1087, 1089, 1098,
             // Debug system event parsing — semua [DBG-*]
             2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
             // Debug fallback resolution detail — [DBG-1074] resolved
@@ -952,6 +971,7 @@ namespace EventLogOutEmployeeService
             queueAlertThreshold = Math.Max(1, ReadIntFromEnvironment("QUEUE_ALERT_THRESHOLD", 500));
             dispatchBackoffSeconds = ReadIntListFromEnvironment(
                 "DISPATCH_BACKOFF_SECONDS", new[] { 30, 60, 120, 300, 600 });
+            _heartbeatListId = config["SharePointSettings:HeartbeatListId"];
 
             ValidateConfiguration(config);
 
@@ -1050,6 +1070,7 @@ namespace EventLogOutEmployeeService
             string? siteId      = config["SharePointSettings:SiteId"];
             string? listId      = config["SharePointSettings:ListId"];
             string? summaryListId = config["SharePointSettings:SummaryListId"];
+            string? heartbeatListId = config["SharePointSettings:HeartbeatListId"];
 
             Critical("SharePointSettings:SiteId",  siteId);
             Critical("SharePointSettings:ListId",  listId);
@@ -1057,6 +1078,9 @@ namespace EventLogOutEmployeeService
             // SummaryListId opsional tapi kalau kosong fitur Summary nonaktif
             Warn("SharePointSettings:SummaryListId", summaryListId,
                 "Fitur Summary (ClockIn/ClockOut harian) tidak akan aktif.");
+
+            Warn("SharePointSettings:HeartbeatListId", heartbeatListId,
+                "SharePointSettings:HeartbeatListId kosong — fitur external heartbeat monitoring tidak aktif.");
 
             // ── AppSettings ───────────────────────────────────────────────────────
             // VerboseLogging tidak wajib — default false, tidak perlu divalidasi.
@@ -1348,6 +1372,8 @@ namespace EventLogOutEmployeeService
                     StartSecurityHealthTask(cancellationToken);
                 if (IsTaskStopped(systemHealthTask))
                     StartSystemHealthTask(cancellationToken);
+                if (IsTaskStopped(heartbeatTask))
+                    StartHeartbeatTask(cancellationToken);
 
                 if (IsTaskStopped(supervisorTask))
                     supervisorTask = Task.Run(() => BackgroundTaskSupervisorLoop(cancellationToken), cancellationToken);
@@ -1401,6 +1427,15 @@ namespace EventLogOutEmployeeService
                 ref _systemHealthTaskCts,
                 ref _lastSystemHealthHeartbeatUtc,
                 SystemLogSubscriptionHealthCheckTask,
+                serviceToken);
+
+        private bool StartHeartbeatTask(CancellationToken serviceToken)
+            => TryStartTask(
+                "Heartbeat task",
+                ref heartbeatTask,
+                ref _heartbeatTaskCts,
+                ref _lastHeartbeatTaskHeartbeatUtc,
+                HeartbeatWriterTask,
                 serviceToken);
 
         private bool TryStartTask(
@@ -1635,6 +1670,14 @@ namespace EventLogOutEmployeeService
                         SystemLogSubscriptionHealthCheckTask,
                         _systemHealthRestartHistory,
                         cancellationToken);
+                    RestartStoppedTask(
+                        "Heartbeat task",
+                        ref heartbeatTask,
+                        ref _heartbeatTaskCts,
+                        ref _lastHeartbeatTaskHeartbeatUtc,
+                        HeartbeatWriterTask,
+                        _heartbeatRestartHistory,
+                        cancellationToken);
                 }
                 catch (TaskCanceledException)
                 {
@@ -1657,6 +1700,7 @@ namespace EventLogOutEmployeeService
             TimeSpan securityTimeout = TimeSpan.FromMinutes(15);
             TimeSpan systemTimeout = TimeSpan.FromMinutes(30);
             TimeSpan cleanupTimeout = TimeSpan.FromHours(6);
+            TimeSpan heartbeatTimeout = TimeSpan.FromHours(1);
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -1700,6 +1744,15 @@ namespace EventLogOutEmployeeService
                         CleanupOldRecordsTask,
                         _cleanupRestartHistory,
                         cancellationToken);
+                    RestartStalledTask(
+                        "Heartbeat task",
+                        heartbeatTimeout,
+                        ref _lastHeartbeatTaskHeartbeatUtc,
+                        ref heartbeatTask,
+                        ref _heartbeatTaskCts,
+                        HeartbeatWriterTask,
+                        _heartbeatRestartHistory,
+                        cancellationToken);
                 }
                 catch (TaskCanceledException)
                 {
@@ -1724,11 +1777,13 @@ namespace EventLogOutEmployeeService
                 CancelTask(ref _queueTaskCts);
                 CancelTask(ref _securityHealthTaskCts);
                 CancelTask(ref _systemHealthTaskCts);
+                CancelTask(ref _heartbeatTaskCts);
 
                 cleanupTask = null;
                 queueTask = null;
                 securityHealthTask = null;
                 systemHealthTask = null;
+                heartbeatTask = null;
                 supervisorTask = null;
                 watchdogTask = null;
             }
@@ -2707,6 +2762,63 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        private async Task HeartbeatWriterTask(CancellationToken cancellationToken)
+        {
+            TimeSpan interval = TimeSpan.FromMinutes(30);
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                Interlocked.Exchange(ref _lastHeartbeatTaskHeartbeatUtc, DateTime.UtcNow.Ticks);
+
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(_heartbeatListId))
+                    {
+                        DateTime nowUtc = DateTime.UtcNow;
+                        int queueCount = await eventQueue.GetCountAsync(cancellationToken);
+                        long lastEventTicks = Interlocked.Read(ref _lastEnqueuedLoginLogoutEventTicksUtc);
+                        DateTime? lastEventTimeUtc = lastEventTicks == DateTime.MinValue.Ticks
+                            ? (DateTime?)null
+                            : new DateTime(lastEventTicks, DateTimeKind.Utc);
+                        string serviceVersion = typeof(LoginLogoutMonitorService).Assembly.GetName().Version?.ToString() ?? "unknown";
+
+                        string? accessToken = await sharePointIntegration.Value.GetAccessTokenAsync(nowUtc, 0);
+                        if (string.IsNullOrWhiteSpace(accessToken))
+                        {
+                            SafeWriteEventLogAlways("Application",
+                                "[HEARTBEAT] Access token unavailable — heartbeat skipped.",
+                                EventLogEntryType.Warning, 1098);
+                        }
+                        else
+                        {
+                            await sharePointIntegration.Value.UpsertHeartbeatAsync(
+                                accessToken,
+                                _heartbeatListId,
+                                Environment.MachineName,
+                                nowUtc,
+                                queueCount,
+                                lastEventTimeUtc,
+                                serviceVersion);
+                            SafeWriteEventLog("Application",
+                                $"[HEARTBEAT] OK: machine={Environment.MachineName} " +
+                                $"queue={queueCount} lastEvent={lastEventTimeUtc?.ToString("O") ?? "(none)"}",
+                                EventLogEntryType.Information, 1098);
+                        }
+                    }
+                }
+                catch (TaskCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLogAlways("Application",
+                        $"[HEARTBEAT] Failed to write heartbeat: {ex.Message}",
+                        EventLogEntryType.Warning, 1098);
+                }
+
+                try { await Task.Delay(interval, cancellationToken); }
+                catch (TaskCanceledException) { break; }
+            }
+        }
+
         // ─── Event handlers ──────────────────────────────────────────────────────
 
         // ── Security log subscription health check ───────────────────────────────
@@ -2739,6 +2851,9 @@ namespace EventLogOutEmployeeService
         private long _lastCleanupHeartbeatUtc = DateTime.MinValue.Ticks;
         private long _lastSecurityHealthHeartbeatUtc = DateTime.MinValue.Ticks;
         private long _lastSystemHealthHeartbeatUtc = DateTime.MinValue.Ticks;
+        private long _lastHeartbeatTaskHeartbeatUtc = DateTime.MinValue.Ticks;
+
+        private long _lastEnqueuedLoginLogoutEventTicksUtc = DateTime.MinValue.Ticks;
 
         private void OnSecurityEventWritten(object sender, EntryWrittenEventArgs e)
         {
@@ -3414,6 +3529,9 @@ namespace EventLogOutEmployeeService
                 }
                 else
                 {
+                    if (eventId == 4624 || eventId == 4647)
+                        Interlocked.Exchange(ref _lastEnqueuedLoginLogoutEventTicksUtc, eventTime.ToUniversalTime().Ticks);
+
                     await CheckQueueSizeThresholdAsync(cancellationToken: default);
 
                     // FIX [CRASH-0xe0434352]: Checkpoint per-event — tulis setiap kali event
