@@ -190,22 +190,22 @@ namespace EventLogOutEmployeeService
                     $"Failed to save stop checkpoint: {ex.GetType().Name}: {ex.Message} | Path='{stopCheckpointPath}'",
                     EventLogEntryType.Warning, 1017);
             }
+        }
 
-            private void EnsureLastWrittenCheckpointInitialized()
-            {
-                if (_lastWrittenCheckpointInitialized)
-                    return;
+        private void EnsureLastWrittenCheckpointInitialized()
+        {
+            if (_lastWrittenCheckpointInitialized)
+                return;
 
-                DateTime? primary = TryLoadCheckpoint(stopCheckpointPath);
-                DateTime? backup = TryLoadCheckpoint(stopCheckpointBackupPath);
+            DateTime? primary = TryLoadCheckpoint(stopCheckpointPath);
+            DateTime? backup = TryLoadCheckpoint(stopCheckpointBackupPath);
 
-                if (primary.HasValue && backup.HasValue)
-                    _lastWrittenCheckpoint = primary.Value >= backup.Value ? primary.Value : backup.Value;
-                else
-                    _lastWrittenCheckpoint = primary ?? backup;
+            if (primary.HasValue && backup.HasValue)
+                _lastWrittenCheckpoint = primary.Value >= backup.Value ? primary.Value : backup.Value;
+            else
+                _lastWrittenCheckpoint = primary ?? backup;
 
-                _lastWrittenCheckpointInitialized = true;
-            }
+            _lastWrittenCheckpointInitialized = true;
         }
 
         public void SaveReplayCheckpoint(DateTime checkpoint)
