@@ -22,7 +22,7 @@ namespace EventLogOutEmployeeService
         private readonly Func<RawSecurityEvent, bool, Task> _processRawSecurityEventAsync;
 
         private volatile bool replayInProgress = false;
-        private DateTime replayUpperBound = DateTime.MinValue;
+        private long _replayUpperBoundTicks = DateTime.MinValue.Ticks;
 
         private volatile int _skipLogSuppressedCount = 0;
         // Ticks-based agar bisa diakses dengan Interlocked.Read (DateTime tidak thread-safe secara native)
@@ -63,7 +63,7 @@ namespace EventLogOutEmployeeService
         public async Task ReplayMissedEventsFromCheckpoint()
         {
             DateTime replayTo = DateTime.UtcNow;
-            replayUpperBound = replayTo;
+            Interlocked.Exchange(ref _replayUpperBoundTicks, replayTo.Ticks);
             replayInProgress = true;
 
             try
@@ -319,6 +319,10 @@ namespace EventLogOutEmployeeService
 
         public bool ShouldSkipLiveEntry(DateTime eventTime, bool isSecurityEvent = false)
         {
+            DateTime replayUpperBound = new DateTime(
+                Interlocked.Read(ref _replayUpperBoundTicks),
+                DateTimeKind.Utc);
+
             // Security log events (4624/4647) get a grace period past replayUpperBound.
             DateTime effectiveBound = isSecurityEvent
                 ? replayUpperBound.Add(LiveEventGracePeriod)

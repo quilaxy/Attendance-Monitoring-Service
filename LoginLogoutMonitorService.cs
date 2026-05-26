@@ -54,6 +54,7 @@ namespace EventLogOutEmployeeService
         // dictionary ini simpan semua login agar bisa detect sesi baru setelah shutdown pertama.
         private readonly Dictionary<string, List<DateTime>> allLogon4624ByDeviceWorkDate =
             new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _allLogon4624Lock = new object();
         private readonly Dictionary<string, DateTime> startupAnchorByDeviceWorkDate =
             new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
@@ -357,8 +358,23 @@ namespace EventLogOutEmployeeService
                     if (currentRetry >= maxRetries)
                     {
                         SafeWriteEventLog("Application",
-                            $"EmployeeLoginLogoutService failed to start after {maxRetries} attempts: {ex.Message}",
+                            $"EmployeeLoginLogoutService failed to start after {maxRetries} attempts: {ex}",
                             EventLogEntryType.Error, 1002);
+                        try { _checkpointService.SaveStopCheckpoint(DateTime.UtcNow.AddSeconds(-5)); }
+                        catch (Exception checkpointEx)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[STARTUP] Failed to save stop checkpoint after startup exhaustion: {checkpointEx.Message}",
+                                EventLogEntryType.Warning, 1002);
+                        }
+                        ExitCode = 1;
+                        try { Stop(); }
+                        catch (Exception stopEx)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[STARTUP] Failed to stop service after startup exhaustion: {stopEx.Message}",
+                                EventLogEntryType.Warning, 1002);
+                        }
                         return;
                     }
                     Thread.Sleep(2000);
@@ -1657,26 +1673,41 @@ namespace EventLogOutEmployeeService
                 {
                     taskCts?.Cancel();
                 }
-                catch
+                catch (Exception cancelEx)
                 {
-                    // non-critical
+                    SafeWriteEventLog("Application",
+                        $"[WATCHDOG] {taskName} cancel failed during stalled restart: {cancelEx.Message}",
+                        EventLogEntryType.Warning, 1094);
                 }
 
-                bool started = true;
-                if (taskField != null && !IsTaskStopped(taskField))
+                Task? previousTask = taskField;
+                if (previousTask != null && !IsTaskStopped(previousTask))
                 {
-                    started = false;
+                    try
+                    {
+                        bool stoppedInGrace = previousTask.Wait(TimeSpan.FromSeconds(5));
+                        if (!stoppedInGrace)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[WATCHDOG] {taskName} did not stop within 5s grace period — forcing restart with new token.",
+                                EventLogEntryType.Warning, 1094);
+                        }
+                    }
+                    catch (Exception waitEx)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[WATCHDOG] {taskName} wait-for-stop failed: {waitEx.Message}. Forcing restart.",
+                            EventLogEntryType.Warning, 1094);
+                    }
                 }
-                else
-                {
-                    started = TryStartTask(
-                        taskName,
-                        ref taskField,
-                        ref taskCts,
-                        ref heartbeatTicks,
-                        taskFactory,
-                        cancellationToken);
-                }
+
+                bool started = TryStartTask(
+                    taskName,
+                    ref taskField,
+                    ref taskCts,
+                    ref heartbeatTicks,
+                    taskFactory,
+                    cancellationToken);
 
                 if (started)
                 {
@@ -1900,7 +1931,7 @@ namespace EventLogOutEmployeeService
                     bool sent;
                     try
                     {
-                        sent = await TryDispatchQueuedEventAsync(next);
+                        sent = await TryDispatchQueuedEventAsync(next, cancellationToken);
                     }
                     finally
                     {
@@ -2475,7 +2506,7 @@ namespace EventLogOutEmployeeService
             return 0;
         }
 
-        private async Task<bool> TryDispatchQueuedEventAsync(QueuedAttendanceEvent item)
+        private async Task<bool> TryDispatchQueuedEventAsync(QueuedAttendanceEvent item, CancellationToken cancellationToken)
         {
             try
             {
@@ -2490,7 +2521,7 @@ namespace EventLogOutEmployeeService
                 }
 
                 var sharePoint = sharePointIntegration.Value;
-                string? accessToken = await sharePoint.GetAccessTokenAsync(item.EventTime, item.EventId);
+                string? accessToken = await sharePoint.GetAccessTokenAsync(item.EventTime, item.EventId, cancellationToken);
                 if (string.IsNullOrEmpty(accessToken))
                 {
                     item.LastDispatchError = "Access token is null";
@@ -2626,7 +2657,7 @@ namespace EventLogOutEmployeeService
                 {
                     await sharePoint.AddRecordToSharePointAsync(
                         accessToken, item.Username, item.EventTime,
-                        item.EventId, item.EventType, item.ComputerName);
+                        item.EventId, item.EventType, item.ComputerName, cancellationToken);
 
                     await eventQueue.UpdateDispatchStateAsync(item.QueueId, rawRecordDispatched: true);
                     item.RawRecordDispatched = true;
@@ -2646,7 +2677,7 @@ namespace EventLogOutEmployeeService
 
                         await sharePoint.UpsertDailySummaryLoginAsync(
                             accessToken, item.Username, item.ComputerName,
-                            item.LoginTime ?? item.EventTime, summaryCache, item.Status);
+                            item.LoginTime ?? item.EventTime, summaryCache, item.Status, cancellationToken);
                     }
                     else
                     {
@@ -2656,12 +2687,15 @@ namespace EventLogOutEmployeeService
                             $"eventId={item.EventId} eventType='{item.EventType}'",
                             EventLogEntryType.Information, 4005);
 
+                        IReadOnlyDictionary<string, List<DateTime>> allLogonSnapshot = SnapshotAllLogon4624Index();
+
                         await sharePoint.TryUpdateDailySummaryShutdownAsync(
                             accessToken, item.Username, item.ComputerName,
                             item.ShutdownTime ?? item.EventTime,
                             item.EventId, item.EventType,
-                            allLogon4624ByDeviceWorkDate,
-                            summaryCache);
+                            allLogonSnapshot,
+                            summaryCache,
+                            cancellationToken);
                     }
 
                     await eventQueue.UpdateDispatchStateAsync(item.QueueId, summaryDispatched: true);
@@ -2872,7 +2906,7 @@ namespace EventLogOutEmployeeService
                             : new DateTime(lastEventTicks, DateTimeKind.Utc);
                         string serviceVersion = typeof(LoginLogoutMonitorService).Assembly.GetName().Version?.ToString() ?? "unknown";
 
-                        string? accessToken = await sharePointIntegration.Value.GetAccessTokenAsync(nowUtc, 0);
+                        string? accessToken = await sharePointIntegration.Value.GetAccessTokenAsync(nowUtc, 0, cancellationToken);
                         if (string.IsNullOrWhiteSpace(accessToken))
                         {
                             SafeWriteEventLogAlways("Application",
@@ -2888,7 +2922,8 @@ namespace EventLogOutEmployeeService
                                 nowUtc,
                                 queueCount,
                                 lastEventTimeUtc,
-                                serviceVersion);
+                                serviceVersion,
+                                cancellationToken);
                             SafeWriteEventLog("Application",
                                 $"[HEARTBEAT] OK: machine={Environment.MachineName} " +
                                 $"queue={queueCount} lastEvent={lastEventTimeUtc?.ToString("O") ?? "(none)"}",
@@ -3760,7 +3795,7 @@ namespace EventLogOutEmployeeService
                         continue;
                     }
 
-                    bool sent = await TryDispatchQueuedEventAsync(next);
+                    bool sent = await TryDispatchQueuedEventAsync(next, cancellationToken);
                     if (sent)
                     {
                         await eventQueue.RemoveByIdAsync(next.QueueId, cancellationToken);
@@ -4462,13 +4497,16 @@ namespace EventLogOutEmployeeService
                 }
 
                 // Track semua login untuk isNewSession check di shutdown dispatch
-                if (!allLogon4624ByDeviceWorkDate.TryGetValue(key, out var logins))
+                lock (_allLogon4624Lock)
                 {
-                    logins = new List<DateTime>();
-                    allLogon4624ByDeviceWorkDate[key] = logins;
+                    if (!allLogon4624ByDeviceWorkDate.TryGetValue(key, out var logins))
+                    {
+                        logins = new List<DateTime>();
+                        allLogon4624ByDeviceWorkDate[key] = logins;
+                    }
+                    if (!logins.Contains(eventTime))
+                        logins.Add(eventTime);
                 }
-                if (!logins.Contains(eventTime))
-                    logins.Add(eventTime);
 
                 // Prune entries lebih dari 2 hari maksimal sekali per hari.
                 // Key format: "COMPUTER::yyyy-MM-dd" — parse date dari suffix.
@@ -4488,7 +4526,8 @@ namespace EventLogOutEmployeeService
                     foreach (var k in removedKeys)
                     {
                         firstLogon4624ByDeviceWorkDate.Remove(k);
-                        allLogon4624ByDeviceWorkDate.Remove(k);
+                        lock (_allLogon4624Lock)
+                            allLogon4624ByDeviceWorkDate.Remove(k);
                         startupAnchorByDeviceWorkDate.Remove(k);
                     }
 
@@ -4534,21 +4573,24 @@ namespace EventLogOutEmployeeService
                 int loadedKeys = 0;
                 lock (firstLogonLock)
                 {
-                    foreach (var kvp in persisted)
+                    lock (_allLogon4624Lock)
                     {
-                        var deduped = new List<DateTime>();
-                        foreach (var t in kvp.Value)
+                        foreach (var kvp in persisted)
                         {
-                            if (!deduped.Contains(t))
-                                deduped.Add(t);
+                            var deduped = new List<DateTime>();
+                            foreach (var t in kvp.Value)
+                            {
+                                if (!deduped.Contains(t))
+                                    deduped.Add(t);
+                            }
+
+                            deduped.Sort();
+                            if (deduped.Count == 0)
+                                continue;
+
+                            allLogon4624ByDeviceWorkDate[kvp.Key] = deduped;
+                            loadedKeys++;
                         }
-
-                        deduped.Sort();
-                        if (deduped.Count == 0)
-                            continue;
-
-                        allLogon4624ByDeviceWorkDate[kvp.Key] = deduped;
-                        loadedKeys++;
                     }
                 }
 
@@ -4562,15 +4604,18 @@ namespace EventLogOutEmployeeService
                     {
                         string cutoffDate = DateTime.Today.AddDays(-2).ToString("yyyy-MM-dd");
                         var toRemove = new List<string>();
-                        foreach (var k in allLogon4624ByDeviceWorkDate.Keys)
+                        lock (_allLogon4624Lock)
                         {
-                            int sep = k.LastIndexOf("::", StringComparison.Ordinal);
-                            if (sep >= 0 && string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0)
-                                toRemove.Add(k);
-                        }
+                            foreach (var k in allLogon4624ByDeviceWorkDate.Keys)
+                            {
+                                int sep = k.LastIndexOf("::", StringComparison.Ordinal);
+                                if (sep >= 0 && string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0)
+                                    toRemove.Add(k);
+                            }
 
-                        foreach (string k in toRemove)
-                            allLogon4624ByDeviceWorkDate.Remove(k);
+                            foreach (string k in toRemove)
+                                allLogon4624ByDeviceWorkDate.Remove(k);
+                        }
                     }
                 }
 
@@ -4609,6 +4654,17 @@ namespace EventLogOutEmployeeService
 
         private static string BuildDeviceWorkDateKey(string computerName, string workDate)
             => $"{computerName}::{workDate}";
+
+        private IReadOnlyDictionary<string, List<DateTime>> SnapshotAllLogon4624Index()
+        {
+            lock (_allLogon4624Lock)
+            {
+                var snapshot = new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kvp in allLogon4624ByDeviceWorkDate)
+                    snapshot[kvp.Key] = new List<DateTime>(kvp.Value);
+                return snapshot;
+            }
+        }
 
         private string ResolveUsernameBySid(string username, string? sid)
         {

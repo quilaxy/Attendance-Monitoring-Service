@@ -28,8 +28,8 @@ namespace EventLogOutEmployeeService
         private static bool _hasWaitedForNetwork = false;
         private static Task? _networkWarmupTask;
         private static readonly object _networkWaitLock = new object();
-        private static DateTime _lastShutdownEventTime = DateTime.MinValue;
-        private static DateTime _lastSleepEventTime = DateTime.MinValue;
+        private static long _lastShutdownEventTicks = DateTime.MinValue.Ticks;
+        private static long _lastSleepEventTicks = DateTime.MinValue.Ticks;
         private static readonly TimeSpan ShutdownEventWindow = TimeSpan.FromMinutes(2);
         private static readonly object _configLock = new object();
         private static bool _configLoaded = false;
@@ -54,14 +54,17 @@ namespace EventLogOutEmployeeService
         public static void SetServiceStartTime(DateTime startTime) { /* reserved */ }
 
         public static void MarkShutdownEvent(DateTime eventTime)
-            => _lastShutdownEventTime = eventTime;
+            => Interlocked.Exchange(ref _lastShutdownEventTicks, eventTime.ToUniversalTime().Ticks);
 
         public static void MarkSleepEvent(DateTime eventTime)
-            => _lastSleepEventTime = eventTime;
+            => Interlocked.Exchange(ref _lastSleepEventTicks, eventTime.ToUniversalTime().Ticks);
 
         public static bool IsValidWakeEvent(DateTime eventTime)
         {
-            var diff = eventTime - _lastSleepEventTime;
+            DateTime lastSleepEventTime = new DateTime(
+                Interlocked.Read(ref _lastSleepEventTicks),
+                DateTimeKind.Utc);
+            var diff = eventTime.ToUniversalTime() - lastSleepEventTime;
             return diff.TotalHours > 0 && diff.TotalHours <= 2;
         }
 
@@ -145,14 +148,20 @@ namespace EventLogOutEmployeeService
 
         // ── Access token ──────────────────────────────────────────────────────────
 
-        public async Task<string?> GetAccessTokenAsync(DateTime eventTime, int eventId)
+        public async Task<string?> GetAccessTokenAsync(
+            DateTime eventTime,
+            int eventId,
+            CancellationToken cancellationToken = default)
         {
             bool isShutdownEvent = IsShutdownEventId(eventId);
             Task? networkWarmupTask = null;
 
             lock (_networkWaitLock)
             {
-                bool inShutdownWindow = (DateTime.Now - _lastShutdownEventTime) < ShutdownEventWindow;
+                DateTime lastShutdownEventTime = new DateTime(
+                    Interlocked.Read(ref _lastShutdownEventTicks),
+                    DateTimeKind.Utc);
+                bool inShutdownWindow = (DateTime.UtcNow - lastShutdownEventTime) < ShutdownEventWindow;
 
                 if (!_hasWaitedForNetwork)
                 {
@@ -177,7 +186,7 @@ namespace EventLogOutEmployeeService
             }
 
             if (networkWarmupTask != null)
-                await networkWarmupTask;
+                await networkWarmupTask.WaitAsync(cancellationToken);
 
             string authority = $"https://login.microsoftonline.com/{_tenantId}/oauth2/v2.0/token";
             int maxRetries = 3;
@@ -265,18 +274,23 @@ namespace EventLogOutEmployeeService
             return null;
         }
 
-        public async Task<string?> GetLatestUsernameByComputerAsync(string computerName, DateTime referenceTime)
+        public async Task<string?> GetLatestUsernameByComputerAsync(
+            string computerName,
+            DateTime referenceTime,
+            CancellationToken cancellationToken = default)
         {
-            var result = await GetLatestUsernameByComputerWithStatusAsync(computerName, referenceTime);
+            var result = await GetLatestUsernameByComputerWithStatusAsync(computerName, referenceTime, cancellationToken);
             return result.Username;
         }
 
         public async Task<(string? Username, bool NetworkUnavailable)> GetLatestUsernameByComputerWithStatusAsync(
-            string computerName, DateTime referenceTime)
+            string computerName,
+            DateTime referenceTime,
+            CancellationToken cancellationToken = default)
         {
             try
             {
-                string? accessToken = await GetAccessTokenAsync(referenceTime, 0);
+                string? accessToken = await GetAccessTokenAsync(referenceTime, 0, cancellationToken);
                 if (string.IsNullOrWhiteSpace(accessToken))
                     return (null, true);
 
@@ -292,7 +306,7 @@ namespace EventLogOutEmployeeService
                              $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=50&$orderby=fields/EventTime desc";
 
                 var request = new HttpRequestMessage(HttpMethod.Get, url);
-                var response = await client.SendAsync(request);
+                var response = await client.SendAsync(request, cancellationToken);
                 if (!response.IsSuccessStatusCode)
                     return (null, false);
 
@@ -339,7 +353,8 @@ namespace EventLogOutEmployeeService
         /// </summary>
         public async Task AddRecordToSharePointAsync(
             string accessToken, string username, DateTime eventTime,
-            int eventId, string eventType, string computerName)
+            int eventId, string eventType, string computerName,
+            CancellationToken cancellationToken = default)
         {
             bool isShutdown = IsShutdownEventId(eventId);
             int maxRetries     = isShutdown ? 2 : 3;
@@ -361,7 +376,7 @@ namespace EventLogOutEmployeeService
                     using var client = CreateGraphClient(accessToken, timeoutSeconds);
 
                     // ── Idempotency check ──────────────────────────────────────
-                    if (await RawRecordAlreadyExistsAsync(client, title, eventTime))
+                    if (await RawRecordAlreadyExistsAsync(client, title, eventTime, cancellationToken))
                     {
                         SafeWriteEventLog("Application",
                             $"[RAW] Idempotency: record already exists for title='{title}' at {eventTimeStr} — skipping insert.",
@@ -435,7 +450,8 @@ namespace EventLogOutEmployeeService
             DateTime timestampUtc,
             int queueCount,
             DateTime? lastEventTimeUtc,
-            string serviceVersion)
+            string serviceVersion,
+            CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(heartbeatListId))
                 return;
@@ -448,7 +464,7 @@ namespace EventLogOutEmployeeService
 
             var findRequest = new HttpRequestMessage(HttpMethod.Get, findUrl);
             findRequest.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
-            var findResponse = await client.SendAsync(findRequest);
+            var findResponse = await client.SendAsync(findRequest, cancellationToken);
             if (!findResponse.IsSuccessStatusCode)
             {
                 string body = await findResponse.Content.ReadAsStringAsync();
@@ -477,7 +493,7 @@ namespace EventLogOutEmployeeService
                 using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                     $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{heartbeatListId}/items/{itemId}/fields")
                 { Content = patchContent };
-                var patchResponse = await client.SendAsync(patchRequest);
+                var patchResponse = await client.SendAsync(patchRequest, cancellationToken);
                 if (!patchResponse.IsSuccessStatusCode)
                 {
                     string body = await patchResponse.Content.ReadAsStringAsync();
@@ -515,7 +531,8 @@ namespace EventLogOutEmployeeService
         public async Task UpsertDailySummaryLoginAsync(
             string accessToken, string username, string computerName, DateTime loginTime,
             SummaryCache? summaryCache = null,
-            string? status = null)
+            string? status = null,
+            CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
@@ -546,7 +563,7 @@ namespace EventLogOutEmployeeService
             if (cacheHit)
             {
                 // Query sekali untuk tahu storedLoginTime — hanya dilakukan kalau cache hit.
-                var cacheCheckItems = await FindSummaryItemWithRetryAsync(client, summaryKey);
+                var cacheCheckItems = await FindSummaryItemWithRetryAsync(client, summaryKey, cancellationToken);
                 if (cacheCheckItems != null && cacheCheckItems.Count > 0)
                 {
                     var ccFields = cacheCheckItems[0]["fields"] as JObject;
@@ -572,7 +589,7 @@ namespace EventLogOutEmployeeService
                 // Fall through ke existingItems block untuk create ulang.
             }
 
-            var existingItems = await FindSummaryItemWithRetryAsync(client, summaryKey);
+            var existingItems = await FindSummaryItemWithRetryAsync(client, summaryKey, cancellationToken);
 
             if (existingItems != null && existingItems.Count > 0)
             {
@@ -607,7 +624,7 @@ namespace EventLogOutEmployeeService
 
                         using var delRequest = new HttpRequestMessage(HttpMethod.Delete,
                             $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{dupId}");
-                        await client.SendAsync(delRequest); // best-effort, ignore failure
+                        await client.SendAsync(delRequest, cancellationToken); // best-effort, ignore failure
                     }
                 }
 
@@ -652,7 +669,7 @@ namespace EventLogOutEmployeeService
                     using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                         $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
                     { Content = patchContent };
-                    var patchResponse = await client.SendAsync(patchRequest);
+                    var patchResponse = await client.SendAsync(patchRequest, cancellationToken);
                     if (!patchResponse.IsSuccessStatusCode)
                     {
                         string body = await patchResponse.Content.ReadAsStringAsync();
@@ -674,7 +691,7 @@ namespace EventLogOutEmployeeService
                     using var statusPatchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                         $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
                     { Content = statusPatchContent };
-                    var statusPatchResponse = await client.SendAsync(statusPatchRequest);
+                    var statusPatchResponse = await client.SendAsync(statusPatchRequest, cancellationToken);
                     if (!statusPatchResponse.IsSuccessStatusCode)
                     {
                         string body = await statusPatchResponse.Content.ReadAsStringAsync();
@@ -801,7 +818,8 @@ namespace EventLogOutEmployeeService
             string accessToken, string username, string computerName,
             DateTime shutdownTime, int eventId, string eventType,
             IReadOnlyDictionary<string, List<DateTime>> allLogon4624Index,
-            SummaryCache? summaryCache = null)
+            SummaryCache? summaryCache = null,
+            CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(_summaryListId)) return;
 
@@ -811,7 +829,8 @@ namespace EventLogOutEmployeeService
                 EventLogEntryType.Information, 3010);
 
             using var client = CreateGraphClient(accessToken, 90); // 90s — retry bisa butuh ~21s
-            var summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime, summaryCache);
+            var summaryItem = await FindSummaryItemForShutdownAsync(
+                client, computerName, username, shutdownTime, summaryCache, cancellationToken);
             if (summaryItem == null)
             {
                 // Fix B: row tidak ditemukan — kemungkinan 4624 tidak ter-capture karena Security log
@@ -832,7 +851,8 @@ namespace EventLogOutEmployeeService
                     await CreateEmptySummaryRowAsync(client, username, shutdownTime, summaryCache);
 
                     // Fetch row yang baru dibuat untuk lanjutkan update ShutdownTime
-                    summaryItem = await FindSummaryItemForShutdownAsync(client, computerName, username, shutdownTime, summaryCache);
+                    summaryItem = await FindSummaryItemForShutdownAsync(
+                        client, computerName, username, shutdownTime, summaryCache, cancellationToken);
                 }
                 catch (Exception ex)
                 {
@@ -979,7 +999,7 @@ namespace EventLogOutEmployeeService
             using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                 $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
             { Content = patchContent };
-            var patchResult = await client.SendAsync(patchRequest);
+            var patchResult = await client.SendAsync(patchRequest, cancellationToken);
             if (!patchResult.IsSuccessStatusCode)
             {
                 string body = await patchResult.Content.ReadAsStringAsync();
@@ -1264,7 +1284,8 @@ namespace EventLogOutEmployeeService
 
         private async Task<JToken?> FindSummaryItemForShutdownAsync(
             HttpClient client, string computerName, string username, DateTime shutdownTime,
-            SummaryCache? summaryCache = null)
+            SummaryCache? summaryCache = null,
+            CancellationToken cancellationToken = default)
         {
             // Prefer same-day summary row. Pakai retry karena shutdown bisa di-dispatch
             // sebelum login row ter-index di SharePoint (eventual consistency).
@@ -1275,8 +1296,8 @@ namespace EventLogOutEmployeeService
             // (kemungkinan besar langsung ketemu).
             bool inCache = summaryCache != null && await summaryCache.ContainsAsync(todayKey);
             var todayItems = inCache
-                ? await FindSummaryItemAsync(client, todayKey)          // cache hint: cukup 1 attempt
-                : await FindSummaryItemWithRetryAsync(client, todayKey); // tidak di cache: retry penuh
+                ? await FindSummaryItemAsync(client, todayKey, cancellationToken)          // cache hint: cukup 1 attempt
+                : await FindSummaryItemWithRetryAsync(client, todayKey, cancellationToken); // tidak di cache: retry penuh
 
             // Kalau 1 attempt gagal tapi cache bilang ada, coba retry juga
             if (inCache && (todayItems == null || todayItems.Count == 0))
@@ -1284,7 +1305,7 @@ namespace EventLogOutEmployeeService
                 SafeWriteEventLog("Application",
                     $"[DBG-Summary] FindSummaryItemForShutdown: cache hit but not found on first attempt, retrying key={todayKey}",
                     EventLogEntryType.Warning, 3019);
-                todayItems = await FindSummaryItemWithRetryAsync(client, todayKey);
+                todayItems = await FindSummaryItemWithRetryAsync(client, todayKey, cancellationToken);
             }
 
             if (todayItems != null && todayItems.Count > 0)
@@ -1294,11 +1315,11 @@ namespace EventLogOutEmployeeService
             string yesterdayKey = BuildSummaryKey(username, shutdownTime.ToLocalTime().AddDays(-1).ToString("yyyy-MM-dd"));
             bool yesterdayInCache = summaryCache != null && await summaryCache.ContainsAsync(yesterdayKey);
             var yesterdayItems = yesterdayInCache
-                ? await FindSummaryItemAsync(client, yesterdayKey)
-                : await FindSummaryItemWithRetryAsync(client, yesterdayKey);
+                ? await FindSummaryItemAsync(client, yesterdayKey, cancellationToken)
+                : await FindSummaryItemWithRetryAsync(client, yesterdayKey, cancellationToken);
 
             if (yesterdayInCache && (yesterdayItems == null || yesterdayItems.Count == 0))
-                yesterdayItems = await FindSummaryItemWithRetryAsync(client, yesterdayKey);
+                yesterdayItems = await FindSummaryItemWithRetryAsync(client, yesterdayKey, cancellationToken);
 
             if (yesterdayItems == null || yesterdayItems.Count == 0)
                 return null;
@@ -1337,7 +1358,10 @@ namespace EventLogOutEmployeeService
             return canonical;
         }
 
-        private async Task<JArray?> FindSummaryItemAsync(HttpClient client, string summaryKey)
+        private async Task<JArray?> FindSummaryItemAsync(
+            HttpClient client,
+            string summaryKey,
+            CancellationToken cancellationToken = default)
         {
             // summaryKey format: "Username\yyyy-MM-dd"
             // Tidak bisa filter by Title langsung karena backslash (\) di OData filter
@@ -1361,7 +1385,7 @@ namespace EventLogOutEmployeeService
 
             var request = new HttpRequestMessage(HttpMethod.Get, findUrl);
             request.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
-            var findResponse = await client.SendAsync(request);
+            var findResponse = await client.SendAsync(request, cancellationToken);
             if (!findResponse.IsSuccessStatusCode)
             {
                 string errBody = await findResponse.Content.ReadAsStringAsync();
@@ -1388,13 +1412,16 @@ namespace EventLogOutEmployeeService
         /// menyebabkan row yang baru di-insert belum muncul di query berikutnya.
         /// Retry 3x dengan delay 3s, 6s, 12s (total max ~21 detik).
         /// </summary>
-        private async Task<JArray?> FindSummaryItemWithRetryAsync(HttpClient client, string summaryKey)
+        private async Task<JArray?> FindSummaryItemWithRetryAsync(
+            HttpClient client,
+            string summaryKey,
+            CancellationToken cancellationToken = default)
         {
             int[] delaysMs = { 3000, 6000, 12000 };
 
             for (int attempt = 0; attempt <= delaysMs.Length; attempt++)
             {
-                var result = await FindSummaryItemAsync(client, summaryKey);
+                var result = await FindSummaryItemAsync(client, summaryKey, cancellationToken);
                 if (result != null && result.Count > 0)
                     return result;
 
@@ -1403,7 +1430,7 @@ namespace EventLogOutEmployeeService
                     SafeWriteEventLog("Application",
                         $"[DBG-Summary] FindSummaryItemWithRetry: attempt={attempt + 1} not found for key={summaryKey}, retrying in {delaysMs[attempt]}ms",
                         EventLogEntryType.Information, 3008);
-                    await Task.Delay(delaysMs[attempt]);
+                    await Task.Delay(delaysMs[attempt], cancellationToken);
                 }
             }
 
@@ -1413,7 +1440,11 @@ namespace EventLogOutEmployeeService
             return null;
         }
 
-        private async Task<bool> RawRecordAlreadyExistsAsync(HttpClient client, string title, DateTime eventTime)
+        private async Task<bool> RawRecordAlreadyExistsAsync(
+            HttpClient client,
+            string title,
+            DateTime eventTime,
+            CancellationToken cancellationToken = default)
         {
             // Title mengandung backslash → OData filter HTTP 400.
             // Filter pakai EventTime window saja — sudah cukup unik karena
@@ -1429,7 +1460,7 @@ namespace EventLogOutEmployeeService
 
             var request = new HttpRequestMessage(HttpMethod.Get, checkUrl);
             request.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
-            var checkResponse = await client.SendAsync(request);
+            var checkResponse = await client.SendAsync(request, cancellationToken);
             if (!checkResponse.IsSuccessStatusCode)
                 return false;
 
