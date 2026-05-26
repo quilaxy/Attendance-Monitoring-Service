@@ -114,6 +114,9 @@ namespace EventLogOutEmployeeService
         private readonly SummaryCache summaryCache =
             new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
 
+        private readonly PersistentLogonIndex allLogon4624IndexStore =
+            new PersistentLogonIndex(Path.Combine(DataDirectory, "all-logon-4624-index.json"));
+
         // Opsi 3: simpan raw security event ke disk sebelum diproses,
         // sehingga kalau Security log ter-rotate/clear sebelum replay, data tidak hilang.
         private readonly RawEventStore rawEventStore =
@@ -310,6 +313,7 @@ namespace EventLogOutEmployeeService
                             // Group Policy yang me-reset konfigurasi ini langsung diperbaiki.
                             EnsureServiceResilience();
 
+                            LoadPersistedAllLogon4624IndexAsync(ct).GetAwaiter().GetResult();
                             PrimeFirstLogonIndexFromQueueAsync(ct).GetAwaiter().GetResult();
                             RetryPendingQueueOnStartupAsync(ct).GetAwaiter().GetResult();
 
@@ -2669,6 +2673,7 @@ namespace EventLogOutEmployeeService
                         try
                         {
                             await summaryCache.CleanupOldEntriesAsync(cancellationToken);
+                            await allLogon4624IndexStore.CleanupOldEntriesAsync(DateTime.Today.AddDays(-2), cancellationToken);
                             await rawEventStore.CleanupOldDatesAsync(eventQueue, cancellationToken);
                             SafeWriteEventLog("Application",
                                 $"[CLEANUP] Local cleanup done for {now.Date:yyyy-MM-dd}.",
@@ -4358,6 +4363,7 @@ namespace EventLogOutEmployeeService
         {
             string workDate = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
             string key = BuildDeviceWorkDateKey(computerName, workDate);
+            List<string>? removedKeys = null;
 
             lock (firstLogonLock)
             {
@@ -4385,21 +4391,105 @@ namespace EventLogOutEmployeeService
                 if (firstLogon4624ByDeviceWorkDate.Count > 50)
                 {
                     string cutoffDate = DateTime.Today.AddDays(-2).ToString("yyyy-MM-dd");
-                    var toRemove = new List<string>();
+                    removedKeys = new List<string>();
                     foreach (var k in firstLogon4624ByDeviceWorkDate.Keys)
                     {
                         // Key format: "{computerName}::{yyyy-MM-dd}"
                         int sep = k.LastIndexOf("::", StringComparison.Ordinal);
                         if (sep >= 0 && string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0)
-                            toRemove.Add(k);
+                            removedKeys.Add(k);
                     }
-                    foreach (var k in toRemove)
+                    foreach (var k in removedKeys)
                     {
                         firstLogon4624ByDeviceWorkDate.Remove(k);
                         allLogon4624ByDeviceWorkDate.Remove(k);
                         startupAnchorByDeviceWorkDate.Remove(k);
                     }
                 }
+            }
+
+            _ = PersistAllLogon4624IndexAsync(key, eventTime, removedKeys);
+        }
+
+        private async Task PersistAllLogon4624IndexAsync(
+            string key,
+            DateTime eventTimeUtc,
+            IReadOnlyCollection<string>? keysToRemove = null)
+        {
+            try
+            {
+                await allLogon4624IndexStore.UpdateAsync(
+                    key,
+                    eventTimeUtc,
+                    keysToRemove);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[INDEX-4624] Failed to persist allLogon4624 index update: {ex.Message}",
+                    EventLogEntryType.Warning, 1056);
+            }
+        }
+
+        private async Task LoadPersistedAllLogon4624IndexAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                Dictionary<string, List<DateTime>> persisted =
+                    await allLogon4624IndexStore.LoadAsync(cancellationToken);
+
+                int loadedKeys = 0;
+                lock (firstLogonLock)
+                {
+                    foreach (var kvp in persisted)
+                    {
+                        var deduped = new List<DateTime>();
+                        foreach (var t in kvp.Value)
+                        {
+                            if (!deduped.Contains(t))
+                                deduped.Add(t);
+                        }
+
+                        deduped.Sort();
+                        if (deduped.Count == 0)
+                            continue;
+
+                        allLogon4624ByDeviceWorkDate[kvp.Key] = deduped;
+                        loadedKeys++;
+                    }
+                }
+
+                int removed = await allLogon4624IndexStore.CleanupOldEntriesAsync(
+                    DateTime.Today.AddDays(-2),
+                    cancellationToken);
+
+                if (removed > 0)
+                {
+                    lock (firstLogonLock)
+                    {
+                        string cutoffDate = DateTime.Today.AddDays(-2).ToString("yyyy-MM-dd");
+                        var toRemove = new List<string>();
+                        foreach (var k in allLogon4624ByDeviceWorkDate.Keys)
+                        {
+                            int sep = k.LastIndexOf("::", StringComparison.Ordinal);
+                            if (sep >= 0 && string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0)
+                                toRemove.Add(k);
+                        }
+
+                        foreach (string k in toRemove)
+                            allLogon4624ByDeviceWorkDate.Remove(k);
+                    }
+                }
+
+                SafeWriteEventLog("Application",
+                    $"[INDEX-4624] Loaded persisted allLogon4624 index: keys={loadedKeys}.",
+                    EventLogEntryType.Information, 1055);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[INDEX-4624] Failed to load persisted allLogon4624 index: {ex.Message}",
+                    EventLogEntryType.Warning, 1055);
             }
         }
 
