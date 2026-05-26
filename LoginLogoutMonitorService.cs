@@ -113,8 +113,7 @@ namespace EventLogOutEmployeeService
         private readonly PersistentEventQueue eventQueue =
             new PersistentEventQueue(Path.Combine(DataDirectory, "queue"));
 
-        private readonly SummaryCache summaryCache =
-            new SummaryCache(Path.Combine(DataDirectory, "summary-cache.json"));
+        private readonly SummaryCache summaryCache;
 
         private readonly PersistentLogonIndex allLogon4624IndexStore =
             new PersistentLogonIndex(Path.Combine(DataDirectory, "all-logon-4624-index.json"));
@@ -158,6 +157,9 @@ namespace EventLogOutEmployeeService
             _adminCorrelationService = new AdminSessionCorrelationService(rawEventStore, WriteAdminCorrelationLog);
             _adminCorrelationService.InitBootSessionId(DataDirectory);
             _checkpointService = new CheckpointService(DataDirectory, MaxReplayLookback, SafeWriteEventLog);
+            summaryCache = new SummaryCache(
+                Path.Combine(DataDirectory, "summary-cache.json"),
+                (msg, type, id) => SafeWriteEventLog("Attendance-Service", msg, type, id));
 
             // Allow OnShutdown() to be called during system shutdown/restart.
             // Without this, ServiceBase never invokes OnShutdown() and the checkpoint is lost.

@@ -31,6 +31,7 @@ namespace EventLogOutEmployeeService
     public class SummaryCache
     {
         private readonly string filePath;
+        private readonly Action<string, EventLogEntryType, int> _logAction;
         private readonly SemaphoreSlim fileLock = new SemaphoreSlim(1, 1);
 
         /// <summary>
@@ -42,9 +43,11 @@ namespace EventLogOutEmployeeService
         /// </summary>
         private const int RetentionMonths = 6; // must match SharePointIntegration.CleanupOldRecordsAsync
 
-        public SummaryCache(string filePath)
+        public SummaryCache(string filePath,
+            Action<string, EventLogEntryType, int>? logAction = null)
         {
             this.filePath = filePath;
+            _logAction = logAction ?? ((msg, type, id) => { });
             EnsureFile();
         }
 
@@ -168,12 +171,12 @@ namespace EventLogOutEmployeeService
                 File.Move(tempPath, filePath);
         }
 
-        private static void SafeLog(string message, EventLogEntryType type, int eventId)
+        private void SafeLog(string message, EventLogEntryType type, int eventId)
         {
             // 5006 (cleanup detail) adalah verbose-only
             if (!LoginLogoutMonitorService.VerboseLogging && eventId == 5006)
                 return;
-            try { EventLog.WriteEntry("Application", message, type, eventId); }
+            try { _logAction(message, type, eventId); }
             catch { }
         }
 
