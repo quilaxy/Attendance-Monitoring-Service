@@ -47,6 +47,7 @@ namespace EventLogOutEmployeeService
             new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, (string Username, DateTime EventTime)> firstLogon4624ByDeviceWorkDate =
             new Dictionary<string, (string Username, DateTime EventTime)>(StringComparer.OrdinalIgnoreCase);
+        private DateTime _lastDictPruneDate = DateTime.MinValue.Date;
 
         // Semua 4624 per computer per hari — dipakai untuk isNewSession check di shutdown dispatch.
         // Berbeda dari firstLogon4624ByDeviceWorkDate yang hanya simpan earliest login,
@@ -69,6 +70,7 @@ namespace EventLogOutEmployeeService
         private Task? heartbeatTask;
         private Task? supervisorTask;
         private Task? watchdogTask;
+        private Timer? _supervisorWatchdogTimer;
 
         private CancellationTokenSource? _cleanupTaskCts;
         private CancellationTokenSource? _queueTaskCts;
@@ -720,7 +722,8 @@ namespace EventLogOutEmployeeService
             // RAW insert success detail
             4020, 4021, 4022, 4025,
             // Cleanup progress detail
-            5001, 5002, 5003, 5006,
+            // 5007 = dictionary prune info
+            5001, 5002, 5003, 5006, 5007,
             // Catatan: 0 (start), 1048 (ready), 1050 (OnStop), 1051 (OnShutdown)
             // sengaja TIDAK ada di sini — lifecycle events selalu tampil.
         };
@@ -1384,6 +1387,56 @@ namespace EventLogOutEmployeeService
                 if (IsTaskStopped(watchdogTask))
                     watchdogTask = Task.Run(() => InternalWatchdogTask(cancellationToken), cancellationToken);
             }
+
+            StartSupervisorWatchdogTimer(cancellationToken);
+        }
+
+        private void StartSupervisorWatchdogTimer(CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            _supervisorWatchdogTimer?.Dispose();
+            _supervisorWatchdogTimer = new Timer(_ =>
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
+                try
+                {
+                    lock (_backgroundTaskLock)
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                            return;
+
+                        if (IsTaskStopped(supervisorTask))
+                        {
+                            SafeWriteEventLog("Application",
+                                "[SUPERVISOR-GUARD] supervisorTask stopped — restarting.",
+                                EventLogEntryType.Warning, 1091);
+                            supervisorTask = Task.Run(
+                                () => BackgroundTaskSupervisorLoop(cancellationToken),
+                                cancellationToken);
+                        }
+
+                        if (IsTaskStopped(watchdogTask))
+                        {
+                            SafeWriteEventLog("Application",
+                                "[SUPERVISOR-GUARD] watchdogTask stopped — restarting.",
+                                EventLogEntryType.Warning, 1091);
+                            watchdogTask = Task.Run(
+                                () => InternalWatchdogTask(cancellationToken),
+                                cancellationToken);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[SUPERVISOR-GUARD] Timer check failed: {ex.Message}",
+                        EventLogEntryType.Warning, 1093);
+                }
+            }, null, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
         }
 
         private static bool IsTaskStopped(Task? task)
@@ -1782,6 +1835,8 @@ namespace EventLogOutEmployeeService
                 CancelTask(ref _securityHealthTaskCts);
                 CancelTask(ref _systemHealthTaskCts);
                 CancelTask(ref _heartbeatTaskCts);
+                _supervisorWatchdogTimer?.Dispose();
+                _supervisorWatchdogTimer = null;
 
                 cleanupTask = null;
                 queueTask = null;
@@ -1927,7 +1982,11 @@ namespace EventLogOutEmployeeService
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(checkIntervalSeconds), cancellationToken);
+                    bool useFastRetry = _resubscribeFailed;
+                    int delaySeconds = useFastRetry ? 5 : checkIntervalSeconds;
+                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
+                    if (useFastRetry)
+                        _resubscribeFailed = false;
 
                     Interlocked.Exchange(ref _lastSecurityHealthHeartbeatUtc, DateTime.UtcNow.Ticks);
 
@@ -2086,7 +2145,16 @@ namespace EventLogOutEmployeeService
             }
 
             if (!resubscribed)
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH] All {maxAttempts} re-subscribe attempts failed for Security log. " +
+                    "Will retry at next health check cycle (~30s). Consider checking EventLog permissions.",
+                    EventLogEntryType.Error, 1085);
+                _resubscribeFailed = true;
                 return;
+            }
+
+            _resubscribeFailed = false;
 
             // Mini-replay: tangkap event yang missed selama subscription mati.
             // Security log sebagai sumber utama, RawEventStore sebagai fallback
@@ -2132,7 +2200,13 @@ namespace EventLogOutEmployeeService
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromMinutes(checkIntervalMinutes), cancellationToken);
+                    bool useFastRetry = _systemResubscribeFailed;
+                    TimeSpan delay = useFastRetry
+                        ? TimeSpan.FromSeconds(5)
+                        : TimeSpan.FromMinutes(checkIntervalMinutes);
+                    await Task.Delay(delay, cancellationToken);
+                    if (useFastRetry)
+                        _systemResubscribeFailed = false;
 
                     Interlocked.Exchange(ref _lastSystemHealthHeartbeatUtc, DateTime.UtcNow.Ticks);
 
@@ -2286,7 +2360,16 @@ namespace EventLogOutEmployeeService
             }
 
             if (!resubscribed)
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH-SYS] All {maxAttempts} re-subscribe attempts failed for System log. " +
+                    "Will retry at next health check cycle (~10m). Consider checking EventLog permissions.",
+                    EventLogEntryType.Error, 1090);
+                _systemResubscribeFailed = true;
                 return false;
+            }
+
+            _systemResubscribeFailed = false;
 
             try
             {
@@ -2842,6 +2925,7 @@ namespace EventLogOutEmployeeService
         private long _lastSecurityEventTicksUtc   = DateTime.MinValue.Ticks;
         private long _subscriptionEnabledTicksUtc = DateTime.MinValue.Ticks;
         private long _securityProbeEpochTicks     = DateTime.MinValue.Ticks;
+        private volatile bool _resubscribeFailed = false;
 
         // ── System log subscription health check ────────────────────────────────
         // _lastSystemEventTicksUtc: kapan terakhir OnSystemEventWritten dipanggil.
@@ -2850,6 +2934,7 @@ namespace EventLogOutEmployeeService
         private long _lastSystemEventTicksUtc          = DateTime.UtcNow.Ticks;
         private int _lastObservedSystemRecordId        = 0;
         private long _systemSubscriptionEnabledTicksUtc = DateTime.MinValue.Ticks;
+        private volatile bool _systemResubscribeFailed = false;
 
         // ── Background task heartbeats ──────────────────────────────────────────
         private long _lastQueueProcessorHeartbeatUtc = DateTime.MinValue.Ticks;
@@ -4383,27 +4468,33 @@ namespace EventLogOutEmployeeService
                 if (!logins.Contains(eventTime))
                     logins.Add(eventTime);
 
-                // Prune entries lebih dari 2 hari — dictionary ini tidak pernah di-clear
-                // sehingga bisa tumbuh tanpa batas pada service yang jalan berbulan-bulan.
+                // Prune entries lebih dari 2 hari maksimal sekali per hari.
                 // Key format: "COMPUTER::yyyy-MM-dd" — parse date dari suffix.
-                // Lakukan prune berkala hanya kalau dictionary sudah cukup besar (>50 entries)
-                // agar tidak ada overhead per-event saat jumlah entry masih kecil.
-                if (firstLogon4624ByDeviceWorkDate.Count > 50)
+                if (DateTime.Today > _lastDictPruneDate)
                 {
+                    _lastDictPruneDate = DateTime.Today;
                     string cutoffDate = DateTime.Today.AddDays(-2).ToString("yyyy-MM-dd");
-                    removedKeys = new List<string>();
-                    foreach (var k in firstLogon4624ByDeviceWorkDate.Keys)
-                    {
-                        // Key format: "{computerName}::{yyyy-MM-dd}"
-                        int sep = k.LastIndexOf("::", StringComparison.Ordinal);
-                        if (sep >= 0 && string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0)
-                            removedKeys.Add(k);
-                    }
+                    removedKeys = firstLogon4624ByDeviceWorkDate.Keys
+                        .Where(k =>
+                        {
+                            int sep = k.LastIndexOf("::", StringComparison.Ordinal);
+                            return sep >= 0 &&
+                                   string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0;
+                        })
+                        .ToList();
+
                     foreach (var k in removedKeys)
                     {
                         firstLogon4624ByDeviceWorkDate.Remove(k);
                         allLogon4624ByDeviceWorkDate.Remove(k);
                         startupAnchorByDeviceWorkDate.Remove(k);
+                    }
+
+                    if (removedKeys.Count > 0)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DICT-PRUNE] Pruned {removedKeys.Count} stale workDate entries.",
+                            EventLogEntryType.Information, 5007);
                     }
                 }
             }
