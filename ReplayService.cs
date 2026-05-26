@@ -26,9 +26,9 @@ namespace EventLogOutEmployeeService
 
         /// <summary>
         /// True selama ReplayMissedEventsFromCheckpoint() berjalan.
-        /// Dipakai oleh live 4634 path di LoginLogoutMonitorService untuk mendeteksi
-        /// startup warmup dan mem-defer pemrosesan 4634 ke retry queue.
-        /// Volatile — aman dibaca dari thread manapun tanpa lock.
+        /// Dibaca oleh live 4634 warmup guard di LoginLogoutMonitorService
+        /// untuk menentukan apakah event perlu di-defer ke retry queue.
+        /// volatile — thread-safe tanpa lock.
         /// </summary>
         public bool IsReplayInProgress => replayInProgress;
 
