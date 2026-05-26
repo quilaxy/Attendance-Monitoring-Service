@@ -813,6 +813,9 @@ namespace EventLogOutEmployeeService
             2013,
             // Debug RawEventStore fallback — [DBG-4624], [DBG-GetMRU], [DBG-42], [DBG-4634]
             2028, 2031, 2032, 2033,
+            // Admin correlation process detail (info-only)
+            // 2043 (warning: lookup failure) sengaja TIDAK di sini agar selalu tampil.
+            2041, 2042,
             // 4634 deferred retry pipeline — [4634-RETRY] / [4634-FILTER]
             // 2050 = deferring (info, verbose — terjadi setiap 4634 saat startup)
             // 2051 = queue full warning → TIDAK di sini (selalu tampil)
