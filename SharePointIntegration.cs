@@ -40,6 +40,41 @@ namespace EventLogOutEmployeeService
         private static string _cachedListId = string.Empty;
         private static string? _cachedSummaryListId = null;
 
+        // ── TASK 1: OAuth token cache ─────────────────────────────────────────────
+        // Caches the bearer token for its full validity window minus a 60-second
+        // refresh buffer. Prevents one Azure AD round-trip per dispatch call, which
+        // during replay recovery would otherwise cause throttling and queue backlog.
+        // Thread-safe: _tokenCacheLock serialises the check-and-refresh critical section
+        // so concurrent dispatchers never trigger a thundering-herd re-fetch.
+        private static string? _cachedAccessToken = null;
+        private static DateTime _tokenExpiry = DateTime.MinValue;
+        private static readonly SemaphoreSlim _tokenCacheLock = new SemaphoreSlim(1, 1);
+        private static readonly TimeSpan TokenRefreshBuffer = TimeSpan.FromSeconds(60);
+
+        // ── TASK 2: note ──────────────────────────────────────────────────────────
+        // Connection pooling is handled via static SocketsHttpHandler instances
+        // (_graphHandler, _tokenHandler) defined near CreateGraphClient below.
+        // The static HttpClient fields originally placed here have been removed
+        // in favour of the disposeHandler:false wrapper pattern which allows
+        // per-call Timeout and DefaultRequestHeaders without concurrency races.
+
+        // ── TASK 3 & 4: Heartbeat alert status ───────────────────────────────────
+        // Written into the SharePoint heartbeat row so operators get a semantic signal
+        // instead of a raw QueueCount integer.
+        public enum AlertStatus { OK, QueueBacklog, CriticalBacklog }
+
+        // Thresholds for queue-backlog escalation.
+        private const int BacklogQueueThreshold = 50;                          // items
+        private static readonly TimeSpan BacklogAgeWarning  = TimeSpan.FromHours(24);
+        private static readonly TimeSpan BacklogAgeCritical = TimeSpan.FromHours(72);
+
+        // Escalation cooldown — suppresses repeated Event Log entries for the same
+        // alert status. Downgrade to OK always logs immediately.
+        private static readonly TimeSpan EscalationCooldown = TimeSpan.FromHours(1);
+        private static AlertStatus _lastEscalationStatus = AlertStatus.OK;
+        private static DateTime   _lastEscalationLogTimeUtc = DateTime.MinValue;
+        private static readonly object _escalationCooldownLock = new object();
+
         // ── Static helpers ────────────────────────────────────────────────────────
 
         /// <summary>
@@ -148,7 +183,62 @@ namespace EventLogOutEmployeeService
 
         // ── Access token ──────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Returns a valid Graph API bearer token, reusing the cached token when it has
+        /// more than <see cref="TokenRefreshBuffer"/> remaining.
+        ///
+        /// Thread-safety: <see cref="_tokenCacheLock"/> (SemaphoreSlim) serialises the
+        /// check-and-refresh section so concurrent callers during replay recovery never
+        /// trigger a thundering-herd re-fetch against Azure AD.
+        ///
+        /// The existing network warmup, retry, and AAD error-code logic is preserved
+        /// unchanged inside the fetch path; the cache is purely additive.
+        /// </summary>
         public async Task<string?> GetAccessTokenAsync(
+            DateTime eventTime,
+            int eventId,
+            CancellationToken cancellationToken = default)
+        {
+            // ── Fast-path: valid cached token ──────────────────────────────────────
+            // Double-checked locking pattern. The first read is un-guarded for throughput
+            // in the common case (token valid); the lock is acquired only when the token
+            // appears expired or absent.
+            if (_cachedAccessToken != null && DateTime.UtcNow < _tokenExpiry - TokenRefreshBuffer)
+                return _cachedAccessToken;
+
+            await _tokenCacheLock.WaitAsync(cancellationToken);
+            try
+            {
+                // Re-check inside the lock — another waiter may have refreshed while we waited.
+                if (_cachedAccessToken != null && DateTime.UtcNow < _tokenExpiry - TokenRefreshBuffer)
+                    return _cachedAccessToken;
+
+                string? freshToken = await FetchAccessTokenAsync(eventTime, eventId, cancellationToken);
+                if (!string.IsNullOrWhiteSpace(freshToken))
+                {
+                    _cachedAccessToken = freshToken;
+                    // Azure AD client-credentials tokens have a 3600-second default lifetime.
+                    // We record expiry conservatively as now + 3600s; the RefreshBuffer ensures
+                    // we re-fetch 60s before that boundary.
+                    _tokenExpiry = DateTime.UtcNow.AddSeconds(3600);
+                    SafeWriteEventLog("Application",
+                        "[TOKEN] Token refreshed and cached. Expiry window reset.",
+                        EventLogEntryType.Information, 4010);
+                }
+                return freshToken;
+            }
+            finally
+            {
+                _tokenCacheLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Internal: performs the actual Azure AD token fetch.
+        /// Contains all existing network-wait, retry, and AAD-error logic unchanged.
+        /// Not called directly — always goes through <see cref="GetAccessTokenAsync"/>.
+        /// </summary>
+        private async Task<string?> FetchAccessTokenAsync(
             DateTime eventTime,
             int eventId,
             CancellationToken cancellationToken = default)
@@ -196,12 +286,17 @@ namespace EventLogOutEmployeeService
             {
                 try
                 {
-                    using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+                    // TASK 2: Use _tokenHandler (shared SocketsHttpHandler) to avoid
+                    // socket exhaustion during replay. disposeHandler:false preserves the pool.
+                    using var tokenClient = new HttpClient(_tokenHandler, disposeHandler: false)
+                    {
+                        Timeout = TimeSpan.FromSeconds(30)
+                    };
                     var body = new StringContent(
                         $"grant_type=client_credentials&client_id={_clientId}&client_secret={_clientSecret}&scope=https://graph.microsoft.com/.default",
                         Encoding.UTF8, "application/x-www-form-urlencoded");
 
-                    var response = await client.PostAsync(authority, body);
+                    var response = await tokenClient.PostAsync(authority, body, cancellationToken);
                     if (response.IsSuccessStatusCode)
                     {
                         string responseBody = await response.Content.ReadAsStringAsync();
@@ -443,6 +538,40 @@ namespace EventLogOutEmployeeService
 
         // ── Heartbeat list ────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Computes the <see cref="AlertStatus"/> for the current heartbeat snapshot.
+        ///
+        /// Rules (evaluated in priority order):
+        ///   • <c>CriticalBacklog</c> : oldest queued item age ≥ 72 h
+        ///   • <c>QueueBacklog</c>    : queue count > <see cref="BacklogQueueThreshold"/>
+        ///                              OR oldest queued item age ≥ 24 h
+        ///   • <c>OK</c>              : all other cases
+        ///
+        /// <paramref name="lastEventTimeUtc"/> is used as a proxy for "oldest item age"
+        /// (the time since the last enqueued login/logout event that has not yet been
+        /// dispatched). This avoids adding a new method to PersistentEventQueue while
+        /// still giving a meaningful staleness signal.
+        /// </summary>
+        public static AlertStatus ComputeAlertStatus(
+            int queueCount,
+            DateTime? lastEventTimeUtc)
+        {
+            if (queueCount == 0)
+                return AlertStatus.OK;
+
+            TimeSpan oldestAge = lastEventTimeUtc.HasValue
+                ? DateTime.UtcNow - lastEventTimeUtc.Value
+                : TimeSpan.Zero;
+
+            if (oldestAge >= BacklogAgeCritical)
+                return AlertStatus.CriticalBacklog;
+
+            if (queueCount > BacklogQueueThreshold || oldestAge >= BacklogAgeWarning)
+                return AlertStatus.QueueBacklog;
+
+            return AlertStatus.OK;
+        }
+
         public async Task UpsertHeartbeatAsync(
             string accessToken,
             string heartbeatListId,
@@ -456,6 +585,50 @@ namespace EventLogOutEmployeeService
             if (string.IsNullOrWhiteSpace(heartbeatListId))
                 return;
 
+            // ── TASK 3 & 4: Compute alert status ──────────────────────────────────
+            AlertStatus alertStatus = ComputeAlertStatus(queueCount, lastEventTimeUtc);
+            string alertStatusStr   = alertStatus.ToString();
+
+            // Log escalation events with cooldown to prevent spam.
+            // Always log when transitioning back to OK (downgrade is always significant).
+            bool shouldLog = false;
+            lock (_escalationCooldownLock)
+            {
+                bool statusChanged  = alertStatus != _lastEscalationStatus;
+                bool cooldownElapsed = (DateTime.UtcNow - _lastEscalationLogTimeUtc) >= EscalationCooldown;
+
+                if (statusChanged || (alertStatus != AlertStatus.OK && cooldownElapsed))
+                {
+                    shouldLog = true;
+                    _lastEscalationStatus   = alertStatus;
+                    _lastEscalationLogTimeUtc = DateTime.UtcNow;
+                }
+            }
+
+            if (shouldLog)
+            {
+                string oldestAgeDesc = lastEventTimeUtc.HasValue
+                    ? $"{(DateTime.UtcNow - lastEventTimeUtc.Value).TotalHours:F1}h"
+                    : "n/a";
+
+                if (alertStatus == AlertStatus.CriticalBacklog)
+                    SafeWriteEventLog("Application",
+                        $"[HEARTBEAT] CRITICAL BACKLOG: machine={machineName} queue={queueCount} " +
+                        $"oldestAge={oldestAgeDesc} — items unprocessed >72h. " +
+                        $"Check network connectivity and SharePoint availability.",
+                        EventLogEntryType.Error, 1099);
+                else if (alertStatus == AlertStatus.QueueBacklog)
+                    SafeWriteEventLog("Application",
+                        $"[HEARTBEAT] QUEUE BACKLOG: machine={machineName} queue={queueCount} " +
+                        $"oldestAge={oldestAgeDesc} — items pending >24h or queue>{BacklogQueueThreshold}.",
+                        EventLogEntryType.Warning, 1099);
+                else
+                    SafeWriteEventLog("Application",
+                        $"[HEARTBEAT] Alert cleared: machine={machineName} status back to OK.",
+                        EventLogEntryType.Information, 1099);
+            }
+
+            // ── SharePoint upsert ──────────────────────────────────────────────────
             using var client = CreateGraphClient(accessToken, timeoutSeconds: 30);
 
             string filter = $"fields/MachineName eq '{EscapeODataLiteral(machineName)}'";
@@ -477,13 +650,18 @@ namespace EventLogOutEmployeeService
             var items = findObject?["value"] as JArray;
             string? itemId = items?.FirstOrDefault()?["id"]?.ToString();
 
+            // TASK 3: AlertStatus written as a "Single line of text" column in SharePoint.
+            // If the column does not yet exist the PATCH/POST will return HTTP 400 for that
+            // field only — guard is handled by the existing exception-safe heartbeat path in
+            // HeartbeatWriterTask (catch logs warning, does not crash the task).
             var fields = new JObject
             {
                 ["MachineName"]    = machineName,
                 ["Timestamp"]      = ToUtcString(timestampUtc),
                 ["QueueCount"]     = queueCount,
                 ["LastEventTime"]  = lastEventTimeUtc.HasValue ? ToUtcString(lastEventTimeUtc.Value) : null,
-                ["ServiceVersion"] = serviceVersion
+                ["ServiceVersion"] = serviceVersion,
+                ["AlertStatus"]    = alertStatusStr   // TASK 3: new field
             };
 
             if (!string.IsNullOrWhiteSpace(itemId))
@@ -1241,9 +1419,42 @@ namespace EventLogOutEmployeeService
         private static string ToLocalTimeString(DateTime dt)
             => dt.ToLocalTime().ToString("HH:mm:ss");
 
+        /// <summary>
+        /// Returns an <see cref="HttpClient"/> pre-configured with the given bearer token.
+        ///
+        /// TASK 2: The underlying <see cref="SocketsHttpHandler"/> is static and shared across
+        /// all instances — this is the key change that prevents socket exhaustion. TCP connections
+        /// are pooled and reused for the full lifetime of the service process.
+        ///
+        /// A lightweight <c>HttpClient</c> wrapper is created per-call so that <c>Timeout</c>
+        /// and <c>DefaultRequestHeaders</c> (Authorization, Accept) remain safely scoped to
+        /// that call without races against concurrent callers. The wrapper's Dispose only affects
+        /// the thin wrapper, not the underlying pooled handler.
+        ///
+        /// PooledConnectionLifetime=5min prevents stale connections after Azure/Graph CDN
+        /// DNS rotation. PooledConnectionIdleTimeout=2min reclaims idle sockets promptly.
+        /// </summary>
+        private static readonly SocketsHttpHandler _graphHandler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime    = TimeSpan.FromMinutes(5),
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+            ConnectTimeout              = TimeSpan.FromSeconds(30),
+        };
+
+        private static readonly SocketsHttpHandler _tokenHandler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime    = TimeSpan.FromMinutes(5),
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+            ConnectTimeout              = TimeSpan.FromSeconds(30),
+        };
+
         private HttpClient CreateGraphClient(string accessToken, int timeoutSeconds)
         {
-            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+            // TASK 2: disposeHandler:false preserves the shared pool across Dispose() calls.
+            var client = new HttpClient(_graphHandler, disposeHandler: false)
+            {
+                Timeout = TimeSpan.FromSeconds(timeoutSeconds)
+            };
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             return client;
