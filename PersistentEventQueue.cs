@@ -287,6 +287,203 @@ namespace EventLogOutEmployeeService
 
     }
 
+    /// <summary>
+    /// Persistensi lokal untuk allLogon4624ByDeviceWorkDate (key: "COMPUTER::yyyy-MM-dd").
+    /// Menjaga daftar timestamp login 4624 agar isNewSession tetap akurat setelah restart.
+    /// </summary>
+    public class PersistentLogonIndex
+    {
+        private readonly string filePath;
+        private readonly SemaphoreSlim fileLock = new SemaphoreSlim(1, 1);
+        private Dictionary<string, List<DateTime>> _cache =
+            new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
+        private bool _cacheInitialized = false;
+
+        public PersistentLogonIndex(string filePath)
+        {
+            this.filePath = filePath;
+            EnsureFile();
+        }
+
+        public async Task<Dictionary<string, List<DateTime>>> LoadAsync(CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                return CloneCache();
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        public async Task UpdateAsync(
+            string key,
+            DateTime eventTimeUtc,
+            IReadOnlyCollection<string>? keysToRemove = null,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                bool changed = false;
+
+                if (keysToRemove != null)
+                {
+                    foreach (string removeKey in keysToRemove)
+                        changed |= _cache.Remove(removeKey);
+                }
+
+                if (!_cache.TryGetValue(key, out var logins))
+                {
+                    logins = new List<DateTime>();
+                    _cache[key] = logins;
+                    changed = true;
+                }
+
+                if (!logins.Contains(eventTimeUtc))
+                {
+                    logins.Add(eventTimeUtc);
+                    changed = true;
+                }
+
+                if (changed)
+                    await WriteAllInternalAsync(_cache);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        public async Task<int> CleanupOldEntriesAsync(DateTime cutoffDateLocal, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                int removed = 0;
+                var toRemove = new List<string>();
+
+                foreach (var key in _cache.Keys)
+                {
+                    if (TryParseWorkDate(key, out DateTime workDate) && workDate.Date < cutoffDateLocal.Date)
+                        toRemove.Add(key);
+                }
+
+                foreach (string key in toRemove)
+                {
+                    if (_cache.Remove(key))
+                        removed++;
+                }
+
+                if (removed > 0)
+                    await WriteAllInternalAsync(_cache);
+
+                return removed;
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        // ── Internal helpers ─────────────────────────────────────────────────────
+
+        private void EnsureFile()
+        {
+            string? dir = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            if (!File.Exists(filePath))
+                File.WriteAllText(filePath, JsonConvert.SerializeObject(new LogonIndexData()));
+        }
+
+        private async Task EnsureCacheAsync()
+        {
+            if (_cacheInitialized) return;
+            _cache = await ReadAllInternalAsync();
+            _cacheInitialized = true;
+        }
+
+        private Dictionary<string, List<DateTime>> CloneCache()
+        {
+            var result = new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in _cache)
+                result[kvp.Key] = new List<DateTime>(kvp.Value);
+            return result;
+        }
+
+        private async Task<Dictionary<string, List<DateTime>>> ReadAllInternalAsync()
+        {
+            EnsureFile();
+            try
+            {
+                string content = await File.ReadAllTextAsync(filePath);
+                var data = JsonConvert.DeserializeObject<LogonIndexData>(content);
+                var result = new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
+                if (data?.Entries != null)
+                {
+                    foreach (var kvp in data.Entries)
+                    {
+                        var list = kvp.Value ?? new List<DateTime>();
+                        result[kvp.Key] = list
+                            .Distinct()
+                            .OrderBy(t => t)
+                            .ToList();
+                    }
+                }
+                return result;
+            }
+            catch
+            {
+                return new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        private async Task WriteAllInternalAsync(Dictionary<string, List<DateTime>> entries)
+        {
+            var data = new LogonIndexData { Entries = entries };
+            string content = JsonConvert.SerializeObject(data, Formatting.Indented);
+            string tempPath = filePath + ".tmp";
+            await File.WriteAllTextAsync(tempPath, content);
+
+            if (File.Exists(filePath))
+                File.Replace(tempPath, filePath, filePath + ".bak", ignoreMetadataErrors: true);
+            else
+                File.Move(tempPath, filePath);
+        }
+
+        private static bool TryParseWorkDate(string key, out DateTime workDate)
+        {
+            int sep = key.LastIndexOf("::", StringComparison.Ordinal);
+            if (sep < 0)
+            {
+                workDate = default;
+                return false;
+            }
+
+            string datePart = key.Substring(sep + 2);
+            return DateTime.TryParseExact(
+                datePart,
+                "yyyy-MM-dd",
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None,
+                out workDate);
+        }
+
+        private class LogonIndexData
+        {
+            [JsonProperty("entries")]
+            public Dictionary<string, List<DateTime>> Entries { get; set; } =
+                new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
     public class QueuedAttendanceEvent
     {
         public string QueueId { get; set; } = string.Empty;
