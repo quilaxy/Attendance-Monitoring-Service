@@ -950,7 +950,6 @@ namespace EventLogOutEmployeeService
                     // ── End admin correlation gate ────────────────────────────────────
 
                     string workDate4634raw = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-                    var allQueue4634raw = await eventQueue.GetAllAsync();
 
                     // Temporal dedup: deteksi 4634 yang fire dalam 30 detik setelah 4624
                     // (stale session close saat unlock/CachedInteractive) — sama dengan live path.
@@ -959,13 +958,12 @@ namespace EventLogOutEmployeeService
                     // tetap masuk raw list SharePoint sebagai audit trail, tapi tidak update
                     // summary via status="STALE_SESSION_CLOSE".
                     const int staleWindowSecondsRaw = 30;
-                    bool isStaleRaw = allQueue4634raw.Any(x =>
-                        x.EventId == 4624 &&
-                        x.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
-                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
-                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634raw &&
-                        eventTime >= x.EventTime &&
-                        (eventTime - x.EventTime).TotalSeconds <= staleWindowSecondsRaw);
+                    bool isStaleRaw = await eventQueue.Has4624Within30sAsync(
+                        username,
+                        computerName,
+                        workDate4634raw,
+                        eventTime,
+                        staleWindowSecondsRaw);
                     if (isStaleRaw)
                     {
                         SafeWriteEventLog("Attendance-Service",
@@ -985,11 +983,10 @@ namespace EventLogOutEmployeeService
                         return;
                     }
 
-                    bool has4647raw = allQueue4634raw.Any(x =>
-                        x.EventId == 4647 &&
-                        x.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
-                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
-                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634raw);
+                    bool has4647raw = await eventQueue.Has4647InQueueAsync(
+                        username,
+                        computerName,
+                        workDate4634raw);
                     if (has4647raw)
                     {
                         SafeWriteEventLog("Attendance-Service",
@@ -2906,7 +2903,7 @@ namespace EventLogOutEmployeeService
                         try
                         {
                             await summaryCache.CleanupOldEntriesAsync(cancellationToken);
-                            await allLogon4624IndexStore.CleanupOldEntriesAsync(DateTime.Today.AddDays(-2), cancellationToken);
+                            await allLogon4624IndexStore.CleanupOldEntriesAsync(DateTime.Today.AddDays(-7), cancellationToken);
                             await rawEventStore.CleanupOldDatesAsync(eventQueue, cancellationToken);
                             SafeWriteEventLog("Application",
                                 $"[CLEANUP] Local cleanup done for {now.Date:yyyy-MM-dd}.",
@@ -3256,7 +3253,6 @@ namespace EventLogOutEmployeeService
                     // Check: apakah 4647 untuk user+computer+workDate ini sudah ada di queue?
                     // Kalau ada, 4634 tidak diperlukan — skip.
                     string workDate4634 = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
-                    var allQueue4634 = await eventQueue.GetAllAsync();
 
                     // Temporal dedup: deteksi 4634 yang fire dalam 30 detik setelah 4624 user yang sama.
                     // Ini adalah Windows behavior normal untuk logon type 11 (CachedInteractive /
@@ -3270,13 +3266,12 @@ namespace EventLogOutEmployeeService
                     // tapi di-blok dari summary update via status="STALE_SESSION_CLOSE".
                     // ShouldProcessSummary akan return false untuk status ini.
                     const int staleSessionWindowSeconds = 30;
-                    bool isStaleSessionClose = allQueue4634.Any(x =>
-                        x.EventId == 4624 &&
-                        x.Username.Equals(username4634, StringComparison.OrdinalIgnoreCase) &&
-                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
-                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634 &&
-                        eventTime >= x.EventTime &&
-                        (eventTime - x.EventTime).TotalSeconds <= staleSessionWindowSeconds);
+                    bool isStaleSessionClose = await eventQueue.Has4624Within30sAsync(
+                        username4634,
+                        computerName,
+                        workDate4634,
+                        eventTime,
+                        staleSessionWindowSeconds);
                     if (isStaleSessionClose)
                     {
                         SafeWriteEventLog("Attendance-Service",
@@ -3296,11 +3291,10 @@ namespace EventLogOutEmployeeService
                         return;
                     }
 
-                    bool has4647 = allQueue4634.Any(x =>
-                        x.EventId == 4647 &&
-                        x.Username.Equals(username4634, StringComparison.OrdinalIgnoreCase) &&
-                        x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
-                        x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate4634);
+                    bool has4647 = await eventQueue.Has4647InQueueAsync(
+                        username4634,
+                        computerName,
+                        workDate4634);
                     if (has4647)
                     {
                         SafeWriteEventLog("Attendance-Service",
@@ -3848,14 +3842,11 @@ namespace EventLogOutEmployeeService
                     // berhasil masuk queue. eventTime - 1 detik agar event ini ikut di-replay
                     // kalau service restart sebelum dispatch selesai.
                     //
-                    // PENTING: hanya maju, tidak pernah mundur.
-                    // Tanpa guard ini, replay event lama (misal dari 2 Maret) akan overwrite
-                    // checkpoint hari ini (12 Maret) → restart berikutnya replay dari 2 Maret
-                    // → semua data lama masuk lagi.
+                    // PENTING: checkpoint hanya maju (never move backward).
+                    // Guard monotonic dilakukan di CheckpointService dengan in-memory
+                    // _lastWrittenCheckpoint yang di-init dari file existing.
                     DateTime candidate = eventTime.AddSeconds(-1);
-                    DateTime? existingCheckpoint = _checkpointService.TryLoadStopCheckpoint();
-                    if (!existingCheckpoint.HasValue || candidate > existingCheckpoint.Value)
-                        _checkpointService.SaveStopCheckpoint(candidate);
+                    _checkpointService.SaveStopCheckpoint(candidate);
                 }
             }
             catch (Exception ex)
@@ -4691,27 +4682,44 @@ namespace EventLogOutEmployeeService
                         logins.Add(eventTime);
                 }
 
-                // Prune entries lebih dari 2 hari maksimal sekali per hari.
+                // Prune harian dengan retention 7 hari (selaras MaxReplayLookback).
                 // Key format: "COMPUTER::yyyy-MM-dd" — parse date dari suffix.
                 if (DateTime.Today > _lastDictPruneDate)
                 {
                     _lastDictPruneDate = DateTime.Today;
-                    string cutoffDate = DateTime.Today.AddDays(-2).ToString("yyyy-MM-dd");
-                    removedKeys = firstLogon4624ByDeviceWorkDate.Keys
-                        .Where(k =>
+                    string cutoffDate = DateTime.Today.AddDays(-7).ToString("yyyy-MM-dd");
+                    var staleKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (string k in firstLogon4624ByDeviceWorkDate.Keys)
+                    {
+                        int sep = k.LastIndexOf("::", StringComparison.Ordinal);
+                        if (sep >= 0 &&
+                            string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0)
+                            staleKeys.Add(k);
+                    }
+
+                    lock (_allLogon4624Lock)
+                    {
+                        foreach (string k in allLogon4624ByDeviceWorkDate.Keys)
                         {
                             int sep = k.LastIndexOf("::", StringComparison.Ordinal);
-                            return sep >= 0 &&
-                                   string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0;
-                        })
-                        .ToList();
+                            if (sep >= 0 &&
+                                string.Compare(k.Substring(sep + 2), cutoffDate, StringComparison.Ordinal) < 0)
+                                staleKeys.Add(k);
+                        }
+                    }
+
+                    removedKeys = staleKeys.ToList();
 
                     foreach (var k in removedKeys)
                     {
                         firstLogon4624ByDeviceWorkDate.Remove(k);
-                        lock (_allLogon4624Lock)
-                            allLogon4624ByDeviceWorkDate.Remove(k);
                         startupAnchorByDeviceWorkDate.Remove(k);
+                    }
+                    lock (_allLogon4624Lock)
+                    {
+                        foreach (var k in removedKeys)
+                            allLogon4624ByDeviceWorkDate.Remove(k);
                     }
 
                     if (removedKeys.Count > 0)
@@ -4778,14 +4786,14 @@ namespace EventLogOutEmployeeService
                 }
 
                 int removed = await allLogon4624IndexStore.CleanupOldEntriesAsync(
-                    DateTime.Today.AddDays(-2),
+                    DateTime.Today.AddDays(-7),
                     cancellationToken);
 
                 if (removed > 0)
                 {
                     lock (firstLogonLock)
                     {
-                        string cutoffDate = DateTime.Today.AddDays(-2).ToString("yyyy-MM-dd");
+                        string cutoffDate = DateTime.Today.AddDays(-7).ToString("yyyy-MM-dd");
                         var toRemove = new List<string>();
                         lock (_allLogon4624Lock)
                         {

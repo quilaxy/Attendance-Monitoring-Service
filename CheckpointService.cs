@@ -12,6 +12,8 @@ namespace EventLogOutEmployeeService
         private readonly string stopCheckpointBackupPath;
         private readonly TimeSpan maxReplayLookback;
         private readonly object checkpointWriteLock = new object();
+        private bool _lastWrittenCheckpointInitialized = false;
+        private DateTime? _lastWrittenCheckpoint = null;
         private readonly Action<string, string, EventLogEntryType, int> writeEventLog;
 
         public CheckpointService(
@@ -143,6 +145,11 @@ namespace EventLogOutEmployeeService
             {
                 lock (checkpointWriteLock)
                 {
+                    EnsureLastWrittenCheckpointInitialized();
+                    DateTime checkpointUtc = checkpoint.ToUniversalTime();
+                    if (_lastWrittenCheckpoint.HasValue && _lastWrittenCheckpoint.Value >= checkpointUtc)
+                        return;
+
                     string? dir = Path.GetDirectoryName(stopCheckpointPath);
 
                     writeEventLog("Application",
@@ -157,7 +164,7 @@ namespace EventLogOutEmployeeService
                             EventLogEntryType.Information, 1021);
                     }
 
-                    string content = checkpoint.ToUniversalTime().ToString("O");
+                    string content = checkpointUtc.ToString("O");
 
                     // Write atomically via temp+rename so the file is never half-written
                     // if Windows kills the process mid-write during system shutdown.
@@ -174,6 +181,7 @@ namespace EventLogOutEmployeeService
                     writeEventLog("Application",
                         $"SaveStopCheckpoint: written '{content}' to primary + backup.",
                         EventLogEntryType.Information, 1022);
+                    _lastWrittenCheckpoint = checkpointUtc;
                 }
             }
             catch (Exception ex)
@@ -181,6 +189,22 @@ namespace EventLogOutEmployeeService
                 writeEventLog("Application",
                     $"Failed to save stop checkpoint: {ex.GetType().Name}: {ex.Message} | Path='{stopCheckpointPath}'",
                     EventLogEntryType.Warning, 1017);
+            }
+
+            private void EnsureLastWrittenCheckpointInitialized()
+            {
+                if (_lastWrittenCheckpointInitialized)
+                    return;
+
+                DateTime? primary = TryLoadCheckpoint(stopCheckpointPath);
+                DateTime? backup = TryLoadCheckpoint(stopCheckpointBackupPath);
+
+                if (primary.HasValue && backup.HasValue)
+                    _lastWrittenCheckpoint = primary.Value >= backup.Value ? primary.Value : backup.Value;
+                else
+                    _lastWrittenCheckpoint = primary ?? backup;
+
+                _lastWrittenCheckpointInitialized = true;
             }
         }
 

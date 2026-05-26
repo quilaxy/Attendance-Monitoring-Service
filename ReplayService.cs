@@ -245,7 +245,7 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Opsi 3: Replay 4624/4647 yang tersimpan di RawEventStore untuk window replayFrom–replayTo.
+        /// Opsi 3: Replay 4624/4647/4634 yang tersimpan di RawEventStore untuk window replayFrom–replayTo.
         /// Ini fallback kalau Security log sudah ter-rotate/clear sebelum ReplaySecurityEvents bisa baca.
         /// DedupWindow di EnqueueIfNotDuplicateAsync akan otomatis skip event yang sudah ada di queue.
         /// </summary>
@@ -262,8 +262,9 @@ namespace EventLogOutEmployeeService
                     // Struktur flat: rawevents\{yyyyMMdd}\ — tidak ada subfolder per PC
                     var events4624 = _rawEventStore.GetEventsForDate(Environment.MachineName, date, 4624);
                     var events4647 = _rawEventStore.GetEventsForDate(Environment.MachineName, date, 4647);
+                    var events4634 = _rawEventStore.GetEventsForDate(Environment.MachineName, date, 4634);
 
-                    var allEvents = events4624.Concat(events4647)
+                    var allEvents = events4624.Concat(events4647).Concat(events4634)
                         .Where(e => e.EventTimeUtc >= replayFrom && e.EventTimeUtc <= replayTo)
                         .OrderBy(e => e.EventTimeUtc)
                         .ToList();
