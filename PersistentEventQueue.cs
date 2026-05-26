@@ -861,6 +861,54 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        public async Task<bool> Has4647InQueueAsync(
+            string username,
+            string computerName,
+            string workDate,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
+                    x.EventId == 4647 &&
+                    x.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
+                    x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                    x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        public async Task<bool> Has4624Within30sAsync(
+            string username,
+            string computerName,
+            string workDate,
+            DateTime eventTimeUtc,
+            int windowSeconds = 30,
+            CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
+                    x.EventId == 4624 &&
+                    x.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
+                    x.ComputerName.Equals(computerName, StringComparison.OrdinalIgnoreCase) &&
+                    x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
+                    eventTimeUtc >= x.EventTime &&
+                    (eventTimeUtc - x.EventTime).TotalSeconds <= windowSeconds);
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
         public async Task<bool> GroupHasHigherPriorityAsync(string groupId, int thanPriority, CancellationToken cancellationToken = default)
         {
             await fileLock.WaitAsync(cancellationToken);
