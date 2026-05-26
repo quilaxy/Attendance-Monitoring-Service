@@ -262,11 +262,6 @@ namespace EventLogOutEmployeeService
             // (e.g. "NyomanMaheswari"). SID.Translate() always fails on AzureAD → no
             // other canonicalization path exists. Convert dot-separated UPN prefix to
             // TitleCase so all event sources produce an identical username string.
-            // Examples:
-            //   nyoman.maheswari  → NyomanMaheswari   ✓
-            //   nabilla.nilawati  → NabillaNilawati    ✓
-            //   chaerunisa.izati  → ChaerunisaIzati    ✓
-            //   NyomanMaheswari   → NyomanMaheswari    ✓ (no dot → unchanged)
             if (normalized.Contains('.'))
             {
                 normalized = string.Concat(
