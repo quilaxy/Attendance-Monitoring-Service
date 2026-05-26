@@ -10,6 +10,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
+using System.Reflection;
 
 namespace EventLogOutEmployeeService
 {
@@ -3023,7 +3024,9 @@ namespace EventLogOutEmployeeService
                         DateTime? lastEventTimeUtc = lastEventTicks == DateTime.MinValue.Ticks
                             ? (DateTime?)null
                             : new DateTime(lastEventTicks, DateTimeKind.Utc);
-                        string serviceVersion = typeof(LoginLogoutMonitorService).Assembly.GetName().Version?.ToString() ?? "unknown";
+                        string serviceVersion = typeof(LoginLogoutMonitorService).Assembly
+                            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()
+                            ?.InformationalVersion ?? "unknown";
 
                         string? accessToken = await sharePointIntegration.Value.GetAccessTokenAsync(nowUtc, 0, cancellationToken);
                         if (string.IsNullOrWhiteSpace(accessToken))

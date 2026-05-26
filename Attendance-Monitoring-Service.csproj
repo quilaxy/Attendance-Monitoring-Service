@@ -10,11 +10,21 @@
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
 
-    <!-- Auto-generated version based on build date: 1.0.YYYYMMDD.HHmm -->
-    <!-- Example: 1.0.20260526.1430 — visible in SharePoint heartbeat list -->
-    <AssemblyVersion>1.0.$([System.DateTime]::UtcNow.ToString("yyyyMMdd")).$([System.DateTime]::UtcNow.ToString("HHmm"))</AssemblyVersion>
-    <FileVersion>1.0.$([System.DateTime]::UtcNow.ToString("yyyyMMdd")).$([System.DateTime]::UtcNow.ToString("HHmm"))</FileVersion>
-    <InformationalVersion>1.0.$([System.DateTime]::UtcNow.ToString("yyyyMMdd")).$([System.DateTime]::UtcNow.ToString("HHmm"))</InformationalVersion>
+    <!--
+      Auto-generated version based on build date/time (UTC).
+      AssemblyVersion format: 1.YYMM.DD.MinutesSinceMidnight
+        YYMM                = e.g. 2605 for May 2026       (max 9912,  safe)
+        DD                  = day of month 01-31           (max 31,    safe)
+        MinutesSinceMidnight= 0-1439                       (max 1439,  safe)
+      Example: build at 2026-05-26 08:59 UTC → 1.2605.26.539
+
+      InformationalVersion = free-form, used by serviceVersion in SharePoint heartbeat.
+      Example: "2026-05-26 08:59 UTC"
+    -->
+    <BuildMinutesSinceMidnight>$([System.Convert]::ToInt32($([MSBuild]::Add($([MSBuild]::Multiply($([System.DateTime]::UtcNow.Hour), 60)), $([System.DateTime]::UtcNow.Minute)))))</BuildMinutesSinceMidnight>
+    <AssemblyVersion>1.$([System.DateTime]::UtcNow.ToString("yyMM")).$([System.DateTime]::UtcNow.ToString("dd")).$(BuildMinutesSinceMidnight)</AssemblyVersion>
+    <FileVersion>1.$([System.DateTime]::UtcNow.ToString("yyMM")).$([System.DateTime]::UtcNow.ToString("dd")).$(BuildMinutesSinceMidnight)</FileVersion>
+    <InformationalVersion>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm")) UTC</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>
