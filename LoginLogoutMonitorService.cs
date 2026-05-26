@@ -952,8 +952,12 @@ namespace EventLogOutEmployeeService
                     string workDate4634raw = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
                     var allQueue4634raw = await eventQueue.GetAllAsync();
 
-                    // Temporal dedup: sama dengan live path — skip 4634 yang fire
-                    // dalam 30 detik setelah 4624 (stale session close saat unlock/CachedInteractive).
+                    // Temporal dedup: deteksi 4634 yang fire dalam 30 detik setelah 4624
+                    // (stale session close saat unlock/CachedInteractive) — sama dengan live path.
+                    //
+                    // FIX: sebelumnya di-drop total (return). Sekarang raw-only dispatch:
+                    // tetap masuk raw list SharePoint sebagai audit trail, tapi tidak update
+                    // summary via status="STALE_SESSION_CLOSE".
                     const int staleWindowSecondsRaw = 30;
                     bool isStaleRaw = allQueue4634raw.Any(x =>
                         x.EventId == 4624 &&
@@ -965,10 +969,19 @@ namespace EventLogOutEmployeeService
                     if (isStaleRaw)
                     {
                         SafeWriteEventLog("Attendance-Service",
-                            $"[DBG-4634] RawReplay skipped — stale session close within " +
-                            $"{staleWindowSecondsRaw}s of 4624. " +
+                            $"[DBG-4634] RawReplay stale session close — raw-only dispatch, summary skipped: " +
+                            $"4634 fired within {staleWindowSecondsRaw}s of 4624. " +
                             $"user='{username}' computer='{computerName}' time={eventTime:O}",
                             EventLogEntryType.Information, 2033);
+
+                        // Raw-only: dispatch ke raw list tapi tidak update summary.
+                        await ProcessEvent(
+                            4634, username, eventTime, computerName,
+                            "Security", 0, null, writeRawRecord,
+                            usernameResolutionSource: "Direct",
+                            isFallback: true,
+                            fallbackSource: "Event4634_StaleSessionClose",
+                            status: "STALE_SESSION_CLOSE");
                         return;
                     }
 
@@ -2560,8 +2573,16 @@ namespace EventLogOutEmployeeService
             // 4634: fallback logout — masuk summary hanya kalau tidak ada 4647 di group
             // yang sama (IsFallback4634 flag). Priority dikendalikan di
             // TryUpdateDailySummaryShutdownAsync via GetShutdownPriority.
+            //
+            // Pengecualian: status="STALE_SESSION_CLOSE" → raw-only, jangan update summary.
+            // Ini adalah 4634 yang fire dalam 30 detik setelah 4624 (CachedInteractive unlock),
+            // bukan logout user sesungguhnya. Raw record tetap di-dispatch sebagai audit trail.
             if (item.EventId == 4634)
+            {
+                if (item.Status == "STALE_SESSION_CLOSE")
+                    return false;
                 return true;
+            }
 
             // FIX [BUG-2+3]: Event 42 (Sleep/Modern Standby) sebagai last-resort shutdown.
             // Hanya masuk summary kalau belum ada ShutdownTime sama sekali (IsLastResort42 flag).
@@ -3237,12 +3258,17 @@ namespace EventLogOutEmployeeService
                     string workDate4634 = eventTime.ToLocalTime().ToString("yyyy-MM-dd");
                     var allQueue4634 = await eventQueue.GetAllAsync();
 
-                    // Temporal dedup: skip 4634 yang fire dalam 30 detik setelah 4624 user yang sama.
+                    // Temporal dedup: deteksi 4634 yang fire dalam 30 detik setelah 4624 user yang sama.
                     // Ini adalah Windows behavior normal untuk logon type 11 (CachedInteractive /
                     // unlock screen) — Windows menutup sesi lama dan membuka sesi baru hampir
                     // bersamaan, menyebabkan 4634 (sesi lama ditutup) fire tepat setelah 4624 baru.
-                    // 4634 seperti ini BUKAN logout user — jangan dispatch ke SharePoint.
+                    // 4634 seperti ini BUKAN logout user — tidak boleh update ShutdownTime di summary.
                     // Window 30 detik aman: logout sesungguhnya selalu punya gap >> 30 detik dari login.
+                    //
+                    // FIX: sebelumnya stale 4634 di-drop total (return tanpa dispatch).
+                    // Sekarang tetap di-dispatch ke raw list SharePoint sebagai audit trail,
+                    // tapi di-blok dari summary update via status="STALE_SESSION_CLOSE".
+                    // ShouldProcessSummary akan return false untuk status ini.
                     const int staleSessionWindowSeconds = 30;
                     bool isStaleSessionClose = allQueue4634.Any(x =>
                         x.EventId == 4624 &&
@@ -3254,10 +3280,19 @@ namespace EventLogOutEmployeeService
                     if (isStaleSessionClose)
                     {
                         SafeWriteEventLog("Attendance-Service",
-                            $"[DBG-4634] Skipped — stale session close: 4634 fired within " +
-                            $"{staleSessionWindowSeconds}s of 4624 login. " +
+                            $"[DBG-4634] Stale session close — raw-only dispatch, summary skipped: " +
+                            $"4634 fired within {staleSessionWindowSeconds}s of 4624 login. " +
                             $"user='{username4634}' computer='{computerName}' time={eventTime:O}",
                             EventLogEntryType.Information, 2033);
+
+                        // Raw-only: dispatch ke raw list tapi tidak update summary.
+                        await ProcessEvent(
+                            4634, username4634, eventTime, computerName,
+                            "Security", 0, null, writeRawRecord,
+                            usernameResolutionSource: "Direct",
+                            isFallback: true,
+                            fallbackSource: "Event4634_StaleSessionClose",
+                            status: "STALE_SESSION_CLOSE");
                         return;
                     }
 
