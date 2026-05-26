@@ -9,6 +9,12 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
+
+    <!-- Auto-generated version based on build date: 1.0.YYYYMMDD.HHmm -->
+    <!-- Example: 1.0.20260526.1430 — visible in SharePoint heartbeat list -->
+    <AssemblyVersion>1.0.$([System.DateTime]::UtcNow.ToString("yyyyMMdd")).$([System.DateTime]::UtcNow.ToString("HHmm"))</AssemblyVersion>
+    <FileVersion>1.0.$([System.DateTime]::UtcNow.ToString("yyyyMMdd")).$([System.DateTime]::UtcNow.ToString("HHmm"))</FileVersion>
+    <InformationalVersion>1.0.$([System.DateTime]::UtcNow.ToString("yyyyMMdd")).$([System.DateTime]::UtcNow.ToString("HHmm"))</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>
