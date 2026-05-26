@@ -426,6 +426,81 @@ namespace EventLogOutEmployeeService
                 lastException);
         }
 
+        // ── Heartbeat list ────────────────────────────────────────────────────────
+
+        public async Task UpsertHeartbeatAsync(
+            string accessToken,
+            string heartbeatListId,
+            string machineName,
+            DateTime timestampUtc,
+            int queueCount,
+            DateTime? lastEventTimeUtc,
+            string serviceVersion)
+        {
+            if (string.IsNullOrWhiteSpace(heartbeatListId))
+                return;
+
+            using var client = CreateGraphClient(accessToken, timeoutSeconds: 30);
+
+            string filter = $"fields/MachineName eq '{EscapeODataLiteral(machineName)}'";
+            string findUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{heartbeatListId}/items" +
+                             $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=1";
+
+            var findRequest = new HttpRequestMessage(HttpMethod.Get, findUrl);
+            findRequest.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
+            var findResponse = await client.SendAsync(findRequest);
+            if (!findResponse.IsSuccessStatusCode)
+            {
+                string body = await findResponse.Content.ReadAsStringAsync();
+                throw new InvalidOperationException(
+                    $"Heartbeat lookup failed HTTP {(int)findResponse.StatusCode}. Body={body}");
+            }
+
+            var findObject = JsonConvert.DeserializeObject<JObject>(
+                await findResponse.Content.ReadAsStringAsync());
+            var items = findObject?["value"] as JArray;
+            string? itemId = items?.FirstOrDefault()?["id"]?.ToString();
+
+            var fields = new JObject
+            {
+                ["MachineName"]    = machineName,
+                ["Timestamp"]      = ToUtcString(timestampUtc),
+                ["QueueCount"]     = queueCount,
+                ["LastEventTime"]  = lastEventTimeUtc.HasValue ? ToUtcString(lastEventTimeUtc.Value) : null,
+                ["ServiceVersion"] = serviceVersion
+            };
+
+            if (!string.IsNullOrWhiteSpace(itemId))
+            {
+                var patchContent = new StringContent(
+                    fields.ToString(Newtonsoft.Json.Formatting.None), Encoding.UTF8, "application/json");
+                using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
+                    $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{heartbeatListId}/items/{itemId}/fields")
+                { Content = patchContent };
+                var patchResponse = await client.SendAsync(patchRequest);
+                if (!patchResponse.IsSuccessStatusCode)
+                {
+                    string body = await patchResponse.Content.ReadAsStringAsync();
+                    throw new InvalidOperationException(
+                        $"Heartbeat update failed HTTP {(int)patchResponse.StatusCode}. Body={body}");
+                }
+                return;
+            }
+
+            var postData = new JObject { ["fields"] = fields };
+            var postContent = new StringContent(
+                JsonConvert.SerializeObject(postData), Encoding.UTF8, "application/json");
+            var postResponse = await client.PostAsync(
+                $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{heartbeatListId}/items",
+                postContent);
+            if (!postResponse.IsSuccessStatusCode)
+            {
+                string body = await postResponse.Content.ReadAsStringAsync();
+                throw new InvalidOperationException(
+                    $"Heartbeat insert failed HTTP {(int)postResponse.StatusCode}. Body={body}");
+            }
+        }
+
         // ── Summary list — Login ──────────────────────────────────────────────────
 
         /// <summary>
