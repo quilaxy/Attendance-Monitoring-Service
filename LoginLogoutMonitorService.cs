@@ -63,6 +63,21 @@ namespace EventLogOutEmployeeService
         private readonly CheckpointService _checkpointService;
         private readonly ReplayService _replayService;
 
+        // ── 4634 startup warmup retry queue ──────────────────────────────────────
+        // 4634 yang datang saat replay masih berjalan ATAU admin cache belum warm
+        // tidak di-drop dan tidak diproses langsung — di-hold di sini, lalu
+        // di-reprocess setelah DrainPending4634QueueAsync() dipanggil pasca replay.
+        // Bounded 200 entry (jauh melebihi burst realistis) mencegah memory leak.
+        private readonly Queue<(EventLogEntry Entry, DateTime ArrivedUtc)> _pending4634Queue
+            = new Queue<(EventLogEntry, DateTime)>();
+        private readonly object _pending4634Lock = new object();
+        private const int Pending4634MaxCapacity = 200;
+
+        // Flag: true setelah DrainPending4634QueueAsync() selesai delay warmup-nya.
+        // Sebelum flag ini true, live 4634 selalu masuk retry queue, bukan diproses langsung.
+        // volatile — dibaca dari OnSecurityEventWritten thread tanpa lock.
+        private volatile bool _adminCacheWarm = false;
+
         // ── Background task supervision ─────────────────────────────────────────
         private Task? cleanupTask;
         private Task? queueTask;
@@ -326,6 +341,13 @@ namespace EventLogOutEmployeeService
                             // dan sebelum background thread ini jalan — tidak perlu set lagi di sini.
 
                             _replayService.ReplayMissedEventsFromCheckpoint().GetAwaiter().GetResult();
+
+                            // Drain 4634 yang di-defer selama startup warmup.
+                            // Fire-and-forget dari background startup thread — tidak block
+                            // checkpoint heartbeat atau live monitoring.
+                            // DrainPending4634QueueAsync() akan set _adminCacheWarm=true setelah
+                            // delay 7 detik sehingga live 4634 berikutnya langsung diproses normal.
+                            _ = DrainPending4634QueueAsync();
 
                             StartCheckpointHeartbeat();
 
@@ -3051,6 +3073,33 @@ namespace EventLogOutEmployeeService
                 // Username source: same "Subject:" section as 4647.
                 if (eventId == 4634)
                 {
+                    // ── Startup warmup guard ──────────────────────────────────────────────
+                    // Dua kondisi yang menyebabkan race condition saat startup:
+                    //
+                    // 1. replayInProgress=true → replay sedang re-hydrate admin cache dari disk.
+                    //    IsAdminSession() bisa memberi jawaban salah (false pass atau false block)
+                    //    karena cache belum terisi penuh.
+                    //
+                    // 2. _adminCacheWarm=false → DrainPending4634QueueAsync() belum selesai
+                    //    delay 7 detiknya, artinya hydration pass ReplayFromRawStore belum
+                    //    terkonfirmasi committed ke _adminSessions dictionary.
+                    //
+                    // Solusi: defer ke _pending4634Queue, jangan drop, jangan block pipeline.
+                    // Event akan di-reprocess oleh DrainPending4634QueueAsync() setelah warmup.
+                    bool replayRunning = _replayService.IsReplayInProgress;
+                    bool cacheNotWarm  = !_adminCacheWarm;
+                    if (replayRunning || cacheNotWarm)
+                    {
+                        SafeWriteEventLog("Attendance-Service",
+                            $"[4634-RETRY] Delaying unresolved logout during startup warmup. " +
+                            $"replayRunning={replayRunning} adminCacheWarm={_adminCacheWarm} " +
+                            $"computer={computerName} eventTime={eventTime:O}",
+                            EventLogEntryType.Information, 2050);
+                        EnqueuePending4634(log);
+                        return;
+                    }
+                    // ── End startup warmup guard ──────────────────────────────────────────
+
                     // Re-use the 4647 username extraction path — same XML/message structure.
                     string? username4634 = SecurityEventParser.GetUsernameFromEvent(eventMessage, 4647);
                     if (string.IsNullOrEmpty(username4634) || !IsValidUsername(username4634))
@@ -3078,7 +3127,7 @@ namespace EventLogOutEmployeeService
                         if (_adminCorrelationService.IsAdminSession(computerName, logonId4634, eventTime, isReplay: false))
                         {
                             SafeWriteEventLog("Application",
-                                $"[ADMIN] Skipping 4634 — paired 4624 session is admin. " +
+                                $"[4634-FILTER] Admin-correlated logout filtered successfully. " +
                                 $"logonId={logonId4634} user={username4634} computer={computerName} time={eventTime:O}",
                                 EventLogEntryType.Information, 2042);
                             return; // tidak di-enqueue, tidak di-dispatch, tidak ke SharePoint
@@ -4961,6 +5010,135 @@ namespace EventLogOutEmployeeService
 
             return shutdownType.Contains("restart", StringComparison.OrdinalIgnoreCase) ||
                    shutdownType.Contains("reboot", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // ── 4634 startup warmup retry: helpers ───────────────────────────────────
+
+        /// <summary>
+        /// Tambahkan live 4634 EventLogEntry ke deferred retry queue.
+        /// Dipanggil hanya saat startup warmup (replay berjalan atau admin cache belum warm).
+        /// Bounded ke Pending4634MaxCapacity — entry tertua di-evict jika penuh.
+        /// Thread-safe: dilindungi _pending4634Lock.
+        /// </summary>
+        private void EnqueuePending4634(EventLogEntry entry)
+        {
+            lock (_pending4634Lock)
+            {
+                if (_pending4634Queue.Count >= Pending4634MaxCapacity)
+                {
+                    // Safety valve: buang entry tertua agar tidak ada memory leak.
+                    // Kondisi ini praktis tidak terjadi (<5 event diharapkan selama warmup).
+                    _pending4634Queue.Dequeue();
+                    SafeWriteEventLog("Application",
+                        "[4634-RETRY] Pending4634 queue penuh — entry tertua dibuang (kapasitas melebihi batas).",
+                        EventLogEntryType.Warning, 2051);
+                }
+                _pending4634Queue.Enqueue((entry, DateTime.UtcNow));
+            }
+        }
+
+        /// <summary>
+        /// Reprocess 4634 yang di-defer selama startup warmup.
+        ///
+        /// Dipanggil sekali setelah ReplayMissedEventsFromCheckpoint() selesai,
+        /// sebagai fire-and-forget dari background startup thread.
+        ///
+        /// Flow:
+        ///   1. Tunggu 7 detik — beri waktu admin cache hydration dari ReplayFromRawStore
+        ///      selesai committed ke _adminSessions dictionary.
+        ///   2. Set _adminCacheWarm = true — live 4634 berikutnya langsung masuk pipeline normal.
+        ///   3. Drain _pending4634Queue — reprocess tiap entry via ProcessSecurityEntryAsync.
+        ///   4. Entry yang lebih tua dari 2 jam di-discard sebagai stale.
+        ///
+        /// Setelah method ini return, sistem berjalan penuh:
+        ///   - Live 4624 → realtime ✓
+        ///   - Live 4634 user biasa → masuk SharePoint ✓
+        ///   - Live 4634 admin → difilter ✓
+        ///   - Tidak ada silent drop ✓
+        /// </summary>
+        private async Task DrainPending4634QueueAsync()
+        {
+            try
+            {
+                // Grace delay: pastikan hydration pass di ProcessRawSecurityEventAsync (replay path)
+                // sudah sepenuhnya selesai menulis ke _adminSessions sebelum kita re-evaluate admin gate.
+                // 7 detik cukup bahkan untuk RawStore dengan ratusan file per hari.
+                await Task.Delay(TimeSpan.FromSeconds(7));
+
+                // Dari titik ini, live 4634 tidak lagi di-defer — masuk pipeline normal.
+                _adminCacheWarm = true;
+
+                List<(EventLogEntry Entry, DateTime ArrivedUtc)> snapshot;
+                lock (_pending4634Lock)
+                {
+                    if (_pending4634Queue.Count == 0)
+                    {
+                        SafeWriteEventLog("Attendance-Service",
+                            "[4634-RETRY] Drain: tidak ada deferred 4634 untuk di-reprocess.",
+                            EventLogEntryType.Information, 2052);
+                        return;
+                    }
+                    snapshot = new List<(EventLogEntry, DateTime)>(_pending4634Queue);
+                    _pending4634Queue.Clear();
+                }
+
+                SafeWriteEventLog("Attendance-Service",
+                    $"[4634-RETRY] Drain: reprocessing {snapshot.Count} deferred 4634 event(s) setelah startup warmup.",
+                    EventLogEntryType.Information, 2052);
+
+                const int staleThresholdMinutes = 120;
+                int processed = 0;
+                int discarded = 0;
+
+                foreach (var (entry, arrivedUtc) in snapshot)
+                {
+                    try
+                    {
+                        // Buang event yang terlalu lama — sesi sudah pasti berakhir
+                        // sebelum drain ini berjalan, tidak ada manfaat re-enqueue.
+                        if ((DateTime.UtcNow - arrivedUtc).TotalMinutes > staleThresholdMinutes)
+                        {
+                            SafeWriteEventLog("Application",
+                                $"[4634-RETRY] Discarding stale deferred 4634: arrivedUtc={arrivedUtc:O} " +
+                                $"(>{staleThresholdMinutes} menit lalu) computer={entry.MachineName}",
+                                EventLogEntryType.Information, 2053);
+                            discarded++;
+                            continue;
+                        }
+
+                        SafeWriteEventLog("Attendance-Service",
+                            $"[4634-RETRY] Reprocessing delayed logout event: " +
+                            $"computer={entry.MachineName} time={entry.TimeGenerated:O}",
+                            EventLogEntryType.Information, 2054);
+
+                        // Re-enter pipeline normal.
+                        // writeRawRecord=false — sudah di-persist ke RawEventStore saat pertama masuk.
+                        // _adminCacheWarm sudah true → warmup guard tidak akan memblok lagi.
+                        await ProcessSecurityEntryAsync(entry, writeRawRecord: false);
+                        processed++;
+                    }
+                    catch (Exception ex)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[4634-RETRY] Error saat reprocessing deferred 4634: {ex.Message} " +
+                            $"computer={entry.MachineName} time={entry.TimeGenerated:O}",
+                            EventLogEntryType.Warning, 2055);
+                    }
+                }
+
+                SafeWriteEventLog("Attendance-Service",
+                    $"[4634-RETRY] Drain selesai: processed={processed} discarded={discarded}.",
+                    EventLogEntryType.Information, 2052);
+            }
+            catch (Exception ex)
+            {
+                // Pastikan _adminCacheWarm tetap true meskipun drain gagal —
+                // agar live 4634 tidak ter-block selamanya.
+                _adminCacheWarm = true;
+                SafeWriteEventLog("Application",
+                    $"[4634-RETRY] DrainPending4634QueueAsync gagal: {ex.Message}",
+                    EventLogEntryType.Error, 2055);
+            }
         }
 
         private bool IsSystemFallbackTriggerAccount(string username)

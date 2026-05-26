@@ -24,6 +24,14 @@ namespace EventLogOutEmployeeService
         private volatile bool replayInProgress = false;
         private long _replayUpperBoundTicks = DateTime.MinValue.Ticks;
 
+        /// <summary>
+        /// True selama ReplayMissedEventsFromCheckpoint() berjalan.
+        /// Dipakai oleh live 4634 path di LoginLogoutMonitorService untuk mendeteksi
+        /// startup warmup dan mem-defer pemrosesan 4634 ke retry queue.
+        /// Volatile — aman dibaca dari thread manapun tanpa lock.
+        /// </summary>
+        public bool IsReplayInProgress => replayInProgress;
+
         private volatile int _skipLogSuppressedCount = 0;
         // Ticks-based agar bisa diakses dengan Interlocked.Read (DateTime tidak thread-safe secara native)
         private long _lastSkipLogTimeTicks = DateTime.MinValue.Ticks;
