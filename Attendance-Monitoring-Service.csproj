@@ -20,7 +20,12 @@
 
       InformationalVersion = free-form, used by serviceVersion in SharePoint heartbeat.
       Example: "2026-05-26 08:59 UTC"
+
+      IncludeSourceRevisionInInformationalVersion = false
+        Mencegah .NET SDK append git commit hash ke InformationalVersion secara otomatis.
+        Default behavior .NET 8: "1.0.0+<commithash>" — tidak diinginkan di sini.
     -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <BuildMinutesSinceMidnight>$([System.Convert]::ToInt32($([MSBuild]::Add($([MSBuild]::Multiply($([System.DateTime]::UtcNow.Hour), 60)), $([System.DateTime]::UtcNow.Minute)))))</BuildMinutesSinceMidnight>
     <AssemblyVersion>1.$([System.DateTime]::UtcNow.ToString("yyMM")).$([System.DateTime]::UtcNow.ToString("dd")).$(BuildMinutesSinceMidnight)</AssemblyVersion>
     <FileVersion>1.$([System.DateTime]::UtcNow.ToString("yyMM")).$([System.DateTime]::UtcNow.ToString("dd")).$(BuildMinutesSinceMidnight)</FileVersion>
