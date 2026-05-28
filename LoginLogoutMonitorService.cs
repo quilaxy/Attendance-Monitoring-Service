@@ -1461,11 +1461,25 @@ namespace EventLogOutEmployeeService
                     systemEventLog.EntryWritten -= OnSystemEventWritten;
                 }
 
+                // [SPRINT] Flush shutdown events sebelum cancel token — hanya saat shutdown sistem nyata.
+                // Untuk OnStop (restart/manual), replay startup berikutnya sudah cukup.
+                if (caller == "OnShutdown")
+                {
+                    checkpointHeartbeatTimer?.Dispose();
+                    checkpointHeartbeatTimer = null;
+
+                    TryFlushShutdownEventsOnStopAsync().GetAwaiter().GetResult();
+                }
+
                 cancellationTokenSource?.Cancel();
                 StopBackgroundTasks();
 
-                checkpointHeartbeatTimer?.Dispose();
-                checkpointHeartbeatTimer = null;
+                // Dispose heartbeat timer untuk OnStop path (OnShutdown sudah dispose di atas).
+                if (caller != "OnShutdown")
+                {
+                    checkpointHeartbeatTimer?.Dispose();
+                    checkpointHeartbeatTimer = null;
+                }
 
                 // ── Step 4: Brief wait for any in-flight dispatch to finish.
                 // Keep this short (≤5s total) — checkpoint is already saved so
@@ -2029,6 +2043,132 @@ namespace EventLogOutEmployeeService
             try { taskCts.Cancel(); } catch { }
             try { taskCts.Dispose(); } catch { }
             taskCts = null;
+        }
+
+        /// <summary>
+        /// Sprint saat OnShutdown: flush shutdown events dari queue sebelum token global di-cancel.
+        /// Best-effort — jika network sudah mati, item tetap di queue untuk replay saat boot berikutnya.
+        /// </summary>
+        private async Task TryFlushShutdownEventsOnStopAsync()
+        {
+            static bool IsShutdownEventId(int id)
+                => id == 4647 || id == 1074 || id == 6006 || id == 4634 || id == 42;
+
+            const int sprintTimeoutMs      = 3000;
+            const int sprintTotalBudgetMs  = 5500;
+
+            var sprintDeadline = DateTime.UtcNow.AddMilliseconds(sprintTotalBudgetMs);
+            using var sprintCts = new CancellationTokenSource(sprintTotalBudgetMs);
+            CancellationToken sprintToken = sprintCts.Token;
+
+            try
+            {
+                List<QueuedAttendanceEvent> allItems = await eventQueue
+                    .GetAllAsync(sprintToken)
+                    .ConfigureAwait(false);
+
+                var shutdownItems = allItems
+                    .Where(x => IsShutdownEventId(x.EventId)
+                                && !(x.RawRecordDispatched && x.SummaryDispatched))
+                    .OrderByDescending(x => GetShutdownEventPriority(x.EventId, x.EventType ?? string.Empty))
+                    .ThenByDescending(x => x.EventTime)
+                    .ToList();
+
+                if (shutdownItems.Count == 0)
+                {
+                    SafeWriteEventLog("Attendance-Service",
+                        "[SHUTDOWN-SPRINT] Tidak ada shutdown event pending — sprint dilewati.",
+                        EventLogEntryType.Information, 1051);
+                    return;
+                }
+
+                SafeWriteEventLog("Attendance-Service",
+                    $"[SHUTDOWN-SPRINT] Sprint dimulai: {shutdownItems.Count} item(s). " +
+                    $"budget={sprintTotalBudgetMs}ms timeoutPerItem={sprintTimeoutMs}ms",
+                    EventLogEntryType.Information, 1051);
+
+                int flushed = 0, failed = 0, skipped = 0;
+
+                foreach (QueuedAttendanceEvent item in shutdownItems)
+                {
+                    TimeSpan remaining = sprintDeadline - DateTime.UtcNow;
+                    if (remaining.TotalMilliseconds < 500 || sprintToken.IsCancellationRequested)
+                    {
+                        SafeWriteEventLog("Attendance-Service",
+                            $"[SHUTDOWN-SPRINT] Budget habis — stop. flushed={flushed} failed={failed}",
+                            EventLogEntryType.Warning, 1051);
+                        break;
+                    }
+
+                    int effectiveTimeout = (int)Math.Min(sprintTimeoutMs, remaining.TotalMilliseconds - 200);
+                    if (effectiveTimeout < 500) { skipped++; continue; }
+
+                    using var itemCts = CancellationTokenSource.CreateLinkedTokenSource(sprintToken);
+                    itemCts.CancelAfter(effectiveTimeout);
+
+                    Interlocked.Increment(ref activeDispatchCount);
+                    try
+                    {
+                        bool sent = await TryDispatchQueuedEventAsync(item, itemCts.Token)
+                            .ConfigureAwait(false);
+
+                        if (sent)
+                        {
+                            await eventQueue.RemoveByIdAsync(item.QueueId, sprintToken)
+                                .ConfigureAwait(false);
+                            flushed++;
+                            SafeWriteEventLog("Attendance-Service",
+                                $"[SHUTDOWN-SPRINT] Flushed: eventId={item.EventId} user={item.Username} " +
+                                $"computer={item.ComputerName} time={item.EventTime:O}",
+                                EventLogEntryType.Information, 1051);
+                        }
+                        else
+                        {
+                            failed++;
+                            SafeWriteEventLog("Attendance-Service",
+                                $"[SHUTDOWN-SPRINT] Dispatch failed — retained for replay: " +
+                                $"eventId={item.EventId} user={item.Username} error={item.LastDispatchError}",
+                                EventLogEntryType.Warning, 1051);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        failed++;
+                        SafeWriteEventLog("Attendance-Service",
+                            $"[SHUTDOWN-SPRINT] Timeout — retained for replay: " +
+                            $"eventId={item.EventId} user={item.Username} queueId={item.QueueId}",
+                            EventLogEntryType.Warning, 1051);
+                    }
+                    catch (Exception ex)
+                    {
+                        failed++;
+                        SafeWriteEventLog("Application",
+                            $"[SHUTDOWN-SPRINT] Error: eventId={item.EventId} user={item.Username} — {ex.Message}",
+                            EventLogEntryType.Warning, 1051);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref activeDispatchCount);
+                    }
+                }
+
+                SafeWriteEventLog("Attendance-Service",
+                    $"[SHUTDOWN-SPRINT] Selesai: flushed={flushed} failed={failed} skipped={skipped}. " +
+                    "Item yang gagal akan di-retry saat startup berikutnya.",
+                    EventLogEntryType.Information, 1051);
+            }
+            catch (OperationCanceledException)
+            {
+                SafeWriteEventLog("Attendance-Service",
+                    "[SHUTDOWN-SPRINT] Dibatalkan oleh total budget timeout.",
+                    EventLogEntryType.Warning, 1051);
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[SHUTDOWN-SPRINT] Sprint error (non-fatal): {ex.Message}",
+                    EventLogEntryType.Warning, 1051);
+            }
         }
 
         // ─── Queue processor ─────────────────────────────────────────────────────
