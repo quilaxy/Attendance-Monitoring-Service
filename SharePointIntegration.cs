@@ -1765,26 +1765,32 @@ namespace EventLogOutEmployeeService
 
         /// <summary>
         /// Priority for Summary ShutdownTime. Higher value wins.
-        ///   4647 User Logout        = 6  (HIGHEST — explicit logoff dari Security log, reliable di semua skenario
-        ///                                  termasuk sleep/hibernate/fast-startup yang tidak punya 1074 atau 6006)
-        ///   6006 confirmed shutdown = 5  (paired 1074 was power-off/shutdown)
-        ///   1074 Shutdown           = 4  (confirmed power-off, no 6006 yet)
-        ///   6006 unconfirmed        = 0  (no paired 1074 — kemungkinan restart, di-skip)
-        ///   6008 Unexpected         = 1
-        ///   41   Crash              = 1
-        ///   42   Sleep last-resort  = -1 (hanya kalau tidak ada event lain sama sekali)
+        ///   4647 = 6  HIGHEST — explicit user logoff, reliable di semua skenario
+        ///   1074 shutdown = 5
+        ///   6006 confirmed = 4
+        ///   4634 = 3  Fallback logout — dipakai HANYA jika tidak ada 4647/1074/6006-confirmed.
+        ///             Ketika ada dua 4634 di hari yang sama, same-priority logic mengambil yang
+        ///             shutdownTime-nya LEBIH BESAR → selalu 4634 terakhir yang jadi ShutdownTime.
+        ///   6008/41 = 1
+        ///   6006 unconfirmed = 0
+        ///   42 = -1 (last resort)
+        ///
+        /// PENTING: Harus selalu sinkron dengan GetShutdownEventPriority di LoginLogoutMonitorService.cs.
         /// </summary>
         private static int GetShutdownPriority(int eventId, string eventType)
         {
-            if (eventId == 4647) return 6; // Priority tertinggi — explicit user logoff dari Security log
-            if (eventId == 1074 && !IsRestartEventType(eventType)) return 5; // was 4 — FIX B: 1074 > 6006 confirmed
+            if (eventId == 4647) return 6;
+            if (eventId == 1074 && !IsRestartEventType(eventType)) return 5;
             if (eventId == 6006)
-                return IsUnconfirmed6006(eventType) ? 0 : 4;  // was 5 — FIX B: 6006 confirmed turun ke 4
+                return IsUnconfirmed6006(eventType) ? 0 : 4;
+            // 4634 fallback: di bawah 1074/6006-confirmed, di atas crash events.
+            // Ketika ada dua 4634, same-priority → ambil yang shutdownTime lebih besar
+            // (lihat blok "newPriority == effectiveCurrentPriority" di TryUpdateDailySummaryShutdownAsync).
+            // Dengan demikian selalu 4634 TERAKHIR di hari itu yang menjadi ShutdownTime.
+            if (eventId == 4634) return 3;
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
             // Event 42 last-resort: priority -1 sehingga ANY event lain selalu overwrite.
-            // isNewSession check di TryUpdateDailySummaryShutdownAsync tetap berlaku —
-            // 42 dari sesi yang lebih baru tetap overwrite shutdown lama.
             if (eventId == 42)   return -1;
             return 0;
         }

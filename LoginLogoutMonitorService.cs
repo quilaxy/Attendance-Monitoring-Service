@@ -966,8 +966,9 @@ namespace EventLogOutEmployeeService
                     // FIX: sebelumnya di-drop total (return). Sekarang raw-only dispatch:
                     // tetap masuk raw list SharePoint sebagai audit trail, tapi tidak update
                     // summary via status="STALE_SESSION_CLOSE".
+                    // Is4634StaleAsync cek dua sumber: queue in-memory DAN RawEventStore disk.
                     const int staleWindowSecondsRaw = 30;
-                    bool isStaleRaw = await eventQueue.Has4624Within30sAsync(
+                    bool isStaleRaw = await Is4634StaleAsync(
                         username,
                         computerName,
                         workDate4634raw,
@@ -2576,13 +2577,21 @@ namespace EventLogOutEmployeeService
             if (item.EventId == 1074 || item.EventId == 6006 || item.EventId == 4647)
                 return true;
 
-            // 4634: fallback logout — masuk summary hanya kalau tidak ada 4647 di group
-            // yang sama (IsFallback4634 flag). Priority dikendalikan di
-            // TryUpdateDailySummaryShutdownAsync via GetShutdownPriority.
+            // 4634: fallback logout.
             //
-            // Pengecualian: status="STALE_SESSION_CLOSE" → raw-only, jangan update summary.
-            // Ini adalah 4634 yang fire dalam 30 detik setelah 4624 (CachedInteractive unlock),
-            // bukan logout user sesungguhnya. Raw record tetap di-dispatch sebagai audit trail.
+            // Raw List SharePoint: 4634 user standard SELALU masuk (kecuali 4634 admin — sudah
+            // di-drop di admin correlation gate sebelum sampai ke sini).
+            //
+            // Summary List SharePoint: 4634 masuk summary dan update ShutdownTime HANYA jika:
+            //   - status bukan STALE_SESSION_CLOSE (4634 yang fire ≤30 detik setelah 4624 —
+            //     bukan logout sesungguhnya; raw record tetap di-dispatch sebagai audit trail)
+            //   - tidak ada 4647/1074/6006-confirmed di queue yang sama — dikendalikan oleh
+            //     priority system di TryUpdateDailySummaryShutdownAsync (4634 = priority 3,
+            //     di bawah 4647=6, 1074=5, 6006-confirmed=4).
+            //
+            // Ketika ada dua atau lebih 4634 di hari yang sama, keduanya masuk summary queue.
+            // TryUpdateDailySummaryShutdownAsync memilih yang shutdownTime LEBIH BESAR
+            // (same-priority → ambil yang lebih baru) → selalu 4634 terakhir yang menang.
             if (item.EventId == 4634)
             {
                 if (item.Status == "STALE_SESSION_CLOSE")
@@ -2600,29 +2609,35 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Priority untuk shutdown group — harus konsisten dengan SharePointIntegration.GetShutdownPriority.
+        /// Priority untuk shutdown group — HARUS selalu sinkron dengan SharePointIntegration.GetShutdownPriority.
         /// Dipakai untuk menentukan event mana di group yang boleh dispatch summary saat timer expired.
-        ///   4647 = 6 (HIGHEST — explicit logoff, reliable di sleep/fast-startup/hibernate)
-        ///   4634 = 5 (fallback 4647 — Logoff event, unreliable tapi lebih baik dari system event)
-        ///   1074 shutdown = 4 | 6006 confirmed = 3 | 42 = 0 (last resort)
+        ///
+        ///   4647 = 6  HIGHEST — explicit user logoff
+        ///   1074 shutdown = 5
+        ///   6006 confirmed = 4
+        ///   4634 = 3  Fallback logout — di bawah 1074/6006-confirmed.
+        ///             Ketika ada dua 4634, same-priority → yang terbaru menang.
+        ///   6008/41 = 1
+        ///   6006 unconfirmed = 0
+        ///   42 = -1 (last resort)
         ///
         /// Perubahan dari versi sebelumnya:
-        ///   - 4634 ditambahkan di priority 5 (di bawah 4647=6, di atas 1074=4).
-        ///   - 1074 diturunkan dari 5 → 4 dan 6006 dari 4 → 3 untuk memberi ruang 4634.
-        ///   - 42 tetap 0 (last resort).
-        ///
-        /// PENTING: Method ini harus di-sync dengan SharePointIntegration.GetShutdownPriority
-        /// kalau method tersebut ada di sana.
+        ///   - 4634: 5 → 3. Sebelumnya (5) lebih tinggi dari 1074 (4) dan 6006-confirmed (3),
+        ///     sehingga 4634 bisa mengalahkan system shutdown events yang lebih reliable.
+        ///   - 1074/6006 tidak berubah nilainya; yang berubah hanya posisi relatif 4634.
+        ///   - 6008, 41, 42 ditambahkan eksplisit (sebelumnya fall-through ke return 0).
         /// </summary>
         private static int GetShutdownEventPriority(int eventId, string eventType)
         {
-            if (eventId == 4647) return 6; // Priority tertinggi — explicit user logoff dari Security log
-            if (eventId == 4634) return 5; // Fallback 4647 — Logoff event, di bawah 4647 tapi di atas system events
+            if (eventId == 4647) return 6;
             if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
-                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 4; // was 5
+                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 5;
             if (eventId == 6006)
-                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 3; // was 4
-            if (eventId == 42)   return 0; // last resort — hanya kalau tidak ada event lain
+                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 4;
+            if (eventId == 4634) return 3;
+            if (eventId == 6008) return 1;
+            if (eventId == 41)   return 1;
+            if (eventId == 42)   return -1;
             return 0;
         }
 
@@ -2704,24 +2719,24 @@ namespace EventLogOutEmployeeService
                         bool confirmedExists = await eventQueue.GroupHasConfirmed6006Async(item.ShutdownGroupId);
                         if (confirmedExists)
                         {
-                            // 4647 priority lebih tinggi dari confirmed 6006 (6 vs 5) —
-                            // kalau item ini 4647, biarkan dia dispatch, bukan 6006.
-                            // 4634 (priority 5) juga lebih tinggi dari 6006 confirmed (3) —
-                            // sama-sama dari Security log, biarkan dia dispatch.
-                            if (item.EventId == 4647 || item.EventId == 4634)
+                            // Priority (GetShutdownEventPriority): 4647=6, 1074=5, 6006-confirmed=4, 4634=3.
+                            //
+                            // 4647 (6) > 6006-confirmed (4) → 4647 menang, mark 6006 sebagai dispatched.
+                            // 4634 (3) < 6006-confirmed (4) → 6006 yang dispatch, 4634 di-skip.
+                            if (item.EventId == 4647)
                             {
-                                // 4647/4634 menang — mark 6006 di group sebagai summaryDispatched
+                                // 4647 menang atas confirmed 6006 — mark 6006 sebagai summaryDispatched
                                 // agar 6006 tidak kirim summary lagi setelahnya.
                                 await eventQueue.MarkGroupSummaryDispatchedAsync(item.ShutdownGroupId, exceptQueueId: item.QueueId);
                                 SafeWriteEventLog("Application",
-                                    $"[DISPATCH] Shutdown group: {item.EventId} takes priority over confirmed 6006. " +
+                                    $"[DISPATCH] Shutdown group: 4647 (priority 6) wins over confirmed 6006 (priority 4). " +
                                     $"queueId={item.QueueId} groupId={item.ShutdownGroupId}",
                                     EventLogEntryType.Information, 4009);
-                                // needsSummary tetap true — 4647/4634 yang dispatch
+                                // needsSummary tetap true — 4647 yang dispatch
                             }
                             else
                             {
-                                // Bukan 4647 — confirmed 6006 yang dispatch summary (priority lebih tinggi).
+                                // Bukan 4647 (termasuk 4634 priority 3) — confirmed 6006 (priority 4) menang.
                                 needsSummary = false;
                                 SafeWriteEventLog("Application",
                                     $"[DISPATCH] Shutdown group: confirmed 6006 in group, skipping summary for " +
@@ -3276,8 +3291,9 @@ namespace EventLogOutEmployeeService
                     // Sekarang tetap di-dispatch ke raw list SharePoint sebagai audit trail,
                     // tapi di-blok dari summary update via status="STALE_SESSION_CLOSE".
                     // ShouldProcessSummary akan return false untuk status ini.
+                    // Is4634StaleAsync cek dua sumber: queue in-memory DAN RawEventStore disk.
                     const int staleSessionWindowSeconds = 30;
-                    bool isStaleSessionClose = await eventQueue.Has4624Within30sAsync(
+                    bool isStaleSessionClose = await Is4634StaleAsync(
                         username4634,
                         computerName,
                         workDate4634,
@@ -3949,6 +3965,58 @@ namespace EventLogOutEmployeeService
         private List<RawSecurityEvent> GetRawEventsFromStore(string computerName, DateTime localDate, int eventId)
         {
             return rawEventStore.GetEventsForDate(computerName, localDate, eventId);
+        }
+
+        /// <summary>
+        /// Deteksi apakah 4634 adalah "stale session close" — yaitu 4634 yang fire dalam
+        /// <paramref name="windowSeconds"/> setelah 4624 user yang sama di komputer yang sama.
+        ///
+        /// Ini terjadi pada logon type 11 (CachedInteractive / unlock screen): Windows menutup
+        /// sesi lama dan membuka sesi baru hampir bersamaan sehingga 4634 fire tepat setelah 4624.
+        /// 4634 seperti ini BUKAN logout — tidak boleh jadi ShutdownTime di summary.
+        ///
+        /// Dua sumber dicek berurutan:
+        ///   1. PersistentEventQueue (in-memory) — untuk live events di sesi ini.
+        ///   2. RawEventStore (disk) — fallback jika service restart di antara 4624 dan 4634
+        ///      sehingga 4624 sudah tidak ada di queue tapi masih ada di raw store.
+        ///
+        /// Fail-safe: jika RawEventStore gagal dibaca, return false (tidak blok 4634 secara salah).
+        /// </summary>
+        private async Task<bool> Is4634StaleAsync(
+            string username,
+            string computerName,
+            string workDate,
+            DateTime eventTimeUtc,
+            int windowSeconds = 30,
+            CancellationToken cancellationToken = default)
+        {
+            // Cek 1: queue in-memory (fast path)
+            bool inQueue = await eventQueue.Has4624Within30sAsync(
+                username, computerName, workDate, eventTimeUtc, windowSeconds, cancellationToken);
+            if (inQueue)
+                return true;
+
+            // Cek 2: RawEventStore di disk (fallback untuk post-restart scenario)
+            try
+            {
+                DateTime localDate = eventTimeUtc.ToLocalTime().Date;
+                var rawLogins = rawEventStore.GetEventsForDate(computerName, localDate, 4624);
+                return rawLogins.Any(r =>
+                    r.Username != null &&
+                    r.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
+                    r.EventTimeUtc <= eventTimeUtc &&
+                    (eventTimeUtc - r.EventTimeUtc).TotalSeconds <= windowSeconds);
+            }
+            catch (Exception ex)
+            {
+                // Fail-safe: jangan blok 4634 jika RawStore gagal.
+                // Lebih baik stale 4634 lolos ke raw-only daripada legitimate logout di-drop.
+                SafeWriteEventLog("Application",
+                    $"[DBG-4634] Is4634StaleAsync: RawStore read failed — treating as non-stale. " +
+                    $"user='{username}' computer='{computerName}' time={eventTimeUtc:O} error={ex.Message}",
+                    EventLogEntryType.Warning, 2033);
+                return false;
+            }
         }
 
         // ─── Helpers ─────────────────────────────────────────────────────────────
