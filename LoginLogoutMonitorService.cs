@@ -398,12 +398,22 @@ namespace EventLogOutEmployeeService
 
                             LoadPersistedAllLogon4624IndexAsync(ct).GetAwaiter().GetResult();
                             PrimeFirstLogonIndexFromQueueAsync(ct).GetAwaiter().GetResult();
-                            RetryPendingQueueOnStartupAsync(ct).GetAwaiter().GetResult();
 
                             // EnableRaisingEvents sudah diaktifkan di OnStart() sebelum delay
                             // dan sebelum background thread ini jalan — tidak perlu set lagi di sini.
 
+                            // FIX [ADMIN-GATE]: Replay DULU sebelum RetryPendingQueue.
+                            // ReplayMissedEventsFromCheckpoint() meng-hydrate _adminSessions dari
+                            // RawEventStore melalui ProcessRawSecurityEventAsync (4624 admin →
+                            // RegisterAdminSession). Jika RetryPendingQueueOnStartupAsync berjalan
+                            // lebih dulu, event 4624 admin yang tersimpan di persistent queue
+                            // (karena network failure di sesi sebelumnya) akan langsung di-dispatch
+                            // ke SharePoint melalui TryDispatchQueuedEventAsync — yang tidak punya
+                            // admin gate — sehingga admin lolos ke rawListId dan summaryListId.
                             _replayService.ReplayMissedEventsFromCheckpoint().GetAwaiter().GetResult();
+
+                            // Persistent queue di-dispatch setelah admin cache ter-hydrate.
+                            RetryPendingQueueOnStartupAsync(ct).GetAwaiter().GetResult();
 
                             // Drain deferred 4634 events yang di-defer selama startup warmup.
                             // Fire-and-forget: tidak block checkpoint heartbeat atau live monitoring.
@@ -1287,13 +1297,28 @@ namespace EventLogOutEmployeeService
 
         // ─── Lifecycle ───────────────────────────────────────────────────────────
 
-        protected override void OnStop() => HandleServiceStopping("OnStop", 1050);
+        protected override void OnStop()
+        {
+            // FIX [ADMIN-GATE]: Service restart (SCM / manual / sc failure recovery).
+            // Hanya flush in-memory cache — TIDAK menghapus boot-session-id.txt.
+            // GUID dipertahankan agar re-hydrate dari RawEventStore pada startup berikutnya
+            // menggunakan key yang sama sehingga admin correlation lookup tetap match.
+            _adminCorrelationService.ClearAdminSessionCache();
+            HandleServiceStopping("OnStop", 1050);
+        }
 
         /// <summary>
         /// Called by SCM during Windows system shutdown/restart (requires CanShutdown = true).
         /// OnStop() is NOT guaranteed to be called in that scenario.
         /// </summary>
-        protected override void OnShutdown() => HandleServiceStopping("OnShutdown", 1051);
+        protected override void OnShutdown()
+        {
+            // FIX [ADMIN-GATE]: Windows shutdown / reboot nyata.
+            // Hapus boot-session-id.txt agar sesi Windows baru mendapat GUID baru —
+            // sesi lama tidak boleh ter-carry-over lintas reboot.
+            _adminCorrelationService.InvalidateBootSessionOnWindowsShutdown();
+            HandleServiceStopping("OnShutdown", 1051);
+        }
 
         /// <summary>
         /// Called by SCM on power state changes (requires CanHandlePowerEvent = true in constructor).
@@ -1393,7 +1418,9 @@ namespace EventLogOutEmployeeService
                     $"Service stopping ({caller}).",
                     EventLogEntryType.Information, stopEventId);
 
-                _adminCorrelationService.InvalidateBootSession();
+                // FIX [ADMIN-GATE]: InvalidateBootSession / ClearAdminSessionCache sudah
+                // dipanggil secara eksplisit di OnStop() dan OnShutdown() masing-masing,
+                // dengan method yang tepat sesuai konteks. Tidak perlu dipanggil lagi di sini.
 
                 // ── Step 1: Request extra shutdown time from SCM immediately.
                 // Windows system shutdown gives services only ~5 seconds by default.

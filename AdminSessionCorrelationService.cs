@@ -48,7 +48,47 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        public void InvalidateBootSession()
+        // ── FIX ROOT CAUSE ──────────────────────────────────────────────────────
+        //
+        // SEBELUMNYA: HandleServiceStopping() memanggil InvalidateBootSession()
+        // tanpa membedakan caller — baik OnStop() (service restart) maupun
+        // OnShutdown() (Windows shutdown) sama-sama menghapus boot-session-id.txt.
+        //
+        // AKIBATNYA pada service restart:
+        //   1. boot-session-id.txt dihapus saat stop.
+        //   2. Saat service start ulang, GUID baru dibuat ("GUID-B").
+        //   3. ReplayMissedEventsFromCheckpoint() membaca 4624 admin dari RawStore
+        //      dan memanggil RegisterAdminSession(key="PC::GUID-B::0xABC") → OK.
+        //   4. RetryPendingQueueOnStartupAsync() berjalan SEBELUM replay selesai.
+        //      _adminSessions masih kosong → admin gate miss → event admin
+        //      lolos ke SharePoint (rawListId & summaryListId).
+        //
+        //   Pada startup berikutnya GUID berubah lagi ("GUID-C") → semua key
+        //   yang sudah ter-hydrate dengan "GUID-B" tidak lagi match → bug berulang.
+        //
+        // FIX: Pisahkan menjadi dua method dengan tanggung jawab berbeda:
+        //
+        //   InvalidateBootSessionOnWindowsShutdown()  → dipanggil HANYA dari OnShutdown().
+        //     Menghapus file agar setelah Windows reboot, sesi baru mendapat GUID baru.
+        //     Ini adalah satu-satunya skenario di mana invalidate memang diperlukan.
+        //
+        //   ClearAdminSessionCache()  → dipanggil dari OnStop() (service restart).
+        //     TIDAK menghapus file — GUID dipertahankan lintas restart service.
+        //     Hanya flush in-memory cache karena proses baru akan re-hydrate dari RawStore.
+        //
+        // Dengan pemisahan ini:
+        //   - Pada service restart: GUID sama, re-hydrate dari RawStore langsung match.
+        //   - Pada Windows reboot: GUID baru, sesi Windows baru benar-benar fresh.
+        // ────────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Hapus boot-session-id.txt — hanya dipanggil saat Windows shutdown/reboot nyata
+        /// (dari <c>OnShutdown()</c>). Setelah Windows boot ulang, service akan membuat
+        /// GUID baru yang merepresentasikan boot session baru secara akurat.
+        ///
+        /// JANGAN panggil ini dari <c>OnStop()</c> (service restart) — lihat <see cref="ClearAdminSessionCache"/>.
+        /// </summary>
+        public void InvalidateBootSessionOnWindowsShutdown()
         {
             try
             {
@@ -60,6 +100,32 @@ namespace EventLogOutEmployeeService
                 // non-critical
             }
         }
+
+        /// <summary>
+        /// Flush in-memory admin session cache tanpa menyentuh boot-session-id.txt.
+        /// Dipanggil dari <c>OnStop()</c> (service restart) agar proses baru
+        /// tidak mewarisi cache yang stale.
+        ///
+        /// File GUID dipertahankan sehingga saat service start ulang, re-hydrate dari
+        /// RawEventStore menggunakan GUID yang sama dan key lookup tetap match.
+        /// </summary>
+        public void ClearAdminSessionCache()
+        {
+            lock (_adminSessionLock)
+            {
+                _adminSessions.Clear();
+            }
+        }
+
+        /// <summary>
+        /// [OBSOLETE — jangan panggil langsung]
+        /// Dipertahankan hanya untuk kompatibilitas sementara.
+        /// Gunakan <see cref="InvalidateBootSessionOnWindowsShutdown"/> atau
+        /// <see cref="ClearAdminSessionCache"/> sesuai konteks caller.
+        /// </summary>
+        [Obsolete("Use InvalidateBootSessionOnWindowsShutdown() from OnShutdown(), or ClearAdminSessionCache() from OnStop().")]
+        public void InvalidateBootSession()
+            => InvalidateBootSessionOnWindowsShutdown();
 
         public void RegisterAdminSession(string computerName, string logonId, string? logMessage)
         {
