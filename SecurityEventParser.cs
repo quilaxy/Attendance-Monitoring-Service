@@ -258,8 +258,8 @@ namespace EventLogOutEmployeeService
                 normalized = normalized.Split('@')[0].Trim();
 
             // FIX BUG-1: On Azure AD joined devices, 4624 Account Name is UPN prefix
-            // (e.g. "nyoman.maheswari") while 4647 and 1074 produce SAMAccountName
-            // (e.g. "NyomanMaheswari"). SID.Translate() always fails on AzureAD → no
+            // (e.g. "nama.panjang") while 4647 and 1074 produce SAMAccountName
+            // (e.g. "NamaPanjang"). SID.Translate() always fails on AzureAD → no
             // other canonicalization path exists. Convert dot-separated UPN prefix to
             // TitleCase so all event sources produce an identical username string.
             if (normalized.Contains('.'))
