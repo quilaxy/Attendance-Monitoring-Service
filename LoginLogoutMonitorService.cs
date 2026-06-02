@@ -885,29 +885,18 @@ namespace EventLogOutEmployeeService
                     // setelah replay bisa dikorelasikan tanpa disk read lagi.
                     if (!string.IsNullOrEmpty(raw.LogonId))
                     {
-                        // Register LogonId utama (sisi standard-token atau elevated-token)
+                        string? linkedLogonId = raw.LinkedLogonId;
+                        string linkedSuffix = string.IsNullOrEmpty(linkedLogonId)
+                            ? string.Empty
+                            : $" linkedLogonId={linkedLogonId}";
+
+                        // Register LogonId utama + LinkedLogonId (split-token) dari disk.
                         _adminCorrelationService.RegisterAdminSession(
                             computerName,
                             raw.LogonId,
+                            linkedLogonId,
                             $"[ADMIN] Admin session re-hydrated from RawStore: " +
-                            $"user={raw.Username} logonId={raw.LogonId} computer={computerName}");
-
-                        // FIX: Register LinkedLogonId (sisi pasangan split-token) dari disk.
-                        // Tanpa ini, 4634 yang membawa LogonId = LinkedLogonId dari 4624 admin
-                        // lolos admin gate di replay path karena in-memory cache hanya berisi
-                        // LogonId utama setelah service restart.
-                        // Skenario: 4624 elevated (LogonId=0xABC, LinkedLogonId=0xDEF) tersimpan
-                        // di disk. Saat replay, tanpa fix ini hanya 0xABC yang ter-register.
-                        // 4634 untuk sesi elevated membawa 0xABC → terblokir ✓
-                        // 4634 untuk sesi standard membawa 0xDEF → LOLOS (bug) → fix: register 0xDEF juga
-                        if (!string.IsNullOrEmpty(raw.LinkedLogonId))
-                        {
-                            _adminCorrelationService.RegisterAdminSession(
-                                computerName,
-                                raw.LinkedLogonId,
-                                $"[ADMIN] Admin session linked ID re-hydrated from RawStore: " +
-                                $"user={raw.Username} linkedLogonId={raw.LinkedLogonId} computer={computerName}");
-                        }
+                            $"user={raw.Username} logonId={raw.LogonId}{linkedSuffix} computer={computerName}");
                     }
 
                     // Gate: tidak di-enqueue, tidak di-dispatch, tidak ke SharePoint.
@@ -3542,11 +3531,17 @@ namespace EventLogOutEmployeeService
                     // bisa di-korelasikan tanpa disk read.
                     if (!string.IsNullOrEmpty(adminLogonId))
                     {
+                        string? linkedLogonId = SecurityEventParser.GetLinkedLogonId(adminExcerpt ?? eventMessage);
+                        string linkedSuffix = string.IsNullOrEmpty(linkedLogonId)
+                            ? string.Empty
+                            : $" linkedLogonId={linkedLogonId}";
+
                         _adminCorrelationService.RegisterAdminSession(
                             computerName,
                             adminLogonId,
+                            linkedLogonId,
                             $"[ADMIN] Admin session cached for correlation (live 4624): " +
-                            $"logonId={adminLogonId} computer={computerName}");
+                            $"logonId={adminLogonId}{linkedSuffix} computer={computerName}");
                     }
 
                     // Gate: jangan enqueue atau dispatch — admin session tidak boleh sampai ke SharePoint.
@@ -4081,6 +4076,9 @@ namespace EventLogOutEmployeeService
                 string? username = parsed.Username;
                 string? sid = parsed.Sid;
                 int logonType = parsed.LogonType;
+                string? linkedLogonId = isAdmin
+                    ? SecurityEventParser.GetLinkedLogonId(parsed.Message ?? parsed.MessageExcerpt)
+                    : null;
 
                 var raw = new RawSecurityEvent
                 {
@@ -4100,9 +4098,7 @@ namespace EventLogOutEmployeeService
                     // Tanpa ini, 4634 yang membawa LogonId = LinkedLogonId dari 4624 admin
                     // lolos admin gate di replay karena in-memory cache hanya berisi LogonId
                     // utama. Null untuk non-admin dan untuk 4634/4647.
-                    LinkedLogonId  = isAdmin
-                        ? SecurityEventParser.GetLinkedLogonId(parsed.Message ?? parsed.MessageExcerpt)
-                        : null
+                    LinkedLogonId  = linkedLogonId
                 };
 
                 // SELALU simpan — termasuk admin session.
@@ -4114,11 +4110,16 @@ namespace EventLogOutEmployeeService
                 // bisa dikorelasikan tanpa disk read. Disk copy menangani skenario cross-restart.
                 if (isAdmin && !string.IsNullOrEmpty(logonId))
                 {
+                    string linkedSuffix = string.IsNullOrEmpty(linkedLogonId)
+                        ? string.Empty
+                        : $" linkedLogonId={linkedLogonId}";
+
                     _adminCorrelationService.RegisterAdminSession(
                         entry.MachineName,
                         logonId,
+                        linkedLogonId,
                         $"[ADMIN] Admin session saved for correlation: " +
-                        $"user={username} logonId={logonId} computer={entry.MachineName}");
+                        $"user={username} logonId={logonId}{linkedSuffix} computer={entry.MachineName}");
                 }
             }
             catch { /* jangan crash service */ }
