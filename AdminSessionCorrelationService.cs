@@ -10,13 +10,27 @@ namespace EventLogOutEmployeeService
     {
         // ── Admin session correlation cache ──────────────────────────────────────
         // Key:   BuildAdminSessionKey(computerName, logonId)  →  "{COMPUTER}::{bootSessionId}::{0xlogonid}"
-        // Value: expiry timestamp (UTC) untuk admin session.
+        // Value: AdminSessionEntry (LogonId, LinkedLogonId, expiry UTC) untuk admin session.
         // Tujuan: korelasikan 4634 logout ke 4624 admin login via Logon ID.
         //         4634 tidak membawa Elevated Token / Linked Logon ID, sehingga
         //         tanpa cache ini konteks admin hilang sepenuhnya.
         // Thread-safety: dilindungi oleh _adminSessionLock.
-        private readonly Dictionary<string, DateTime> _adminSessions =
-            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private sealed class AdminSessionEntry
+        {
+            public AdminSessionEntry(string logonId, string? linkedLogonId, DateTime expiryUtc)
+            {
+                LogonId = logonId;
+                LinkedLogonId = linkedLogonId;
+                ExpiryUtc = expiryUtc;
+            }
+
+            public string LogonId { get; }
+            public string? LinkedLogonId { get; }
+            public DateTime ExpiryUtc { get; set; }
+        }
+
+        private readonly Dictionary<string, AdminSessionEntry> _adminSessions =
+            new Dictionary<string, AdminSessionEntry>(StringComparer.OrdinalIgnoreCase);
         private readonly object _adminSessionLock = new object();
         private DateTime _lastAdminCachePrune = DateTime.MinValue;
         private static readonly TimeSpan AdminSessionRetention = TimeSpan.FromHours(48);
@@ -128,6 +142,13 @@ namespace EventLogOutEmployeeService
             => InvalidateBootSessionOnWindowsShutdown();
 
         public void RegisterAdminSession(string computerName, string logonId, string? logMessage)
+            => RegisterAdminSession(computerName, logonId, linkedLogonId: null, logMessage);
+
+        public void RegisterAdminSession(
+            string computerName,
+            string logonId,
+            string? linkedLogonId,
+            string? logMessage)
         {
             if (string.IsNullOrEmpty(logonId))
                 return;
@@ -135,7 +156,30 @@ namespace EventLogOutEmployeeService
             string cacheKey = BuildAdminSessionKey(computerName, logonId);
             lock (_adminSessionLock)
             {
-                _adminSessions[cacheKey] = DateTime.UtcNow.Add(AdminSessionRetention);
+                if (_adminSessions.TryGetValue(cacheKey, out var existing))
+                {
+                    if (linkedLogonId != null &&
+                        !string.IsNullOrEmpty(existing.LinkedLogonId) &&
+                        !LogonIdEquals(existing.LinkedLogonId, linkedLogonId))
+                    {
+                        string oldLinkedKey = BuildAdminSessionKey(computerName, existing.LinkedLogonId);
+                        _adminSessions.Remove(oldLinkedKey);
+                    }
+                }
+
+                var entry = new AdminSessionEntry(
+                    logonId,
+                    linkedLogonId,
+                    DateTime.UtcNow.Add(AdminSessionRetention));
+
+                _adminSessions[cacheKey] = entry;
+
+                if (!string.IsNullOrEmpty(linkedLogonId) && !LogonIdEquals(linkedLogonId, logonId))
+                {
+                    string linkedKey = BuildAdminSessionKey(computerName, linkedLogonId);
+                    _adminSessions[linkedKey] = entry;
+                }
+
                 PruneAdminSessionCache();
             }
 
@@ -154,16 +198,20 @@ namespace EventLogOutEmployeeService
             // 1. In-memory cache (fast path) — validasi expiry secara eksplisit.
             lock (_adminSessionLock)
             {
-                if (_adminSessions.TryGetValue(cacheKey, out DateTime expiry))
+                if (_adminSessions.TryGetValue(cacheKey, out var entry))
                 {
-                    if (expiry > DateTime.UtcNow)
+                    if (entry.ExpiryUtc > DateTime.UtcNow)
                     {
-                        isAdminSession = true;
+                        if (LogonIdEquals(entry.LogonId, logonId) ||
+                            LogonIdEquals(entry.LinkedLogonId, logonId))
+                        {
+                            isAdminSession = true;
+                        }
                     }
                     else
                     {
-                        // Entry ada tapi expired — bersihkan sekarang
-                        _adminSessions.Remove(cacheKey);
+                        // Entry ada tapi expired — bersihkan sekarang (primary + linked key)
+                        RemoveAdminSessionEntries(computerName, entry);
                     }
                 }
             }
@@ -186,8 +234,8 @@ namespace EventLogOutEmployeeService
                         var rawLogins = _rawEventStore.GetEventsForDate(computerName, searchDate, 4624);
                         isAdminSession = rawLogins.Any(r =>
                             r.IsAdminLogon &&
-                            !string.IsNullOrEmpty(r.LogonId) &&
-                            r.LogonId.Equals(logonId, StringComparison.OrdinalIgnoreCase) &&
+                            (LogonIdEquals(r.LogonId, logonId) ||
+                             LogonIdEquals(r.LinkedLogonId, logonId)) &&
                             r.EventTimeUtc >= retentionCutoff &&
                             // Boot boundary: tolak 4624 sebelum boot terakhir.
                             r.EventTimeUtc >= lastBootUtc);
@@ -236,12 +284,27 @@ namespace EventLogOutEmployeeService
             var expired = new List<string>();
             foreach (var kv in _adminSessions)
             {
-                if (kv.Value < DateTime.UtcNow)
+                if (kv.Value.ExpiryUtc < DateTime.UtcNow)
                     expired.Add(kv.Key);
             }
 
             foreach (string k in expired)
                 _adminSessions.Remove(k);
+        }
+
+        private static bool LogonIdEquals(string? left, string? right)
+            => !string.IsNullOrEmpty(left) &&
+               !string.IsNullOrEmpty(right) &&
+               left.Equals(right, StringComparison.OrdinalIgnoreCase);
+
+        private void RemoveAdminSessionEntries(string computerName, AdminSessionEntry entry)
+        {
+            _adminSessions.Remove(BuildAdminSessionKey(computerName, entry.LogonId));
+            if (!string.IsNullOrEmpty(entry.LinkedLogonId) &&
+                !LogonIdEquals(entry.LinkedLogonId, entry.LogonId))
+            {
+                _adminSessions.Remove(BuildAdminSessionKey(computerName, entry.LinkedLogonId));
+            }
         }
     }
 }
