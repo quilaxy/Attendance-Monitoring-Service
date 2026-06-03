@@ -1006,7 +1006,18 @@ namespace EventLogOutEmployeeService
                 $"shutdownTime={shutdownTime:O} eventId={eventId} eventType='{eventType}'",
                 EventLogEntryType.Information, 3010);
 
+            // ── Optimistic-concurrency retry loop ─────────────────────────────────
+            // Setiap iterasi: GET row (+ ETag) → priority check → PATCH dengan If-Match.
+            // Jika SharePoint return 412 (row diubah device lain setelah GET kita),
+            // loop retry dari awal: re-read row dengan ETag baru → re-check → re-PATCH.
+            // Ini menggantikan last-write-wins dengan "correct-value-wins via retry".
+            // MaxRaceRetries=3 — setelah itu log warning dan keluar tanpa throw.
+            const int MaxRaceRetries = 3;
+
             using var client = CreateGraphClient(accessToken, 90); // 90s — retry bisa butuh ~21s
+
+            for (int raceAttempt = 1; raceAttempt <= MaxRaceRetries; raceAttempt++)
+            {
             var summaryItem = await FindSummaryItemForShutdownAsync(
                 client, computerName, username, shutdownTime, summaryCache, cancellationToken);
             if (summaryItem == null)
@@ -1050,6 +1061,13 @@ namespace EventLogOutEmployeeService
 
             string? itemId  = summaryItem?["id"]?.ToString();
             if (string.IsNullOrWhiteSpace(itemId)) return;
+
+            // ── ETag untuk optimistic concurrency ──────────────────────────────────
+            // Graph API menyertakan @odata.etag di setiap item. ETag ini di-set sebagai
+            // If-Match di PATCH agar SharePoint return 412 kalau row berubah sejak GET kita.
+            // TryAddWithoutValidation dipakai karena SharePoint ETag bisa mengandung koma
+            // yang akan ditolak EntityTagHeaderValue parser standar.
+            string? etag = summaryItem?["@odata.etag"]?.ToString();
 
             var fields            = summaryItem?["fields"] as JObject;
             DateTime? loginTime   = ParseFieldDateTime(fields, "LoginTime");
@@ -1156,7 +1174,8 @@ namespace EventLogOutEmployeeService
             SafeWriteEventLog("Application",
                 $"[DBG-Summary] TryUpdateShutdown: PATCHING itemId={itemId} " +
                 $"shutdownTime={shutdownTime:O} shutdownType='{shutdownTypeStr}' " +
-                $"priority={newPriority} isNewSession={isNewSession}",
+                $"priority={newPriority} isNewSession={isNewSession} " +
+                $"etagPresent={!string.IsNullOrWhiteSpace(etag)} raceAttempt={raceAttempt}/{MaxRaceRetries}",
                 EventLogEntryType.Information, 3016);
 
             // PATCH ke /items/{id}/fields — body langsung berisi field values tanpa "fields" wrapper
@@ -1177,7 +1196,43 @@ namespace EventLogOutEmployeeService
             using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
                 $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
             { Content = patchContent };
+
+            // ── If-Match: optimistic concurrency guard ─────────────────────────────
+            // ETag di-set dari @odata.etag yang dibaca saat GET di atas.
+            // SharePoint akan reject PATCH dengan 412 kalau row sudah diubah
+            // oleh device lain sejak ETag ini dibaca → loop retry dari atas.
+            if (!string.IsNullOrWhiteSpace(etag))
+                patchRequest.Headers.TryAddWithoutValidation("If-Match", etag);
+
             var patchResult = await client.SendAsync(patchRequest, cancellationToken);
+
+            // ── 412 Precondition Failed: race condition terdeteksi ─────────────────
+            // Row diubah device lain setelah GET kita — ETag tidak cocok lagi.
+            // Retry: re-read row (ETag baru) → re-check priority → re-PATCH.
+            if ((int)patchResult.StatusCode == 412)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] TryUpdateShutdown: 412 Precondition Failed — " +
+                    $"concurrent write detected on itemId={itemId} " +
+                    $"(attempt {raceAttempt}/{MaxRaceRetries}). Re-reading and retrying...",
+                    EventLogEntryType.Warning, 3030);
+
+                if (raceAttempt < MaxRaceRetries)
+                {
+                    await Task.Delay(500 * raceAttempt, cancellationToken);
+                    continue; // kembali ke atas loop: re-read row dengan ETag baru
+                }
+
+                // Semua retry habis — tidak bisa menang dari race condition ini.
+                // Log warning; data mungkin perlu cek manual.
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] TryUpdateShutdown: GAVE UP after {MaxRaceRetries} race retries " +
+                    $"for itemId={itemId} user={username} shutdownTime={shutdownTime:O}. " +
+                    $"Row may have incorrect ShutdownTime — manual verification recommended.",
+                    EventLogEntryType.Warning, 3031);
+                return;
+            }
+
             if (!patchResult.IsSuccessStatusCode)
             {
                 string body = await patchResult.Content.ReadAsStringAsync();
@@ -1189,6 +1244,86 @@ namespace EventLogOutEmployeeService
             SafeWriteEventLog("Application",
                 $"[DBG-Summary] TryUpdateShutdown: PATCH success itemId={itemId}",
                 EventLogEntryType.Information, 3017);
+
+            // ── Post-PATCH verify (short-term safety net) ─────────────────────────
+            // Re-read row setelah PATCH untuk konfirmasi nilai yang kita tulis benar-benar
+            // tersimpan. Berguna sebagai net kedua saat ETag tidak tersedia (etag null),
+            // atau untuk deteksi race condition yang terjadi di luar window If-Match check.
+            await VerifyAndLogShutdownPatchAsync(client, itemId, shutdownTime, username, cancellationToken);
+
+            return; // PATCH berhasil — keluar dari retry loop
+            } // end for raceAttempt
+        }
+
+        // ── Post-PATCH verify ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Re-read summary row setelah PATCH dan bandingkan ShutdownTime yang tersimpan
+        /// dengan nilai yang kita kirim. Perbedaan > 5 detik mengindikasikan race condition —
+        /// device lain mungkin meng-overwrite PATCH kita setelah If-Match check lolos.
+        ///
+        /// Ini adalah safety net layer kedua di atas ETag/If-Match:
+        ///   • If-Match mencegah race condition yang terdeteksi saat PATCH dikirim.
+        ///   • VerifyAndLog mendeteksi race condition yang terjadi di luar window tersebut.
+        ///
+        /// Bersifat best-effort — tidak throw, tidak retry. Hanya mencatat warning di Event Log
+        /// agar operator tahu ada potensi data yang perlu dicek manual.
+        /// </summary>
+        private async Task VerifyAndLogShutdownPatchAsync(
+            HttpClient client,
+            string itemId,
+            DateTime expectedShutdownTime,
+            string username,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                // Beri SharePoint sedikit waktu untuk menyebarkan write sebelum re-read.
+                await Task.Delay(600, cancellationToken);
+
+                string verifyUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}" +
+                                   $"/items/{itemId}?$expand=fields&$select=id,fields";
+                var verifyRequest  = new HttpRequestMessage(HttpMethod.Get, verifyUrl);
+                var verifyResponse = await client.SendAsync(verifyRequest, cancellationToken);
+                if (!verifyResponse.IsSuccessStatusCode)
+                    return; // verify bersifat best-effort; biarkan caller terus
+
+                var verifyItem   = JsonConvert.DeserializeObject<JObject>(
+                    await verifyResponse.Content.ReadAsStringAsync());
+                var verifyFields = verifyItem?["fields"] as JObject;
+                DateTime? writtenShutdown = ParseFieldDateTime(verifyFields, "ShutdownTime");
+
+                if (!writtenShutdown.HasValue)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown VERIFY: ShutdownTime null setelah PATCH " +
+                        $"— itemId={itemId} user={username} expected={expectedShutdownTime:O}. " +
+                        $"Kemungkinan concurrent write menimpa nilai kita.",
+                        EventLogEntryType.Warning, 3032);
+                    return;
+                }
+
+                double diffSeconds = Math.Abs((writtenShutdown.Value - expectedShutdownTime).TotalSeconds);
+                if (diffSeconds > 5)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown VERIFY MISMATCH — " +
+                        $"expected={expectedShutdownTime:O} written={writtenShutdown.Value:O} " +
+                        $"diff={diffSeconds:F0}s itemId={itemId} user={username}. " +
+                        $"Race condition kemungkinan terjadi setelah If-Match check. " +
+                        $"Perlu verifikasi manual di SharePoint.",
+                        EventLogEntryType.Warning, 3032);
+                }
+                else
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown VERIFY OK — " +
+                        $"shutdownTime={writtenShutdown.Value:O} matches expected (diff={diffSeconds:F1}s).",
+                        EventLogEntryType.Information, 3033);
+                }
+            }
+            catch (OperationCanceledException) { /* service shutting down */ }
+            catch { /* verify bersifat best-effort — jangan crash service */ }
         }
 
         // ── Cleanup ───────────────────────────────────────────────────────────────
@@ -1487,6 +1622,8 @@ namespace EventLogOutEmployeeService
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
             3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019, 3021, 3022, 3023,
+            // Post-PATCH verify OK (3033) — verbose only; mismatch (3032) dan race (3030/3031) selalu di-log
+            3033,
             // Dispatch & raw detail
             4010, 4011, 4020, 4021, 4022, 4025,
             // Cleanup progress

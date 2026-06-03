@@ -21,7 +21,7 @@ namespace EventLogOutEmployeeService
         {
             // Akun sistem Windows standar
             "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "NETWORK SERVICE",
-            "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator",
+            "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator", "localadmin",
             // Nama Windows path component yang terbukti lolos lewat Pattern 3
             // karena ada di path executable di baris pertama event 1074
             // (misal C:\\WINDOWS\\servicing\\TrustedInstaller.exe → "servicing")
