@@ -21,7 +21,7 @@ namespace EventLogOutEmployeeService
         {
             // Akun sistem Windows standar
             "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "NETWORK SERVICE",
-            "ANONYMOUS LOGON", "Guest", "DefaultAccount", "Administrator", "localadmin",
+            "ANONYMOUS LOGON", "Guest", "DefaultAccount",
             // Nama Windows path component yang terbukti lolos lewat Pattern 3
             // karena ada di path executable di baris pertama event 1074
             // (misal C:\\WINDOWS\\servicing\\TrustedInstaller.exe → "servicing")
@@ -35,6 +35,15 @@ namespace EventLogOutEmployeeService
             "DWM-", "UMFD-", "NT Service",
             // Path-relative prefixes yang kadang tersisa setelah NormalizeDisplayUsername
             "NT AUTHORITY", "BUILTIN"
+        };
+
+        private static readonly HashSet<string> ExcludedUsers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "localadmin",
+            "Administrator",
+            "helpdesk",
+            "itadmin",
+            "Admin"
         };
 
         public static ParsedSecurityEvent Parse(EventLogEntry entry)
@@ -280,6 +289,7 @@ namespace EventLogOutEmployeeService
                 return false;
 
             if (InvalidUsernames.Contains(username)) return false;
+            if (ExcludedUsers.Contains(username)) return false;
             if (username.EndsWith("$")) return false;
 
             foreach (var prefix in InvalidUsernamePrefixes)
