@@ -845,6 +845,8 @@ namespace EventLogOutEmployeeService
             // SharePoint summary detail
             3001, 3002, 3003, 3004, 3005, 3007, 3008,
             3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3021, 3022,
+            // 3032 = cross-device later time (info, verbose — terjadi setiap ada multi-device shutdown)
+            3032,
             // Dispatch detail (per-event, terlalu sering di production)
             4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009, 4010,
             // Event 42 last-resort promotion

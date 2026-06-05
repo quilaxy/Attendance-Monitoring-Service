@@ -1090,6 +1090,10 @@ namespace EventLogOutEmployeeService
             DateTime? expectedTimeOut = ParseFieldDateTime(fields, "ExpectedTimeOut");
             DateTime? currentShutdown = ParseFieldDateTime(fields, "ShutdownTime");
             string? currentShutdownType = fields?["ShutdownType"]?.ToString();
+            // Baca device yang meng-set ShutdownTime terakhir.
+            // Dipakai untuk cross-device check: device berbeda + waktu lebih baru → boleh update
+            // terlepas dari priority, karena aturan multi-device = device yang mati terakhir menang.
+            string? currentLogoutDevice = fields?["LogoutDevice"]?.ToString();
 
             SafeWriteEventLog("Application",
                 $"[DBG-Summary] TryUpdateShutdown: found row itemId={itemId} " +
@@ -1097,6 +1101,7 @@ namespace EventLogOutEmployeeService
                 $"expectedTimeOut={expectedTimeOut?.ToString("O") ?? "(null)"} " +
                 $"currentShutdown={currentShutdown?.ToString("O") ?? "(null)"} " +
                 $"currentType='{currentShutdownType ?? "(empty)"}' " +
+                $"currentLogoutDevice='{currentLogoutDevice ?? "(empty)"}' " +
                 $"allFields={fields?.ToString(Newtonsoft.Json.Formatting.None) ?? "(null)"}",
                 EventLogEntryType.Information, 3012);
 
@@ -1151,6 +1156,40 @@ namespace EventLogOutEmployeeService
                         t <= shutdownTime);
                 }
             }
+
+            // FIX [CROSS-DEVICE]: Skenario multi-device — device berbeda dengan waktu lebih baru.
+            //
+            // Problem sebelumnya:
+            //   LAPTOP → 4647 jam 13:00  (priority 6, LogoutDevice = LAPTOP)
+            //   PC     → 42   jam 16:00  (priority -1)
+            //   → isNewSession = false (PC tidak punya 4624 antara 13:00–16:00 karena resume sleep)
+            //   → priority check: -1 < 6 → SKIP ← BUG
+            //   → ShutdownTime tetap 13:00 padahal PC baru mati jam 16:00
+            //
+            // Fix: jika shutdownTime > currentShutdown DAN device berbeda, bypass priority —
+            // cukup waktu lebih baru yang menentukan. Priority system HANYA relevan untuk
+            // same-device same-session (jangan biarkan kualitas rendah override kualitas tinggi
+            // di sesi yang sama). Cross-device: device yang mati TERAKHIR selalu menang.
+            //
+            // Guard:
+            //   - shutdownTime HARUS lebih baru dari currentShutdown (bukan retroactive override)
+            //   - currentLogoutDevice tidak boleh kosong (kalau kosong, tidak tahu device mana
+            //     yang set — fallback ke priority system normal agar tidak salah)
+            bool isCrossDeviceLaterTime = false;
+            if (currentShutdown.HasValue &&
+                shutdownTime > currentShutdown.Value &&
+                !string.IsNullOrWhiteSpace(currentLogoutDevice) &&
+                !computerName.Equals(currentLogoutDevice, StringComparison.OrdinalIgnoreCase))
+            {
+                isCrossDeviceLaterTime = true;
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] TryUpdateShutdown: CROSS-DEVICE later time — " +
+                    $"incoming device='{computerName}' (time={shutdownTime:O}, priority={newPriority}) " +
+                    $"overrides currentLogoutDevice='{currentLogoutDevice}' (time={currentShutdown.Value:O}, priority={effectiveCurrentPriority}). " +
+                    $"Priority check bypassed — latest device wins.",
+                    EventLogEntryType.Information, 3032);
+            }
+
             if (isNewSession)
             {
                 SafeWriteEventLog("Application",
@@ -1160,9 +1199,14 @@ namespace EventLogOutEmployeeService
                     EventLogEntryType.Information, 3018);
                 // Sesi baru → tulis langsung tanpa cek priority lama.
             }
+            else if (isCrossDeviceLaterTime)
+            {
+                // Cross-device, waktu lebih baru → tulis langsung tanpa cek priority.
+                // Log sudah ditulis di atas saat isCrossDeviceLaterTime di-set.
+            }
             else
             {
-                // Sesi yang sama — terapkan priority system normal dengan effectiveCurrentPriority.
+                // Same device, same session — terapkan priority system normal.
                 if (newPriority < effectiveCurrentPriority)
                 {
                     SafeWriteEventLog("Application",
