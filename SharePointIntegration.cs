@@ -579,6 +579,8 @@ namespace EventLogOutEmployeeService
             DateTime timestampUtc,
             int queueCount,
             DateTime? lastEventTimeUtc,
+            DateTime? lastSecurityEventTimeUtc,
+            string securitySubscriptionStatus,
             string serviceVersion,
             CancellationToken cancellationToken = default)
         {
@@ -656,12 +658,26 @@ namespace EventLogOutEmployeeService
             // HeartbeatWriterTask (catch logs warning, does not crash the task).
             var fields = new JObject
             {
-                ["MachineName"]    = machineName,
-                ["Timestamp"]      = ToUtcString(timestampUtc),
-                ["QueueCount"]     = queueCount,
-                ["LastEventTime"]  = lastEventTimeUtc.HasValue ? ToUtcString(lastEventTimeUtc.Value) : null,
-                ["ServiceVersion"] = serviceVersion,
-                ["AlertStatus"]    = alertStatusStr   // TASK 3: new field
+                ["MachineName"]                  = machineName,
+                ["Timestamp"]                    = ToUtcString(timestampUtc),
+                ["QueueCount"]                   = queueCount,
+                ["LastEventTime"]                = lastEventTimeUtc.HasValue ? ToUtcString(lastEventTimeUtc.Value) : null,
+                ["ServiceVersion"]               = serviceVersion,
+                ["AlertStatus"]                  = alertStatusStr,
+                // Kapan terakhir event APAPUN dari Security log diterima subscription.
+                // Berbeda dari LastEventTime yang hanya update saat 4624/4647.
+                // Kalau LastSecurityEventTime recent tapi LastEventTime stale → subscription
+                // hidup, hanya Windows tidak fire 4624 (Fast Startup / session resume).
+                // Kalau LastSecurityEventTime juga stale → kemungkinan subscription drop.
+                ["LastSecurityEventTime"]        = lastSecurityEventTimeUtc.HasValue
+                                                   ? ToUtcString(lastSecurityEventTimeUtc.Value)
+                                                   : null,
+                // Status subscription Security log.
+                // OK            = subscription aktif, event masuk normal
+                // SILENT        = health check deteksi tidak ada event (sedang investigasi)
+                // RESUBSCRIBED  = health check / OnPowerEvent berhasil re-subscribe
+                // FAILED        = semua attempt re-subscribe gagal
+                ["SecuritySubscriptionStatus"]   = securitySubscriptionStatus
             };
 
             if (!string.IsNullOrWhiteSpace(itemId))

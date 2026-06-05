@@ -2325,6 +2325,8 @@ namespace EventLogOutEmployeeService
                                 $"Force re-subscribe + mini-replay.",
                                 EventLogEntryType.Warning, 1079);
 
+                            _securitySubscriptionStatus = "SILENT";
+
                             // Buffer 5 menit sebelum subscription untuk tangkap event yang terjadi
                             // tepat saat wake sebelum service berhasil subscribe.
                             DateTime missedSince = new DateTime(enabledTicks, DateTimeKind.Utc)
@@ -2364,6 +2366,8 @@ namespace EventLogOutEmployeeService
                         $"[HEALTH] Mid-day drop detected: Security log silent {silentMinutes} min " +
                         $"(threshold={silentThresholdWorkHour / 60} min). Re-subscribe + mini-replay.",
                         EventLogEntryType.Warning, 1079);
+
+                    _securitySubscriptionStatus = "SILENT";
 
                     DateTime midDayMissedSince = lastEventTicks == DateTime.MinValue.Ticks
                         ? new DateTime(enabledTicks, DateTimeKind.Utc)
@@ -2428,6 +2432,8 @@ namespace EventLogOutEmployeeService
                     Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, nowTicks);
                     Interlocked.Exchange(ref _securityProbeEpochTicks,     nowTicks);
 
+                    _securitySubscriptionStatus = "RESUBSCRIBED";
+
                     SafeWriteEventLog("Application",
                         $"[HEALTH] Re-subscribed OK (attempt {attempt}/{maxAttempts}).",
                         EventLogEntryType.Information, 1080);
@@ -2453,6 +2459,7 @@ namespace EventLogOutEmployeeService
                     "Will retry at next health check cycle (~30s). Consider checking EventLog permissions.",
                     EventLogEntryType.Error, 1085);
                 _resubscribeFailed = true;
+                _securitySubscriptionStatus = "FAILED";
                 return;
             }
 
@@ -3191,10 +3198,23 @@ namespace EventLogOutEmployeeService
                     {
                         DateTime nowUtc = DateTime.UtcNow;
                         int queueCount = await eventQueue.GetCountAsync(cancellationToken);
+
+                        // LastEventTime: kapan terakhir 4624 / 4647 masuk queue
                         long lastEventTicks = Interlocked.Read(ref _lastEnqueuedLoginLogoutEventTicksUtc);
                         DateTime? lastEventTimeUtc = lastEventTicks == DateTime.MinValue.Ticks
                             ? (DateTime?)null
                             : new DateTime(lastEventTicks, DateTimeKind.Utc);
+
+                        // LastSecurityEventTime: kapan terakhir event APAPUN dari Security log diterima.
+                        // Kalau ini recent tapi LastEventTime stale → subscription hidup,
+                        // hanya Windows tidak fire 4624 (Fast Startup / session resume).
+                        long lastSecurityTicks = Interlocked.Read(ref _lastSecurityEventTicksUtc);
+                        DateTime? lastSecurityEventTimeUtc = lastSecurityTicks == DateTime.MinValue.Ticks
+                            ? (DateTime?)null
+                            : new DateTime(lastSecurityTicks, DateTimeKind.Utc);
+
+                        string securitySubscriptionStatus = _securitySubscriptionStatus;
+
                         string serviceVersion = typeof(LoginLogoutMonitorService).Assembly
                             .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()
                             ?.InformationalVersion ?? "unknown";
@@ -3215,11 +3235,15 @@ namespace EventLogOutEmployeeService
                                 nowUtc,
                                 queueCount,
                                 lastEventTimeUtc,
+                                lastSecurityEventTimeUtc,
+                                securitySubscriptionStatus,
                                 serviceVersion,
                                 cancellationToken);
                             SafeWriteEventLog("Application",
                                 $"[HEARTBEAT] OK: machine={Environment.MachineName} " +
-                                $"queue={queueCount} lastEvent={lastEventTimeUtc?.ToString("O") ?? "(none)"}",
+                                $"queue={queueCount} lastEvent={lastEventTimeUtc?.ToString("O") ?? "(none)"} " +
+                                $"lastSecurityEvent={lastSecurityEventTimeUtc?.ToString("O") ?? "(none)"} " +
+                                $"securityStatus={securitySubscriptionStatus}",
                                 EventLogEntryType.Information, 1098);
                         }
                     }
@@ -3257,6 +3281,13 @@ namespace EventLogOutEmployeeService
         private long _securityProbeEpochTicks     = DateTime.MinValue.Ticks;
         private volatile bool _resubscribeFailed = false;
 
+        // Status subscription Security log — ditulis ke heartbeat SharePoint.
+        // Membedakan dua kondisi yang tampak sama dari LastEventTime saja:
+        //   "subscription hidup, Windows tidak fire 4624 (Fast Startup)" vs
+        //   "subscription benar-benar drop silently".
+        // volatile: dibaca dari HeartbeatWriterTask tanpa lock.
+        private volatile string _securitySubscriptionStatus = "OK";
+
         // ── System log subscription health check ────────────────────────────────
         // _lastSystemEventTicksUtc: kapan terakhir OnSystemEventWritten dipanggil.
         // _lastObservedSystemRecordId: record ID terakhir yang benar-benar diterima handler.
@@ -3279,8 +3310,12 @@ namespace EventLogOutEmployeeService
         {
             if (e?.Entry == null) return;
 
-            // Reset health check counter — subscription masih hidup
+            // Reset health check counter — subscription masih hidup.
+            // Setiap Security event (apapun ID-nya) membuktikan subscription aktif.
+            // _lastSecurityEventTicksUtc dipakai oleh SecurityLogSubscriptionHealthCheckTask
+            // untuk membedakan "subscription drop" vs "Windows tidak fire 4624 (Fast Startup)".
             Interlocked.Exchange(ref _lastSecurityEventTicksUtc, DateTime.UtcNow.Ticks);
+            _securitySubscriptionStatus = "OK";
 
             EventLogEntry entry = e.Entry;
             if (_replayService.ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime(), isSecurityEvent: true))

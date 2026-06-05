@@ -43,7 +43,8 @@ namespace EventLogOutEmployeeService
             "Administrator",
             "helpdesk",
             "itadmin",
-            "Admin"
+            "Admin",
+            "kidannafi"
         };
 
         public static ParsedSecurityEvent Parse(EventLogEntry entry)
