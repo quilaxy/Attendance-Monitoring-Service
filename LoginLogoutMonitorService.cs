@@ -1348,6 +1348,32 @@ namespace EventLogOutEmployeeService
                     Interlocked.Exchange(ref _systemSubscriptionEnabledTicksUtc, resumeTicks);
                     Interlocked.Exchange(ref _lastSystemEventTicksUtc,           DateTime.MinValue.Ticks);
 
+                    // Reset watchdog heartbeat baselines untuk task yang MASIH running.
+                    //
+                    // Masalah: saat PC resume dari sleep/hibernate, task-task background (queue
+                    // processor, cleanup, heartbeat, dll.) tidak di-restart — mereka dilanjutkan
+                    // dari state sebelum suspend. Heartbeat tick mereka terakhir diperbarui sebelum
+                    // suspend, sehingga watchdog mengukur elapsed = durasi sleep (bisa 8-15+ jam).
+                    // Ini menyebabkan watchdog langsung restart semua task di check berikutnya
+                    // (~5 menit) meskipun task sebenarnya masih aktif dan akan heartbeat sendiri
+                    // segera setelah resume.
+                    //
+                    // Fix: reset baseline ke 'now' HANYA untuk task yang !IsTaskStopped.
+                    // Task yang sudah crash/selesai sebelum sleep dibiarkan stale — watchdog akan
+                    // mendeteksi dan me-restart mereka seperti biasa (perilaku yang diinginkan).
+                    // Task yang masih running diberi grace period = timeout normal mereka dari
+                    // titik resume, bukan dari sebelum suspend.
+                    if (!IsTaskStopped(queueTask))
+                        Interlocked.Exchange(ref _lastQueueProcessorHeartbeatUtc, resumeTicks);
+                    if (!IsTaskStopped(cleanupTask))
+                        Interlocked.Exchange(ref _lastCleanupHeartbeatUtc,        resumeTicks);
+                    if (!IsTaskStopped(securityHealthTask))
+                        Interlocked.Exchange(ref _lastSecurityHealthHeartbeatUtc, resumeTicks);
+                    if (!IsTaskStopped(systemHealthTask))
+                        Interlocked.Exchange(ref _lastSystemHealthHeartbeatUtc,   resumeTicks);
+                    if (!IsTaskStopped(heartbeatTask))
+                        Interlocked.Exchange(ref _lastHeartbeatTaskHeartbeatUtc,  resumeTicks);
+
                     var ct = cancellationToken ?? CancellationToken.None;
 
                     _ = Task.Run(async () =>
@@ -2468,33 +2494,62 @@ namespace EventLogOutEmployeeService
             _resubscribeFailed = false;
 
             // Mini-replay: tangkap event yang missed selama subscription mati.
-            // Security log sebagai sumber utama, RawEventStore sebagai fallback
-            // kalau Security log sudah di-rotate sejak subscription drop.
+            //
+            // PENTING: Security log replay dan RawStore replay dijalankan dalam try-catch TERPISAH.
+            // Alasan: EventLog.Entries adalah live collection — kalau log rotate selama iterasi,
+            // akses index bisa throw ArgumentException/IndexOutOfRangeException (race condition).
+            // Jika keduanya dalam satu try-catch, crash di Security replay akan skip RawStore
+            // replay juga — padahal RawStore membaca dari disk lokal dan tidak tergantung pada
+            // EventLog. Dengan memisahkan keduanya, RawStore replay tetap berjalan meski
+            // Security log replay gagal.
+            SafeWriteEventLog("Application",
+                $"[HEALTH] Mini-replay: from={missedSinceUtc:O} to={replayToUtc:O}",
+                EventLogEntryType.Information, 1082);
+
+            bool securityReplayOk = false;
+
+            // ── Step 1: Security log replay (sumber utama) ──────────────────────────
+            // Jalankan di thread pool — ReplaySecurityEvents memanggil
+            // ProcessSecurityEntryAsync secara sync (.GetAwaiter().GetResult())
+            // sehingga perlu thread terpisah untuk hindari deadlock dari async context.
             try
             {
-                SafeWriteEventLog("Application",
-                    $"[HEALTH] Mini-replay: from={missedSinceUtc:O} to={replayToUtc:O}",
-                    EventLogEntryType.Information, 1082);
-
-                // Jalankan di thread pool — ReplaySecurityEvents memanggil
-                // ProcessSecurityEntryAsync secara sync (.GetAwaiter().GetResult())
-                // sehingga perlu thread terpisah untuk hindari deadlock dari async context.
                 await Task.Run(
                     () => _replayService.ReplaySecurityEvents(missedSinceUtc, replayToUtc),
                     cancellationToken);
 
-                await _replayService.ReplayFromRawStore(missedSinceUtc, replayToUtc);
-
+                securityReplayOk = true;
+            }
+            catch (Exception ex)
+            {
+                // IndexOutOfRangeException / ArgumentException paling sering terjadi saat
+                // Security log rotate tepat selama iterasi Entries[i]. Log dan lanjut ke
+                // RawStore replay — jangan biarkan crash ini membatalkan keduanya.
                 SafeWriteEventLog("Application",
-                    $"[HEALTH] Mini-replay done: from={missedSinceUtc:O} to={replayToUtc:O}",
-                    EventLogEntryType.Information, 1083);
+                    $"[HEALTH] Mini-replay Security log error (proceeding to raw store): {ex.Message}",
+                    EventLogEntryType.Warning, 1084);
+            }
+
+            // ── Step 2: RawStore replay (fallback / pelengkap) ──────────────────────
+            // Selalu dijalankan — bukan hanya fallback ketika Security log crash.
+            // Kalau Security log sudah di-rotate, RawStore menjadi sumber utama.
+            // Kalau Security log berhasil, RawStore mengisi event yang mungkin tidak
+            // tertangkap karena race condition write-then-rotate.
+            try
+            {
+                await _replayService.ReplayFromRawStore(missedSinceUtc, replayToUtc);
             }
             catch (Exception ex)
             {
                 SafeWriteEventLog("Application",
-                    $"[HEALTH] Mini-replay error: {ex.Message}",
+                    $"[HEALTH] Mini-replay raw store error: {ex.Message}",
                     EventLogEntryType.Warning, 1084);
             }
+
+            SafeWriteEventLog("Application",
+                $"[HEALTH] Mini-replay done: from={missedSinceUtc:O} to={replayToUtc:O} " +
+                $"securityLogOk={securityReplayOk}",
+                EventLogEntryType.Information, 1083);
         }
 
         /// <summary>
@@ -2594,7 +2649,18 @@ namespace EventLogOutEmployeeService
                 int count = systemEventLog.Entries.Count;
                 if (count == 0) return false;
 
-                EventLogEntry latest = systemEventLog.Entries[count - 1];
+                // Akses [count - 1] bisa throw ArgumentException kalau log rotate
+                // tepat setelah kita baca count. Tangkap dan return false — caller
+                // akan retry di check cycle berikutnya.
+                EventLogEntry latest;
+                try
+                {
+                    latest = systemEventLog.Entries[count - 1];
+                }
+                catch (ArgumentException)
+                {
+                    return false;
+                }
                 latestRecordId = latest.Index;
 
                 if (latestRecordId <= lastObservedRecordId || lastObservedRecordId <= 0)
@@ -2602,7 +2668,17 @@ namespace EventLogOutEmployeeService
 
                 for (int i = count - 1; i >= 0; i--)
                 {
-                    EventLogEntry entry = systemEventLog.Entries[i];
+                    EventLogEntry entry;
+                    try
+                    {
+                        entry = systemEventLog.Entries[i];
+                    }
+                    catch (ArgumentException)
+                    {
+                        // Log rotate saat iterasi — entry sebelum index ini sudah tidak ada.
+                        // Hentikan iterasi; earliestMissedUtc yang sudah dikumpulkan tetap valid.
+                        break;
+                    }
                     if (entry.Index <= lastObservedRecordId)
                         break;
 
@@ -2682,28 +2758,36 @@ namespace EventLogOutEmployeeService
 
             _systemResubscribeFailed = false;
 
+            // ── System log mini-replay ───────────────────────────────────────────────
+            // Sama dengan Security log: dua try-catch terpisah agar error di System log
+            // replay tidak membatalkan RawStore replay (jika ada).
+            // ReplaySystemEvents memanggil ProcessSystemEntryAsync secara sync (.GetAwaiter().GetResult())
+            // → jalankan di thread pool untuk hindari deadlock dari async context.
+            SafeWriteEventLog("Application",
+                $"[HEALTH-SYS] Mini-replay System: from={missedSinceUtc:O} to={replayToUtc:O}",
+                EventLogEntryType.Information, 1089);
+
+            bool systemReplayOk = false;
+
             try
             {
-                SafeWriteEventLog("Application",
-                    $"[HEALTH-SYS] Mini-replay System: from={missedSinceUtc:O} to={replayToUtc:O}",
-                    EventLogEntryType.Information, 1089);
-
-                // ReplaySystemEvents memanggil ProcessSystemEntryAsync secara sync (.GetAwaiter().GetResult())
-                // → jalankan di thread pool untuk hindari deadlock dari async context.
                 await Task.Run(
                     () => _replayService.ReplaySystemEvents(missedSinceUtc, replayToUtc),
                     cancellationToken);
 
-                SafeWriteEventLog("Application",
-                    $"[HEALTH-SYS] Mini-replay System done: from={missedSinceUtc:O} to={replayToUtc:O}",
-                    EventLogEntryType.Information, 1089);
+                systemReplayOk = true;
             }
             catch (Exception ex)
             {
                 SafeWriteEventLog("Application",
-                    $"[HEALTH-SYS] Mini-replay System error: {ex.Message}",
+                    $"[HEALTH-SYS] Mini-replay System log error: {ex.Message}",
                     EventLogEntryType.Warning, 1090);
             }
+
+            SafeWriteEventLog("Application",
+                $"[HEALTH-SYS] Mini-replay System done: from={missedSinceUtc:O} to={replayToUtc:O} " +
+                $"systemLogOk={systemReplayOk}",
+                EventLogEntryType.Information, 1089);
 
             return true;
         }
@@ -4141,7 +4225,37 @@ namespace EventLogOutEmployeeService
                 // SELALU simpan — termasuk admin session.
                 // RawEventStore kini berfungsi ganda: replay storage DAN session-correlation cache.
                 // Menyimpan admin event ke disk TIDAK berarti di-enqueue atau di-dispatch.
-                await rawEventStore.SaveAsync(raw);
+                //
+                // Retry dua kali untuk transient disk error (file lock, I/O momentary failure).
+                // Jika semua attempt gagal, log event ID 4025 dan lanjut — event tetap diproses
+                // dan di-enqueue ke persistent queue sehingga dispatch ke SharePoint tetap berjalan
+                // meski local raw store tidak berhasil ditulis.
+                bool rawSaved = false;
+                Exception? rawSaveLastEx = null;
+                for (int rawAttempt = 1; rawAttempt <= 2 && !rawSaved; rawAttempt++)
+                {
+                    try
+                    {
+                        await rawEventStore.SaveAsync(raw);
+                        rawSaved = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        rawSaveLastEx = ex;
+                        if (rawAttempt < 2)
+                            await Task.Delay(150);
+                    }
+                }
+
+                if (!rawSaved)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RAW-STORE] Failed to persist local raw event after 2 attempts — " +
+                        $"eventId={eventId} computer={entry.MachineName} time={raw.EventTimeUtc:O}: " +
+                        $"{rawSaveLastEx?.Message}",
+                        EventLogEntryType.Warning, 4025);
+                    // Tidak return — event tetap lanjut ke queue dispatch.
+                }
 
                 // Populate in-memory admin cache agar 4634 yang tiba di proses yang sama
                 // bisa dikorelasikan tanpa disk read. Disk copy menangani skenario cross-restart.
@@ -4159,7 +4273,16 @@ namespace EventLogOutEmployeeService
                         $"user={username} logonId={logonId}{linkedSuffix} computer={entry.MachineName}");
                 }
             }
-            catch { /* jangan crash service */ }
+            catch (Exception ex)
+            {
+                // Log exception yang tidak tertangkap di blok retry di atas
+                // (misal: parsing error sebelum rawEventStore.SaveAsync dipanggil).
+                // Tidak di-rethrow agar tidak membatalkan event processing pipeline di caller.
+                SafeWriteEventLog("Application",
+                    $"[RAW-STORE] SaveRawSecurityEventAsync unexpected error — " +
+                    $"computer={entry?.MachineName}: {ex.Message}",
+                    EventLogEntryType.Warning, 4025);
+            }
         }
 
         /// <summary>
@@ -4307,7 +4430,15 @@ namespace EventLogOutEmployeeService
                 for (int i = secLog.Entries.Count - 1; i >= 0 && checkCount < 500; i--)
                 {
                     checkCount++;
-                    EventLogEntry entry = secLog.Entries[i];
+                    EventLogEntry entry;
+                    try
+                    {
+                        entry = secLog.Entries[i];
+                    }
+                    catch (ArgumentException)
+                    {
+                        break; // log rotated during scan
+                    }
 
                     int secEventId = GetNormalizedEventId(entry);
                     if ((secEventId == 4624 || secEventId == 4647) &&
@@ -4442,7 +4573,15 @@ namespace EventLogOutEmployeeService
                 for (int i = secLog.Entries.Count - 1; i >= 0 && checkCount < 1000; i--)
                 {
                     checkCount++;
-                    EventLogEntry entry = secLog.Entries[i];
+                    EventLogEntry entry;
+                    try
+                    {
+                        entry = secLog.Entries[i];
+                    }
+                    catch (ArgumentException)
+                    {
+                        break; // log rotated during scan
+                    }
                     if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
                         continue;
 
@@ -4754,7 +4893,15 @@ namespace EventLogOutEmployeeService
 
                     for (int i = total - 1; i >= 0; i--)
                     {
-                        EventLogEntry entry = secLog.Entries[i];
+                        EventLogEntry entry;
+                        try
+                        {
+                            entry = secLog.Entries[i];
+                        }
+                        catch (ArgumentException)
+                        {
+                            break; // log rotated during scan
+                        }
                         if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
                             continue;
 
@@ -4898,7 +5045,15 @@ namespace EventLogOutEmployeeService
 
                     for (int i = total - 1; i >= 0; i--)
                     {
-                        EventLogEntry entry = sysLog.Entries[i];
+                        EventLogEntry entry;
+                        try
+                        {
+                            entry = sysLog.Entries[i];
+                        }
+                        catch (ArgumentException)
+                        {
+                            break; // log rotated during scan
+                        }
                         if (!entry.MachineName.Equals(computerName, StringComparison.OrdinalIgnoreCase))
                             continue;
 
