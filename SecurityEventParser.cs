@@ -41,10 +41,9 @@ namespace EventLogOutEmployeeService
         {
             "localadmin",
             "Administrator",
-            "helpdesk",
-            "itadmin",
             "Admin",
-            "kidannafi"
+            "kidannafi",
+            "kidbenjamin"
         };
 
         public static ParsedSecurityEvent Parse(EventLogEntry entry)
