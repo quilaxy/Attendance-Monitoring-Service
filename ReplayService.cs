@@ -71,14 +71,12 @@ namespace EventLogOutEmployeeService
         public async Task ReplayMissedEventsFromCheckpoint()
         {
             DateTime replayTo = DateTime.UtcNow;
-            // FIX BUG-F: replayInProgress HARUS di-set true sebelum _replayUpperBoundTicks di-update.
-            // Urutan sebelumnya (bound dulu, lalu flag) membuka race window di mana ShouldSkipLiveEntry
-            // melihat bound baru tapi replayInProgress=false → live event di-skip dengan log ID 1038
-            // ("older than replayUpperBound") padahal seharusnya 1037 ("during replay overlap").
-            // Dengan urutan yang benar: bound belum bergerak saat flag masih false, sehingga tidak ada
-            // live event yang ter-skip dengan alasan yang salah.
-            replayInProgress = true;
+
+            // Establish replay upper bound before enabling replay mode.
+            // This avoids a window where replayInProgress=true but replayUpperBound
+            // still contains DateTime.MinValue.
             Interlocked.Exchange(ref _replayUpperBoundTicks, replayTo.Ticks);
+            replayInProgress = true;
 
             try
             {

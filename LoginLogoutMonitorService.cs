@@ -823,7 +823,7 @@ namespace EventLogOutEmployeeService
             // 1096 = power resume/suspend info detail → verbose
             1080, 1082, 1083, 1087, 1089, 1092, 1096, 1098,
             // Debug system event parsing — semua [DBG-*]
-            2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021,
+            2001, 2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2020, 2021, 1041,
             // Debug fallback resolution detail — [DBG-1074] resolved
             2013,
             // Debug RawEventStore fallback — [DBG-4624], [DBG-GetMRU], [DBG-42], [DBG-4634]
