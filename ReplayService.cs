@@ -182,6 +182,14 @@ namespace EventLogOutEmployeeService
             var entries = new List<(DateTime Time, EventLogEntry Entry, int EventId)>();
             int collectionErrors = 0;
 
+            // FIX-SPAM-1039: Track corrupt-skip count and first exception type separately
+            // from collectionErrors (which also counts the rotation/ArgumentException case).
+            // Per-entry logging of each corrupt entry caused thousands of 1039 events on
+            // machines with large numbers of malformed Security log records. Replaced with
+            // a single aggregated warning emitted once after the collection loop.
+            int corruptSkipCount = 0;
+            string? firstCorruptExType = null;
+
             for (int i = _securityEventLog.Entries.Count - 1; i >= 0; i--)
             {
                 // FIX BUG-A: Seluruh blok akses per-entry dibungkus try-catch.
@@ -226,6 +234,7 @@ namespace EventLogOutEmployeeService
                 {
                     // Log sudah di-rotate selama iterasi: Entries[i] tidak lagi valid.
                     // Semua index lebih rendah juga tidak valid — hentikan loop dengan aman.
+                    // Rotation sudah log satu event saja (break) — tidak ada spam di sini.
                     collectionErrors++;
                     _writeEventLog("Application",
                         $"[SEC-REPLAY] Security log rotated at index {i} during collection — stopping scan. " +
@@ -235,13 +244,27 @@ namespace EventLogOutEmployeeService
                 }
                 catch (Exception ex)
                 {
-                    // Entry di index ini korup atau tidak terbaca — skip dan lanjut.
+                    // FIX-SPAM-1039: Entry korup — increment counter dan lanjut.
+                    // JANGAN panggil _writeEventLog di sini: pada mesin dengan ribuan
+                    // corrupt entries, per-entry log menghasilkan ribuan event 1039 yang
+                    // membuat Event Viewer tidak bisa dipakai untuk troubleshooting.
+                    // Summary warning satu baris ditulis setelah loop selesai.
                     collectionErrors++;
-                    _writeEventLog("Application",
-                        $"[SEC-REPLAY] Skipping corrupt Security entry at index {i}: {ex.GetType().Name}: {ex.Message}",
-                        EventLogEntryType.Warning, 1039);
+                    corruptSkipCount++;
+                    if (firstCorruptExType == null)
+                        firstCorruptExType = ex.GetType().Name;
                     continue;
                 }
+            }
+
+            // FIX-SPAM-1039: Emit satu aggregated warning menggantikan ribuan per-entry logs.
+            // Tetap pakai event ID 1039 agar filter Event Viewer yang sudah ada tetap bekerja.
+            if (corruptSkipCount > 0)
+            {
+                _writeEventLog("Application",
+                    $"[SEC-REPLAY] Skipped {corruptSkipCount} corrupt Security entr{(corruptSkipCount == 1 ? "y" : "ies")} during collection " +
+                    $"(exType={firstCorruptExType ?? "unknown"}).",
+                    EventLogEntryType.Warning, 1039);
             }
 
             _writeEventLog("Application",
@@ -308,6 +331,14 @@ namespace EventLogOutEmployeeService
             var entries = new List<(DateTime Time, EventLogEntry Entry, int EventId)>();
             int collectionErrors = 0;
 
+            // FIX-SPAM-1040: Track corrupt-skip count and first exception type separately
+            // from collectionErrors (which also counts the rotation/ArgumentException case).
+            // Per-entry logging of each corrupt entry caused thousands of 1040 events on
+            // machines with large numbers of malformed System log records. Replaced with
+            // a single aggregated warning emitted once after the collection loop.
+            int corruptSkipCount = 0;
+            string? firstCorruptExType = null;
+
             for (int i = _systemEventLog.Entries.Count - 1; i >= 0; i--)
             {
                 // FIX BUG-C: Pola guard yang sama dengan ReplaySecurityEvents (FIX BUG-A).
@@ -337,6 +368,7 @@ namespace EventLogOutEmployeeService
                 catch (ArgumentException)
                 {
                     // Log sudah di-rotate selama iterasi — hentikan loop dengan aman.
+                    // Rotation sudah log satu event saja (break) — tidak ada spam di sini.
                     collectionErrors++;
                     _writeEventLog("Application",
                         $"[SYS-REPLAY] System log rotated at index {i} during collection — stopping scan. " +
@@ -346,13 +378,27 @@ namespace EventLogOutEmployeeService
                 }
                 catch (Exception ex)
                 {
-                    // Entry korup — skip dan lanjut.
+                    // FIX-SPAM-1040: Entry korup — increment counter dan lanjut.
+                    // JANGAN panggil _writeEventLog di sini: pada mesin dengan ribuan
+                    // corrupt entries, per-entry log menghasilkan ribuan event 1040 yang
+                    // membuat Event Viewer tidak bisa dipakai untuk troubleshooting.
+                    // Summary warning satu baris ditulis setelah loop selesai.
                     collectionErrors++;
-                    _writeEventLog("Application",
-                        $"[SYS-REPLAY] Skipping corrupt System entry at index {i}: {ex.GetType().Name}: {ex.Message}",
-                        EventLogEntryType.Warning, 1040);
+                    corruptSkipCount++;
+                    if (firstCorruptExType == null)
+                        firstCorruptExType = ex.GetType().Name;
                     continue;
                 }
+            }
+
+            // FIX-SPAM-1040: Emit satu aggregated warning menggantikan ribuan per-entry logs.
+            // Tetap pakai event ID 1040 agar filter Event Viewer yang sudah ada tetap bekerja.
+            if (corruptSkipCount > 0)
+            {
+                _writeEventLog("Application",
+                    $"[SYS-REPLAY] Skipped {corruptSkipCount} corrupt System entr{(corruptSkipCount == 1 ? "y" : "ies")} during collection " +
+                    $"(exType={firstCorruptExType ?? "unknown"}).",
+                    EventLogEntryType.Warning, 1040);
             }
 
             _writeEventLog("Application",

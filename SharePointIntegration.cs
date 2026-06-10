@@ -31,6 +31,11 @@ namespace EventLogOutEmployeeService
         private static long _lastShutdownEventTicks = DateTime.MinValue.Ticks;
         private static long _lastSleepEventTicks = DateTime.MinValue.Ticks;
         private static readonly TimeSpan ShutdownEventWindow = TimeSpan.FromMinutes(2);
+        // FIX-SHUTDOWN-PRIORITY: Event 42 (last-resort, priority -1) hanya mendapat cross-device bypass
+        // kalau jarak waktunya > threshold ini dari shutdown yang sudah tersimpan.
+        // Kalau ≤ threshold, kedua device kemungkinan besar mati hampir bersamaan (end-of-day bersamaan)
+        // → priority check normal berlaku → 42 tidak bisa meng-overwrite 4647/1074/6006.
+        private static readonly TimeSpan CrossDeviceLastResortMinGap = TimeSpan.FromMinutes(5);
         private static readonly object _configLock = new object();
         private static bool _configLoaded = false;
         private static string _cachedTenantId = string.Empty;
@@ -1175,19 +1180,47 @@ namespace EventLogOutEmployeeService
             //   - shutdownTime HARUS lebih baru dari currentShutdown (bukan retroactive override)
             //   - currentLogoutDevice tidak boleh kosong (kalau kosong, tidak tahu device mana
             //     yang set — fallback ke priority system normal agar tidak salah)
+            //
+            // FIX-SHUTDOWN-PRIORITY: Tambahan guard untuk event 42 (last-resort, priority -1).
+            //   Event 42 adalah Sleep/Modern Standby — bukan explicit logout, kualitas rendah.
+            //   Bypass cross-device HANYA berlaku kalau jarak waktu > CrossDeviceLastResortMinGap (5 menit).
+            //   Kalau ≤ 5 menit: kedua device kemungkinan mati hampir bersamaan di akhir hari →
+            //   priority check normal harus berlaku → 4647/1074/6006 menang atas 42.
+            //   Contoh bug: 4647=16:47:42 (device A), 42=16:47:46 (device B) → selisih 4 detik
+            //   → sebelumnya 42 menang karena cross-device bypass, sekarang 4647 yang menang.
+            //   Intended scenario tetap aman: 4647=13:00 (LAPTOP), 42=16:00 (PC) → selisih 3 jam
+            //   → bypass tetap aktif → 42 dari PC menang sebagai end-time yang lebih baru. ✓
             bool isCrossDeviceLaterTime = false;
             if (currentShutdown.HasValue &&
                 shutdownTime > currentShutdown.Value &&
                 !string.IsNullOrWhiteSpace(currentLogoutDevice) &&
                 !computerName.Equals(currentLogoutDevice, StringComparison.OrdinalIgnoreCase))
             {
-                isCrossDeviceLaterTime = true;
-                SafeWriteEventLog("Application",
-                    $"[DBG-Summary] TryUpdateShutdown: CROSS-DEVICE later time — " +
-                    $"incoming device='{computerName}' (time={shutdownTime:O}, priority={newPriority}) " +
-                    $"overrides currentLogoutDevice='{currentLogoutDevice}' (time={currentShutdown.Value:O}, priority={effectiveCurrentPriority}). " +
-                    $"Priority check bypassed — latest device wins.",
-                    EventLogEntryType.Information, 3032);
+                // FIX-SHUTDOWN-PRIORITY
+                TimeSpan crossDeviceDelta = shutdownTime - currentShutdown.Value;
+                bool isLastResortTooClose = newPriority == -1 && crossDeviceDelta <= CrossDeviceLastResortMinGap;
+
+                if (!isLastResortTooClose)
+                {
+                    isCrossDeviceLaterTime = true;
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown: CROSS-DEVICE later time — " +
+                        $"incoming device='{computerName}' (time={shutdownTime:O}, priority={newPriority}) " +
+                        $"overrides currentLogoutDevice='{currentLogoutDevice}' (time={currentShutdown.Value:O}, priority={effectiveCurrentPriority}). " +
+                        $"Priority check bypassed — latest device wins.",
+                        EventLogEntryType.Information, 3032);
+                }
+                else
+                {
+                    // FIX-SHUTDOWN-PRIORITY: last-resort (42) cross-device bypass ditolak — selisih terlalu kecil.
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown: CROSS-DEVICE bypass DENIED — " +
+                        $"last-resort event (priority={newPriority}) tiba {crossDeviceDelta.TotalSeconds:F1}s setelah " +
+                        $"event priority tinggi di device lain. Priority check normal berlaku. " +
+                        $"incoming device='{computerName}' (time={shutdownTime:O}) " +
+                        $"vs currentLogoutDevice='{currentLogoutDevice}' (time={currentShutdown.Value:O}, priority={effectiveCurrentPriority}).",
+                        EventLogEntryType.Information, 3032);
+                }
             }
 
             if (isNewSession)

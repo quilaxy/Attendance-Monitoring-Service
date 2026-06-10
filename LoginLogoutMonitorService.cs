@@ -4705,13 +4705,29 @@ namespace EventLogOutEmployeeService
             // 4634 (fallback 4647) juga dianggap "lebih baik" dari 42 — kalau 4634 sudah ada,
             // 42 tidak perlu dipromosikan sebagai last-resort.
             var allItems = await eventQueue.GetAllAsync();
-            bool hasBetterShutdown = allItems.Any(x =>
+            // FIX-SHUTDOWN-PRIORITY: pecah menjadi same-device dan cross-device check.
+            bool hasBetterShutdownSameDevice = allItems.Any(x =>
                 x.QueueId != item.QueueId &&
                 x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
                 x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
                 x.EventTime.ToLocalTime().ToString("yyyy-MM-dd") == workDate &&
                 (x.EventId == 1074 || x.EventId == 4647 || x.EventId == 4634 ||
                  (x.EventId == 6006 && !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))));
+            // FIX-SHUTDOWN-PRIORITY: Juga cek event dari device lain yang terjadi hampir bersamaan (≤120 detik).
+            // Skenario bug: DEVICE-A fire 4647 jam 16:47:42, DEVICE-B fire 42 jam 16:47:46 (4 detik kemudian).
+            // Tanpa cross-device check ini, 42 dari DEVICE-B dipromosikan karena tidak menemukan 4647
+            // di queue DEVICE-B — padahal 4647 dari DEVICE-A sudah ada untuk user yang sama.
+            // Window 120 detik dipilih karena rangkaian 4647+42 di dua device biasanya terjadi dalam ≤60 detik.
+            // Skenario intended (LAPTOP logout 13:00, PC sleep 16:00) tidak terpengaruh karena
+            // selisih waktu jauh melebihi 120 detik.
+            bool hasBetterShutdownCrossDevice = allItems.Any(x =>
+                x.QueueId != item.QueueId &&
+                x.Username.Equals(item.Username, StringComparison.OrdinalIgnoreCase) &&
+                !x.ComputerName.Equals(item.ComputerName, StringComparison.OrdinalIgnoreCase) &&
+                Math.Abs((x.EventTime - item.EventTime).TotalSeconds) <= 120 &&
+                (x.EventId == 1074 || x.EventId == 4647 || x.EventId == 4634 ||
+                 (x.EventId == 6006 && !x.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))));
+            bool hasBetterShutdown = hasBetterShutdownSameDevice || hasBetterShutdownCrossDevice;
 
             if (hasBetterShutdown)
             {
