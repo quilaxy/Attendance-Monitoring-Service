@@ -27,6 +27,10 @@ namespace EventLogOutEmployeeService
         private readonly object knownLoginLock = new object();
         private readonly object firstLogonLock = new object();
         private readonly object startupAnchorLock = new object();
+        // Guards compound recreate-subscribe sequence on securityEventLog / systemEventLog.
+        // Prevents race between health-check resubscribe, OnPowerEvent recovery, and HandleServiceStopping.
+        private readonly object _securityEventLogLock = new object();
+        private readonly object _systemEventLogLock   = new object();
         private int activeDispatchCount = 0;
         private DateTime serviceStartTime;
         private readonly Lazy<SharePointIntegration> sharePointIntegration =
@@ -1466,16 +1470,24 @@ namespace EventLogOutEmployeeService
                     EventLogEntryType.Information, 1019);
 
                 // ── Step 3: Stop listening for new events
-                if (securityEventLog != null)
+                // Acquire both locks to prevent a concurrent resubscribe from re-enabling
+                // events on a freshly-created EventLog object after we've disabled them here.
+                lock (_securityEventLogLock)
                 {
-                    securityEventLog.EnableRaisingEvents = false;
-                    securityEventLog.EntryWritten -= OnSecurityEventWritten;
+                    if (securityEventLog != null)
+                    {
+                        securityEventLog.EnableRaisingEvents = false;
+                        securityEventLog.EntryWritten -= OnSecurityEventWritten;
+                    }
                 }
 
-                if (systemEventLog != null)
+                lock (_systemEventLogLock)
                 {
-                    systemEventLog.EnableRaisingEvents = false;
-                    systemEventLog.EntryWritten -= OnSystemEventWritten;
+                    if (systemEventLog != null)
+                    {
+                        systemEventLog.EnableRaisingEvents = false;
+                        systemEventLog.EntryWritten -= OnSystemEventWritten;
+                    }
                 }
 
                 // [SPRINT] Flush shutdown events sebelum cancel token — hanya saat shutdown sistem nyata.
@@ -2390,10 +2402,71 @@ namespace EventLogOutEmployeeService
                         continue;
 
                     int silentMinutes = (int)(secondsSinceLastEvent / 60);
-                    SafeWriteEventLog("Application",
-                        $"[HEALTH] Mid-day drop detected: Security log silent {silentMinutes} min " +
-                        $"(threshold={silentThresholdWorkHour / 60} min). Re-subscribe + mini-replay.",
-                        EventLogEntryType.Warning, 1079);
+
+                    // ── Record ID validation ──────────────────────────────────────────
+                    // Bedakan "subscription drop" dari "mesin idle" menggunakan Security
+                    // Record ID. Subscription dianggap benar-benar drop hanya jika:
+                    //   (a) Record ID Security log bertambah   → log masih aktif ditulis
+                    //   (b) _lastCallbackSecurityRecordId diam → callback tidak menerima event
+                    //
+                    // Jika Record ID tidak bertambah, mesin kemungkinan besar idle —
+                    // tidak ada bukti subscription drop, skip recovery.
+                    //
+                    // Guard callbackRecordId > 0 mencegah false positive saat startup
+                    // sebelum callback pertama pernah diterima (lihat komentar field).
+
+                    int callbackRecordId = Volatile.Read(ref _lastCallbackSecurityRecordId);
+
+                    if (TryGetLatestSecurityRecordId(out int latestSecurityRecordId))
+                    {
+                        Volatile.Write(ref _lastObservedSecurityRecordId, latestSecurityRecordId);
+
+                        if (callbackRecordId > 0 && latestSecurityRecordId > callbackRecordId)
+                        {
+                            // Confirmed subscription drop: log bertambah tapi callback tidak bergerak.
+                            SafeWriteEventLog("Application",
+                                $"[HEALTH] Confirmed subscription drop: Security log silent {silentMinutes} min " +
+                                $"AND record ID advanced " +
+                                $"(callbackId={callbackRecordId} latestId={latestSecurityRecordId}). " +
+                                $"Re-subscribe + mini-replay.",
+                                EventLogEntryType.Warning, 1079);
+                        }
+                        else if (callbackRecordId == 0)
+                        {
+                            // Callback belum pernah diterima (post-resubscribe edge case atau
+                            // sangat early in startup). Lanjut resubscribe sebagai conservative
+                            // fallback — lebih aman daripada skip.
+                            SafeWriteEventLog("Application",
+                                $"[HEALTH] Mid-day timeout: Security log silent {silentMinutes} min " +
+                                $"(callback record ID belum terinisialisasi — conservative resubscribe). " +
+                                $"latestId={latestSecurityRecordId}.",
+                                EventLogEntryType.Warning, 1079);
+                        }
+                        else
+                        {
+                            // Record ID tidak bertambah → log memang tidak aktif ditulis.
+                            // Besar kemungkinan mesin idle, bukan subscription drop. Skip recovery.
+                            if (VerboseLogging)
+                                SafeWriteEventLog("Application",
+                                    $"[HEALTH] Security log silent {silentMinutes} min " +
+                                    $"tapi record ID tidak bertambah " +
+                                    $"(callbackId={callbackRecordId} latestId={latestSecurityRecordId}) — " +
+                                    $"kemungkinan mesin idle. Tidak ada aksi.",
+                                    EventLogEntryType.Information, 1080);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        // Security log tidak bisa dibaca (null / race condition log rotate).
+                        // Fallback ke timeout-only logic seperti sebelumnya — lebih aman
+                        // daripada skip recovery saat log tidak bisa diverifikasi.
+                        SafeWriteEventLog("Application",
+                            $"[HEALTH] Mid-day drop detected: Security log silent {silentMinutes} min " +
+                            $"(threshold={silentThresholdWorkHour / 60} min, record ID tidak dapat dibaca). " +
+                            $"Re-subscribe + mini-replay.",
+                            EventLogEntryType.Warning, 1079);
+                    }
 
                     _securitySubscriptionStatus = "SILENT";
 
@@ -2439,17 +2512,51 @@ namespace EventLogOutEmployeeService
             {
                 try
                 {
-                    if (securityEventLog == null)
-                    {
-                        SafeWriteEventLog("Application",
-                            "[HEALTH] securityEventLog is null — cannot re-subscribe.",
-                            EventLogEntryType.Warning, 1081);
-                        break;
-                    }
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH] Re-subscribe Security log attempt {attempt}/{maxAttempts}: " +
+                        "recreating EventLog object to ensure fresh kernel handle.",
+                        EventLogEntryType.Information, 1080);
 
-                    securityEventLog.EnableRaisingEvents = false;
+                    // Brief pause before recreation — lets Windows complete any in-flight log
+                    // rotation that may have triggered the subscription drop in the first place.
                     await Task.Delay(300, cancellationToken);
-                    securityEventLog.EnableRaisingEvents = true;
+
+                    lock (_securityEventLogLock)
+                    {
+                        // ── Full EventLog recreation ──────────────────────────────────────────
+                        //
+                        // Rationale: toggle EnableRaisingEvents on the existing object calls
+                        // NotifyChangeEventLog() on the same Win32 object. After hibernate/resume,
+                        // Fast Startup, or Intune/GPO audit-policy refresh this handle can be
+                        // silently stale — NotifyChangeEventLog() returns success but the handle
+                        // never signals again. Creating a new EventLog("Security") instance
+                        // guarantees a fresh OpenEventLog() handle with no ambiguous internal state.
+                        //
+                        // Why NOT Dispose() the old object:
+                        // ReplayService was passed the original securityEventLog reference at
+                        // construction and may still call Entries[] during mini-replay below.
+                        // Disposing here would cause ObjectDisposedException in ReplaySecurityEvents.
+                        // Detaching the handler and clearing EnableRaisingEvents is sufficient —
+                        // the old object becomes unreachable from subscription paths and GC
+                        // will collect it after ReplayService finishes using it.
+                        EventLog? oldLog = securityEventLog;
+
+                        if (oldLog != null)
+                        {
+                            try { oldLog.EnableRaisingEvents = false; } catch { /* stale handle — expected post-hibernate */ }
+                            try { oldLog.EntryWritten -= OnSecurityEventWritten; } catch { }
+                            // Do NOT oldLog.Dispose() — see rationale above.
+                        }
+
+                        // Create fresh instance; assign before enabling so that any exception
+                        // from EnableRaisingEvents is caught by the outer catch and retried,
+                        // while securityEventLog already references the new object for the
+                        // next attempt (old handler is already detached).
+                        EventLog newLog = new EventLog("Security");
+                        newLog.EntryWritten += OnSecurityEventWritten;
+                        newLog.EnableRaisingEvents = true;
+                        securityEventLog = newLog;
+                    }
 
                     // Reset counter setelah re-subscribe berhasil:
                     //   _lastSecurityEventTicksUtc   → mid-day cooldown dihitung ulang dari sini
@@ -2459,6 +2566,18 @@ namespace EventLogOutEmployeeService
                     Interlocked.Exchange(ref _lastSecurityEventTicksUtc,   nowTicks);
                     Interlocked.Exchange(ref _subscriptionEnabledTicksUtc, nowTicks);
                     Interlocked.Exchange(ref _securityProbeEpochTicks,     nowTicks);
+
+                    // Seed Record ID fields agar mid-day check berikutnya tidak
+                    // false-positive karena membandingkan latestFromLog dengan 0.
+                    // Dilakukan setelah EnableRaisingEvents sukses (di luar lock) —
+                    // tidak perlu lock karena health-check task adalah satu-satunya writer
+                    // untuk _lastObservedSecurityRecordId, dan Volatile.Write cukup untuk
+                    // _lastCallbackSecurityRecordId yang dibaca dari health-check task.
+                    if (TryGetLatestSecurityRecordId(out int seededRecordId))
+                    {
+                        Volatile.Write(ref _lastCallbackSecurityRecordId, seededRecordId);
+                        Volatile.Write(ref _lastObservedSecurityRecordId, seededRecordId);
+                    }
 
                     _securitySubscriptionStatus = "RESUBSCRIBED";
 
@@ -2697,6 +2816,47 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
+        /// Ambil Record ID terbaru dari Security log.
+        /// Return false jika log tidak bisa dibaca (null, kosong, atau race condition log rotate).
+        /// Dipakai oleh SecurityLogSubscriptionHealthCheckTask untuk confirmed-drop validation:
+        /// jika latestRecordId > _lastCallbackSecurityRecordId → subscription drop confirmed.
+        /// </summary>
+        private bool TryGetLatestSecurityRecordId(out int latestRecordId)
+        {
+            latestRecordId = 0;
+            try
+            {
+                if (securityEventLog == null) return false;
+
+                int count = securityEventLog.Entries.Count;
+                if (count == 0) return false;
+
+                // Akses [count - 1] bisa throw ArgumentException kalau log rotate
+                // tepat setelah kita baca count. Tangkap dan return false — caller
+                // akan retry di check cycle berikutnya.
+                EventLogEntry latest;
+                try
+                {
+                    latest = securityEventLog.Entries[count - 1];
+                }
+                catch (ArgumentException)
+                {
+                    return false;
+                }
+
+                latestRecordId = latest.Index;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[HEALTH] TryGetLatestSecurityRecordId error: {ex.Message}",
+                    EventLogEntryType.Warning, 1085);
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Re-subscribe System log dan jalankan mini-replay System events untuk window yang missed.
         /// Analog dengan ResubscribeAndMiniReplayAsync untuk Security log.
         /// </summary>
@@ -2712,17 +2872,30 @@ namespace EventLogOutEmployeeService
             {
                 try
                 {
-                    if (systemEventLog == null)
-                    {
-                        SafeWriteEventLog("Application",
-                            "[HEALTH-SYS] systemEventLog is null — cannot re-subscribe.",
-                            EventLogEntryType.Warning, 1088);
-                        break;
-                    }
+                    SafeWriteEventLog("Application",
+                        $"[HEALTH-SYS] Re-subscribe System log attempt {attempt}/{maxAttempts}: " +
+                        "recreating EventLog object to ensure fresh kernel handle.",
+                        EventLogEntryType.Information, 1087);
 
-                    systemEventLog.EnableRaisingEvents = false;
                     await Task.Delay(300, cancellationToken);
-                    systemEventLog.EnableRaisingEvents = true;
+
+                    lock (_systemEventLogLock)
+                    {
+                        // Full EventLog recreation — same rationale as Security log.
+                        // Do NOT Dispose() old object: ReplayService may scan Entries[] on it.
+                        EventLog? oldLog = systemEventLog;
+
+                        if (oldLog != null)
+                        {
+                            try { oldLog.EnableRaisingEvents = false; } catch { }
+                            try { oldLog.EntryWritten -= OnSystemEventWritten; } catch { }
+                        }
+
+                        EventLog newLog = new EventLog("System");
+                        newLog.EntryWritten += OnSystemEventWritten;
+                        newLog.EnableRaisingEvents = true;
+                        systemEventLog = newLog;
+                    }
 
                     long nowTicks = DateTime.UtcNow.Ticks;
                     Interlocked.Exchange(ref _lastSystemEventTicksUtc,           nowTicks);
@@ -3367,6 +3540,28 @@ namespace EventLogOutEmployeeService
         private long _securityProbeEpochTicks     = DateTime.MinValue.Ticks;
         private volatile bool _resubscribeFailed = false;
 
+        // ── Security Record ID validation ────────────────────────────────────────
+        // Dipakai oleh SecurityLogSubscriptionHealthCheckTask untuk membedakan
+        // "subscription drop" (log bertambah tapi callback tidak bergerak) dari
+        // "mesin idle" (log memang tidak bertambah).
+        //
+        // _lastObservedSecurityRecordId: Record ID terakhir yang dibaca langsung
+        //   dari Security log oleh health-check task.
+        //   Ditulis hanya oleh health-check task → Volatile.Read/Write cukup.
+        //
+        // _lastCallbackSecurityRecordId: Record ID terakhir yang diterima oleh
+        //   OnSecurityEventWritten callback (= entry.Index).
+        //   Ditulis dari thread-pool (callback thread), dibaca oleh health-check task
+        //   → Volatile.Write/Read untuk visibility cross-thread.
+        //   Init 0 = "belum pernah ada callback". Guard callbackRecordId > 0 di
+        //   health-check mencegah false positive saat startup sebelum callback pertama.
+        //
+        // Catatan: Record ID Windows EventLog adalah 32-bit unsigned (tapi .NET
+        //   mengekspos sebagai int). Wrap-around setelah ~4 miliar entries diabaikan —
+        //   risiko praktis mendekati nol di Security log dalam satu sesi service.
+        private int _lastObservedSecurityRecordId = 0;
+        private int _lastCallbackSecurityRecordId = 0;
+
         // Status subscription Security log — ditulis ke heartbeat SharePoint.
         // Membedakan dua kondisi yang tampak sama dari LastEventTime saja:
         //   "subscription hidup, Windows tidak fire 4624 (Fast Startup)" vs
@@ -3404,6 +3599,14 @@ namespace EventLogOutEmployeeService
             _securitySubscriptionStatus = "OK";
 
             EventLogEntry entry = e.Entry;
+
+            // Track Record ID terakhir yang benar-benar diterima callback.
+            // Dipakai oleh SecurityLogSubscriptionHealthCheckTask untuk confirmed-drop
+            // validation: jika Record ID Security log naik tapi field ini tidak bergerak,
+            // subscription benar-benar drop (bukan sekadar mesin idle).
+            // Volatile.Write: ditulis di sini (thread-pool callback), dibaca dari health-check task.
+            Volatile.Write(ref _lastCallbackSecurityRecordId, entry.Index);
+
             if (_replayService.ShouldSkipLiveEntry(entry.TimeGenerated.ToUniversalTime(), isSecurityEvent: true))
                 return;
 
