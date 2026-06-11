@@ -83,21 +83,68 @@ namespace EventLogOutEmployeeService
         // per-call Timeout and DefaultRequestHeaders without concurrency races.
 
         // ── TASK 3 & 4: Heartbeat alert status ───────────────────────────────────
-        // Written into the SharePoint heartbeat row so operators get a semantic signal
-        // instead of a raw QueueCount integer.
-        public enum AlertStatus { OK, QueueBacklog, CriticalBacklog }
+        // Written into the SharePoint heartbeat row as a single aggregated operational
+        // status so operators can spot problems without opening Event Viewer or
+        // remoting to the endpoint.
+        //
+        // Single-issue priority order (first match wins; MULTIPLE_ISSUES when ≥2 active):
+        //   SECURITY_FAILED  — all re-subscribe attempts to Security log have failed
+        //   SECURITY_SILENT  — health check detected Security subscription went silent
+        //   TOKEN_FAILURE    — ≥3 consecutive Graph/AAD auth failures within last 4 h
+        //   QUEUE_BACKLOG    — queue > threshold OR oldest-item age ≥ 24 h
+        //   OK               — none of the above
+        //
+        // No new SharePoint columns required; all conditions are computed from existing
+        // runtime state. No new background tasks or polling loops introduced.
+        public enum AlertStatus
+        {
+            OK,
+            SECURITY_SILENT,
+            SECURITY_FAILED,
+            QUEUE_BACKLOG,
+            TOKEN_FAILURE,
+            MULTIPLE_ISSUES
+        }
 
-        // Thresholds for queue-backlog escalation.
-        private const int BacklogQueueThreshold = 50;                          // items
-        private static readonly TimeSpan BacklogAgeWarning  = TimeSpan.FromHours(24);
-        private static readonly TimeSpan BacklogAgeCritical = TimeSpan.FromHours(72);
+        // ── Queue-backlog thresholds ──────────────────────────────────────────────
+        // QUEUE_BACKLOG only fires when backlog is truly significant.
+        // Small queues that form and drain within the 30-min heartbeat interval are
+        // normal and do not trigger an alert.
+        private const int BacklogQueueThreshold = 50;                         // items
+        private static readonly TimeSpan BacklogAgeThreshold = TimeSpan.FromHours(24);
 
-        // Escalation cooldown — suppresses repeated Event Log entries for the same
-        // alert status. Downgrade to OK always logs immediately.
-        private static readonly TimeSpan EscalationCooldown = TimeSpan.FromHours(1);
-        private static AlertStatus _lastEscalationStatus = AlertStatus.OK;
-        private static DateTime   _lastEscalationLogTimeUtc = DateTime.MinValue;
-        private static readonly object _escalationCooldownLock = new object();
+        // ── Token-failure thresholds ──────────────────────────────────────────────
+        // TOKEN_FAILURE fires after ≥ TokenFailureAlertThreshold consecutive
+        // GetAccessTokenAsync failures (null return or exception). Single transient
+        // errors are not reported to avoid false positives from brief network blips.
+        //
+        // The failure timestamp remains set for TokenFailureVisibilityWindow after the
+        // last failure, so TOKEN_FAILURE stays visible on the first successful heartbeat
+        // write after recovery — giving operators an "auth was recently broken" signal.
+        //
+        // Note: for persistent AADSTS failures (secret expired, app not found), the
+        // heartbeat row becomes stale because no token can be obtained to write it.
+        // Those cases are already covered by Event Log error 4015 / 4016 which are far
+        // more actionable. TOKEN_FAILURE in SharePoint is primarily a recovery signal
+        // for intermittent auth failures.
+        private const int TokenFailureAlertThreshold = 3;
+        private static readonly TimeSpan TokenFailureVisibilityWindow = TimeSpan.FromHours(4);
+
+        // Token-failure runtime state — updated exclusively by GetAccessTokenAsync.
+        // _tokenFailStreak  : consecutive failure count; reset to 0 on fresh token success.
+        // _lastTokenFailureTicksUtc : set when streak reaches threshold; never explicitly
+        //   cleared — it ages out after TokenFailureVisibilityWindow. Using long ticks for
+        //   Interlocked.Read/Exchange thread safety.
+        private static int  _tokenFailStreak          = 0;
+        private static long _lastTokenFailureTicksUtc = DateTime.MinValue.Ticks;
+
+        // ── Escalation cooldown ───────────────────────────────────────────────────
+        // Suppresses repeated Event Log entries for the same non-OK alert status.
+        // Transition back to OK always logs immediately regardless of cooldown.
+        private static readonly TimeSpan EscalationCooldown       = TimeSpan.FromHours(1);
+        private static AlertStatus      _lastEscalationStatus     = AlertStatus.OK;
+        private static DateTime         _lastEscalationLogTimeUtc = DateTime.MinValue;
+        private static readonly object  _escalationCooldownLock   = new object();
 
         // ── Static helpers ────────────────────────────────────────────────────────
 
@@ -272,16 +319,40 @@ namespace EventLogOutEmployeeService
             // in the common case (token valid); the lock is acquired only when the token
             // appears expired or absent.
             if (_cachedAccessToken != null && DateTime.UtcNow < _tokenExpiry - TokenRefreshBuffer)
+            {
+                // Valid cached token means auth is working — reset streak so transient
+                // failures don't accumulate across sessions where the token is actually fine.
+                Interlocked.Exchange(ref _tokenFailStreak, 0);
                 return _cachedAccessToken;
+            }
 
             await _tokenCacheLock.WaitAsync(cancellationToken);
             try
             {
                 // Re-check inside the lock — another waiter may have refreshed while we waited.
                 if (_cachedAccessToken != null && DateTime.UtcNow < _tokenExpiry - TokenRefreshBuffer)
+                {
+                    Interlocked.Exchange(ref _tokenFailStreak, 0);
                     return _cachedAccessToken;
+                }
 
-                TokenResponse? freshToken = await FetchAccessTokenAsync(eventTime, eventId, cancellationToken);
+                TokenResponse? freshToken;
+                try
+                {
+                    freshToken = await FetchAccessTokenAsync(eventTime, eventId, cancellationToken);
+                }
+                catch
+                {
+                    // FetchAccessTokenAsync threw — AADSTS error, network exhaustion, etc.
+                    // Count towards the failure streak; set the failure timestamp once the
+                    // streak reaches the alert threshold so TOKEN_FAILURE becomes visible on
+                    // the next successful heartbeat write.
+                    int streak = Interlocked.Increment(ref _tokenFailStreak);
+                    if (streak >= TokenFailureAlertThreshold)
+                        Interlocked.Exchange(ref _lastTokenFailureTicksUtc, DateTime.UtcNow.Ticks);
+                    throw;
+                }
+
                 if (!string.IsNullOrWhiteSpace(freshToken?.access_token))
                 {
                     _cachedAccessToken = freshToken.access_token;
@@ -296,10 +367,21 @@ namespace EventLogOutEmployeeService
                         : 3600;
                     _tokenExpiry = DateTime.UtcNow.AddSeconds(lifetimeSeconds);
 
+                    // Fresh token obtained successfully — reset failure streak.
+                    Interlocked.Exchange(ref _tokenFailStreak, 0);
+
                     SafeWriteEventLog("Application",
                         $"[TOKEN] Token refreshed and cached. Lifetime={lifetimeSeconds}s " +
                         $"(source={(freshToken.expires_in.HasValue ? "AAD response" : "default 3600s")}).",
                         EventLogEntryType.Information, 4010);
+                }
+                else
+                {
+                    // FetchAccessTokenAsync returned null/empty access_token — unexpected
+                    // (e.g. malformed AAD response). Count as a failure.
+                    int streak = Interlocked.Increment(ref _tokenFailStreak);
+                    if (streak >= TokenFailureAlertThreshold)
+                        Interlocked.Exchange(ref _lastTokenFailureTicksUtc, DateTime.UtcNow.Ticks);
                 }
                 return freshToken?.access_token;
             }
@@ -675,37 +757,78 @@ namespace EventLogOutEmployeeService
         // ── Heartbeat list ────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Computes the <see cref="AlertStatus"/> for the current heartbeat snapshot.
+        /// Computes the aggregated <see cref="AlertStatus"/> for the current heartbeat snapshot.
         ///
-        /// Rules (evaluated in priority order):
-        ///   • <c>CriticalBacklog</c> : oldest queued item age ≥ 72 h
-        ///   • <c>QueueBacklog</c>    : queue count > <see cref="BacklogQueueThreshold"/>
-        ///                              OR oldest queued item age ≥ 24 h
-        ///   • <c>OK</c>              : all other cases
+        /// Conditions evaluated independently:
+        ///   • SECURITY_FAILED  : securitySubscriptionStatus == "FAILED"
+        ///   • SECURITY_SILENT  : securitySubscriptionStatus == "SILENT"
+        ///   • TOKEN_FAILURE    : ≥<see cref="TokenFailureAlertThreshold"/> consecutive
+        ///                        GetAccessTokenAsync failures recorded within
+        ///                        <see cref="TokenFailureVisibilityWindow"/> of now
+        ///   • QUEUE_BACKLOG    : queueCount > <see cref="BacklogQueueThreshold"/> OR
+        ///                        (queueCount > 0 AND oldest-item proxy age ≥ <see cref="BacklogAgeThreshold"/>)
         ///
-        /// <paramref name="lastEventTimeUtc"/> is used as a proxy for "oldest item age"
-        /// (the time since the last enqueued login/logout event that has not yet been
-        /// dispatched). This avoids adding a new method to PersistentEventQueue while
-        /// still giving a meaningful staleness signal.
+        /// Returns MULTIPLE_ISSUES when two or more conditions are simultaneously active.
+        /// Returns the single matching status when exactly one condition is active.
+        /// Returns OK when no condition is active.
+        ///
+        /// Notes:
+        ///   • "RESUBSCRIBED" subscription status is treated as OK — it means the health-
+        ///     check already fixed the issue; no operator action required.
+        ///   • <paramref name="lastEventTimeUtc"/> is a proxy for oldest-item age (last time
+        ///     a login/logout event was enqueued). Slightly conservative: triggers sooner
+        ///     than the true oldest-item age, but never misses a real backlog.
         /// </summary>
         public static AlertStatus ComputeAlertStatus(
             int queueCount,
-            DateTime? lastEventTimeUtc)
+            DateTime? lastEventTimeUtc,
+            string securitySubscriptionStatus)
         {
-            if (queueCount == 0)
-                return AlertStatus.OK;
+            // ── Security subscription ──────────────────────────────────────────────
+            bool isSecurityFailed = string.Equals(securitySubscriptionStatus, "FAILED",
+                StringComparison.OrdinalIgnoreCase);
+            bool isSecuritySilent = string.Equals(securitySubscriptionStatus, "SILENT",
+                StringComparison.OrdinalIgnoreCase);
 
-            TimeSpan oldestAge = lastEventTimeUtc.HasValue
-                ? DateTime.UtcNow - lastEventTimeUtc.Value
-                : TimeSpan.Zero;
+            // ── Token failure ──────────────────────────────────────────────────────
+            // Visible for up to TokenFailureVisibilityWindow after the last failure so
+            // the status persists on the first successful heartbeat write after recovery.
+            bool hasTokenFailure = false;
+            long lastFailTicks = Interlocked.Read(ref _lastTokenFailureTicksUtc);
+            if (lastFailTicks != DateTime.MinValue.Ticks)
+            {
+                TimeSpan sinceLastFailure = DateTime.UtcNow - new DateTime(lastFailTicks, DateTimeKind.Utc);
+                hasTokenFailure = sinceLastFailure < TokenFailureVisibilityWindow;
+            }
 
-            if (oldestAge >= BacklogAgeCritical)
-                return AlertStatus.CriticalBacklog;
+            // ── Queue backlog ──────────────────────────────────────────────────────
+            // Only signals when backlog is genuinely significant.
+            // Small queues (< threshold) that formed recently are normal and ignored.
+            bool hasQueueBacklog = false;
+            if (queueCount > BacklogQueueThreshold)
+            {
+                hasQueueBacklog = true;
+            }
+            else if (queueCount > 0 && lastEventTimeUtc.HasValue)
+            {
+                TimeSpan itemAge = DateTime.UtcNow - lastEventTimeUtc.Value;
+                hasQueueBacklog = itemAge >= BacklogAgeThreshold;
+            }
 
-            if (queueCount > BacklogQueueThreshold || oldestAge >= BacklogAgeWarning)
-                return AlertStatus.QueueBacklog;
+            // ── Aggregate ──────────────────────────────────────────────────────────
+            int activeIssueCount = (isSecurityFailed ? 1 : 0)
+                                 + (isSecuritySilent  ? 1 : 0)
+                                 + (hasTokenFailure   ? 1 : 0)
+                                 + (hasQueueBacklog   ? 1 : 0);
 
-            return AlertStatus.OK;
+            if (activeIssueCount == 0) return AlertStatus.OK;
+            if (activeIssueCount >= 2) return AlertStatus.MULTIPLE_ISSUES;
+
+            // Exactly one condition active — return its specific status.
+            if (isSecurityFailed) return AlertStatus.SECURITY_FAILED;
+            if (isSecuritySilent) return AlertStatus.SECURITY_SILENT;
+            if (hasTokenFailure)  return AlertStatus.TOKEN_FAILURE;
+            return AlertStatus.QUEUE_BACKLOG;
         }
 
         public async Task UpsertHeartbeatAsync(
@@ -724,7 +847,7 @@ namespace EventLogOutEmployeeService
                 return;
 
             // ── TASK 3 & 4: Compute alert status ──────────────────────────────────
-            AlertStatus alertStatus = ComputeAlertStatus(queueCount, lastEventTimeUtc);
+            AlertStatus alertStatus = ComputeAlertStatus(queueCount, lastEventTimeUtc, securitySubscriptionStatus);
             string alertStatusStr   = alertStatus.ToString();
 
             // Log escalation events with cooldown to prevent spam.
@@ -749,21 +872,56 @@ namespace EventLogOutEmployeeService
                     ? $"{(DateTime.UtcNow - lastEventTimeUtc.Value).TotalHours:F1}h"
                     : "n/a";
 
-                if (alertStatus == AlertStatus.CriticalBacklog)
-                    SafeWriteEventLog("Application",
-                        $"[HEARTBEAT] CRITICAL BACKLOG: machine={machineName} queue={queueCount} " +
-                        $"oldestAge={oldestAgeDesc} — items unprocessed >72h. " +
-                        $"Check network connectivity and SharePoint availability.",
-                        EventLogEntryType.Error, 1099);
-                else if (alertStatus == AlertStatus.QueueBacklog)
-                    SafeWriteEventLog("Application",
-                        $"[HEARTBEAT] QUEUE BACKLOG: machine={machineName} queue={queueCount} " +
-                        $"oldestAge={oldestAgeDesc} — items pending >24h or queue>{BacklogQueueThreshold}.",
-                        EventLogEntryType.Warning, 1099);
-                else
-                    SafeWriteEventLog("Application",
-                        $"[HEARTBEAT] Alert cleared: machine={machineName} status back to OK.",
-                        EventLogEntryType.Information, 1099);
+                switch (alertStatus)
+                {
+                    case AlertStatus.SECURITY_FAILED:
+                        SafeWriteEventLog("Application",
+                            $"[HEARTBEAT] SECURITY_FAILED: machine={machineName} — " +
+                            $"all Security log re-subscribe attempts have failed. " +
+                            $"Login/logout events are NOT being captured. " +
+                            $"Check Event Log (ID 1085) for subscription error details.",
+                            EventLogEntryType.Error, 1099);
+                        break;
+                    case AlertStatus.SECURITY_SILENT:
+                        SafeWriteEventLog("Application",
+                            $"[HEARTBEAT] SECURITY_SILENT: machine={machineName} — " +
+                            $"Security log subscription appears silent (no events detected). " +
+                            $"lastSecurityEvent={lastSecurityEventTimeUtc?.ToString("O") ?? "(none)"}. " +
+                            $"Health-check will attempt re-subscribe automatically.",
+                            EventLogEntryType.Warning, 1099);
+                        break;
+                    case AlertStatus.TOKEN_FAILURE:
+                        SafeWriteEventLog("Application",
+                            $"[HEARTBEAT] TOKEN_FAILURE: machine={machineName} — " +
+                            $"Graph/AAD authentication has been failing " +
+                            $"(≥{TokenFailureAlertThreshold} consecutive failures in last " +
+                            $"{TokenFailureVisibilityWindow.TotalHours:F0}h). " +
+                            $"Check AzureSettings in appsettings.json and Azure AD App Registration " +
+                            $"(Certificates & secrets). Event Log 4011/4012/4015/4016 for details.",
+                            EventLogEntryType.Error, 1099);
+                        break;
+                    case AlertStatus.QUEUE_BACKLOG:
+                        SafeWriteEventLog("Application",
+                            $"[HEARTBEAT] QUEUE_BACKLOG: machine={machineName} queue={queueCount} " +
+                            $"oldestAge={oldestAgeDesc} — items pending " +
+                            $">{BacklogAgeThreshold.TotalHours:F0}h or queue>{BacklogQueueThreshold}. " +
+                            $"Check network connectivity and SharePoint availability.",
+                            EventLogEntryType.Warning, 1099);
+                        break;
+                    case AlertStatus.MULTIPLE_ISSUES:
+                        SafeWriteEventLog("Application",
+                            $"[HEARTBEAT] MULTIPLE_ISSUES: machine={machineName} queue={queueCount} " +
+                            $"oldestAge={oldestAgeDesc} securityStatus={securitySubscriptionStatus} — " +
+                            $"multiple operational conditions are active simultaneously. " +
+                            $"Check Event Log for details on each condition.",
+                            EventLogEntryType.Error, 1099);
+                        break;
+                    default: // OK
+                        SafeWriteEventLog("Application",
+                            $"[HEARTBEAT] Alert cleared: machine={machineName} status back to OK.",
+                            EventLogEntryType.Information, 1099);
+                        break;
+                }
             }
 
             // ── SharePoint upsert ──────────────────────────────────────────────────
