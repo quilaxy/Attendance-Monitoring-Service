@@ -15,6 +15,25 @@ using Newtonsoft.Json.Linq;
 
 namespace EventLogOutEmployeeService
 {
+    /// <summary>
+    /// FIX FINDING 5: thrown by Graph "find/query" helpers (e.g. FindSummaryItemAsync) when
+    /// the underlying call fails with HTTP 401 Unauthorized.
+    ///
+    /// Previously these helpers returned null on ANY non-success status, so callers could
+    /// not tell "row genuinely not found" (empty result set, HTTP 200) apart from "query
+    /// failed because the token was rejected" (HTTP 401). That ambiguity let
+    /// TryUpdateDailySummaryShutdownAsync treat a 401 as "no summary row exists" and create
+    /// a duplicate/incomplete estimated row.
+    ///
+    /// Callers should let this propagate (do not catch-and-treat-as-not-found) so the
+    /// dispatch attempt fails cleanly and is retried later with a fresh token — the token
+    /// cache has already been invalidated by the time this is thrown.
+    /// </summary>
+    public sealed class GraphUnauthorizedException : Exception
+    {
+        public GraphUnauthorizedException(string message) : base(message) { }
+    }
+
     public class SharePointIntegration
     {
         private readonly string _tenantId;
@@ -314,6 +333,14 @@ namespace EventLogOutEmployeeService
                 {
                     if (isShutdownEvent || inShutdownWindow)
                     {
+                        // FIX FINDING 8: previously _hasWaitedForNetwork was set true here too,
+                        // permanently skipping the warmup for ALL future calls (including
+                        // non-shutdown ones) if the very first call after boot/resume happened
+                        // to be a shutdown event. Leave the flag false so the NEXT call —
+                        // shutdown or not — still gets a chance to run the warmup if needed.
+                        // This is intentionally re-checked on every shutdown-event call until
+                        // a non-shutdown call (or another shutdown call outside the window)
+                        // finally performs the warmup; the lock-protected check is cheap.
                     }
                     else
                     {
@@ -328,9 +355,10 @@ namespace EventLogOutEmployeeService
                             EventLogEntryType.Information, 4010);
                         _networkWarmupTask ??= Task.Delay(warmup);
                         networkWarmupTask = _networkWarmupTask;
-                    }
 
-                    _hasWaitedForNetwork = true;
+                        // FIX FINDING 8: only mark as "done" when the warmup actually ran.
+                        _hasWaitedForNetwork = true;
+                    }
                 }
                 else if (_networkWarmupTask != null && !_networkWarmupTask.IsCompleted)
                 {
@@ -1555,9 +1583,12 @@ namespace EventLogOutEmployeeService
                     $"listId='{_listId}' summaryListId='{_summaryListId ?? "(none)"}'",
                     EventLogEntryType.Information, 5001);
 
-                using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
-                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-                client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                // FIX FINDING 6: previously `new HttpClient { ... }` created a brand-new,
+                // non-pooled HttpClient/handler for every cleanup run. Use the same shared
+                // _graphHandler (via CreateGraphClient) as every other Graph call so cleanup
+                // — which can issue hundreds of GET/DELETE calls across many pages —
+                // reuses pooled connections instead of risking socket exhaustion.
+                using var client = CreateGraphClient(accessToken, timeoutSeconds: 300); // 5 min, same as before
                 client.DefaultRequestHeaders.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
 
                 int rawDeleted = await CleanupListByDateFieldAsync(client, _listId, "EventTime", cutoffDate);
@@ -1688,11 +1719,18 @@ namespace EventLogOutEmployeeService
         private static async Task<HttpResponseMessage> GetWithThrottleRetryAsync(
             HttpClient client, string url, int maxRetries = 3)
         {
-            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            // FIX FINDING 7: previously, if all `maxRetries` attempts inside the loop were
+            // throttled (429), the loop exited and made one MORE call below with NO 429
+            // handling at all — silently returning a 429 response (or throwing) to the caller
+            // as if it were a normal failure, after SharePoint had just told us 3 times to
+            // back off. The loop now runs maxRetries+1 attempts total, and EVERY attempt —
+            // including the last — is subject to the same 429 check; only the final attempt
+            // skips the wait-and-continue (no point waiting if we're about to give up anyway).
+            for (int attempt = 1; attempt <= maxRetries + 1; attempt++)
             {
                 var response = await client.GetAsync(url);
 
-                if ((int)response.StatusCode == 429)
+                if ((int)response.StatusCode == 429 && attempt <= maxRetries)
                 {
                     int retryAfterSeconds = 30 * attempt;
                     if (response.Headers.TryGetValues("Retry-After", out var values) &&
@@ -1713,17 +1751,19 @@ namespace EventLogOutEmployeeService
                 return response;
             }
 
+            // Unreachable — the loop above always returns on its final iteration.
             return await client.GetAsync(url);
         }
 
         private static async Task<HttpResponseMessage> DeleteWithThrottleRetryAsync(
             HttpClient client, string url, int maxRetries = 3)
         {
-            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            // FIX FINDING 7: same fix as GetWithThrottleRetryAsync above.
+            for (int attempt = 1; attempt <= maxRetries + 1; attempt++)
             {
                 var response = await client.DeleteAsync(url);
 
-                if ((int)response.StatusCode == 429)
+                if ((int)response.StatusCode == 429 && attempt <= maxRetries)
                 {
                     int retryAfterSeconds = 30 * attempt;
                     if (response.Headers.TryGetValues("Retry-After", out var values) &&
@@ -1744,6 +1784,7 @@ namespace EventLogOutEmployeeService
                 return response;
             }
 
+            // Unreachable — the loop above always returns on its final iteration.
             return await client.DeleteAsync(url);
         }
 
@@ -1945,11 +1986,24 @@ namespace EventLogOutEmployeeService
             var findResponse = await client.SendAsync(request, cancellationToken);
             if (!findResponse.IsSuccessStatusCode)
             {
-                InvalidateTokenCacheIfUnauthorized(findResponse); // FIX FINDING 1
+                bool wasUnauthorized = InvalidateTokenCacheIfUnauthorized(findResponse); // FIX FINDING 1
                 string errBody = await findResponse.Content.ReadAsStringAsync();
                 SafeWriteEventLog("Application",
                     $"[DBG-Summary] FindSummaryItemAsync: HTTP {(int)findResponse.StatusCode} for key={summaryKey} body={errBody}",
                     EventLogEntryType.Warning, 3020);
+
+                // FIX FINDING 5: a 401 here means the QUERY failed, not that the row doesn't
+                // exist. Returning null in this case previously made
+                // TryUpdateDailySummaryShutdownAsync believe no summary row exists and create
+                // a duplicate/incomplete estimated row. Throw instead so callers don't confuse
+                // "auth failure" with "not found".
+                if (wasUnauthorized)
+                {
+                    throw new GraphUnauthorizedException(
+                        $"FindSummaryItemAsync: HTTP 401 for key={summaryKey}. Token cache invalidated; " +
+                        $"caller should not treat this as 'row not found'.");
+                }
+
                 return null;
             }
 
