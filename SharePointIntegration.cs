@@ -91,6 +91,50 @@ namespace EventLogOutEmployeeService
                 _hasWaitedForNetwork = false;
         }
 
+        /// <summary>
+        /// FIX FINDING 1: Clears the cached access token and forces the next call to
+        /// <see cref="GetAccessTokenAsync"/> to fetch a fresh token from Azure AD.
+        ///
+        /// Must be called whenever a Graph API call returns HTTP 401 Unauthorized.
+        /// Without this, a rejected token stays "valid" according to _tokenExpiry
+        /// (up to ~60 minutes) and every retry — including items pulled back from the
+        /// retry queue — keeps reusing the same rejected token, producing a permanent
+        /// silent 401 failure loop until the token naturally expires.
+        ///
+        /// Thread-safe: guarded by _tokenCacheLock so a refresh already in flight
+        /// (triggered by another caller) isn't clobbered mid-flight.
+        /// </summary>
+        public static void InvalidateTokenCache()
+        {
+            _tokenCacheLock.Wait();
+            try
+            {
+                _cachedAccessToken = null;
+                _tokenExpiry = DateTime.MinValue;
+            }
+            finally
+            {
+                _tokenCacheLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// FIX FINDING 1 helper: if the response is HTTP 401, invalidates the cached
+        /// access token so the *next* GetAccessTokenAsync call fetches a fresh one.
+        /// Call this at every Graph API call site immediately after checking
+        /// response.IsSuccessStatusCode, before throwing/returning failure.
+        /// Returns true if the response was 401 (and the cache was invalidated).
+        /// </summary>
+        private static bool InvalidateTokenCacheIfUnauthorized(HttpResponseMessage response)
+        {
+            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                InvalidateTokenCache();
+                return true;
+            }
+            return false;
+        }
+
         public static void SetServiceStartTime(DateTime startTime) { /* reserved */ }
 
         public static void MarkShutdownEvent(DateTime eventTime)
@@ -218,19 +262,27 @@ namespace EventLogOutEmployeeService
                 if (_cachedAccessToken != null && DateTime.UtcNow < _tokenExpiry - TokenRefreshBuffer)
                     return _cachedAccessToken;
 
-                string? freshToken = await FetchAccessTokenAsync(eventTime, eventId, cancellationToken);
-                if (!string.IsNullOrWhiteSpace(freshToken))
+                TokenResponse? freshToken = await FetchAccessTokenAsync(eventTime, eventId, cancellationToken);
+                if (!string.IsNullOrWhiteSpace(freshToken?.access_token))
                 {
-                    _cachedAccessToken = freshToken;
-                    // Azure AD client-credentials tokens have a 3600-second default lifetime.
-                    // We record expiry conservatively as now + 3600s; the RefreshBuffer ensures
-                    // we re-fetch 60s before that boundary.
-                    _tokenExpiry = DateTime.UtcNow.AddSeconds(3600);
+                    _cachedAccessToken = freshToken.access_token;
+
+                    // FIX FINDING 2: Use the expires_in returned by Azure AD instead of a
+                    // hardcoded 3600s. Falls back to 3600s if the field is missing, and
+                    // enforces a 300s floor so a misbehaving/very-short-lived token can't
+                    // cause a refresh storm (combined with the 60s TokenRefreshBuffer,
+                    // a 300s floor still leaves a usable window).
+                    int lifetimeSeconds = freshToken.expires_in.HasValue
+                        ? Math.Max(freshToken.expires_in.Value, 300)
+                        : 3600;
+                    _tokenExpiry = DateTime.UtcNow.AddSeconds(lifetimeSeconds);
+
                     SafeWriteEventLog("Application",
-                        "[TOKEN] Token refreshed and cached. Expiry window reset.",
+                        $"[TOKEN] Token refreshed and cached. Lifetime={lifetimeSeconds}s " +
+                        $"(source={(freshToken.expires_in.HasValue ? "AAD response" : "default 3600s")}).",
                         EventLogEntryType.Information, 4010);
                 }
-                return freshToken;
+                return freshToken?.access_token;
             }
             finally
             {
@@ -243,7 +295,7 @@ namespace EventLogOutEmployeeService
         /// Contains all existing network-wait, retry, and AAD-error logic unchanged.
         /// Not called directly — always goes through <see cref="GetAccessTokenAsync"/>.
         /// </summary>
-        private async Task<string?> FetchAccessTokenAsync(
+        private async Task<TokenResponse?> FetchAccessTokenAsync(
             DateTime eventTime,
             int eventId,
             CancellationToken cancellationToken = default)
@@ -265,10 +317,16 @@ namespace EventLogOutEmployeeService
                     }
                     else
                     {
+                        // FIX FINDING 3 (partial): add jitter (0-10s) on top of the base 30s
+                        // warmup so devices that wake nearly simultaneously don't all hammer
+                        // login.microsoftonline.com at the exact same instant, and so the
+                        // wait better covers the variable post-wake DNS-readiness window.
+                        int jitterMs = RandomNumberGenerator.GetInt32(0, 10_000);
+                        TimeSpan warmup = TimeSpan.FromSeconds(30) + TimeSpan.FromMilliseconds(jitterMs);
                         SafeWriteEventLog("Application",
-                            "[TOKEN] Waiting 30s for network on fresh boot...",
+                            $"[TOKEN] Waiting {warmup.TotalSeconds:F1}s for network on fresh boot/resume...",
                             EventLogEntryType.Information, 4010);
-                        _networkWarmupTask ??= Task.Delay(TimeSpan.FromSeconds(30));
+                        _networkWarmupTask ??= Task.Delay(warmup);
                         networkWarmupTask = _networkWarmupTask;
                     }
 
@@ -284,7 +342,11 @@ namespace EventLogOutEmployeeService
                 await networkWarmupTask.WaitAsync(cancellationToken);
 
             string authority = $"https://login.microsoftonline.com/{_tenantId}/oauth2/v2.0/token";
-            int maxRetries = 3;
+            // FIX FINDING 3: increased from 3 to 5. Post-wake DNS resolution can take
+            // longer than the 30s+jitter warmup above in some Fast Startup scenarios;
+            // extra attempts (with exponential backoff) give DNS more chances to recover
+            // before FetchAccessTokenAsync gives up and the event lands in the retry queue.
+            int maxRetries = 5;
             int delayMs = 5000;
 
             for (int attempt = 1; attempt <= maxRetries; attempt++)
@@ -306,7 +368,7 @@ namespace EventLogOutEmployeeService
                     {
                         string responseBody = await response.Content.ReadAsStringAsync();
                         var token = JsonConvert.DeserializeObject<TokenResponse>(responseBody);
-                        return token?.access_token;
+                        return token;
                     }
 
                     string errorBody = await response.Content.ReadAsStringAsync();
@@ -408,7 +470,10 @@ namespace EventLogOutEmployeeService
                 var request = new HttpRequestMessage(HttpMethod.Get, url);
                 var response = await client.SendAsync(request, cancellationToken);
                 if (!response.IsSuccessStatusCode)
+                {
+                    InvalidateTokenCacheIfUnauthorized(response); // FIX FINDING 1
                     return (null, false);
+                }
 
                 var payload = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
                 var items = payload?["value"] as JArray;
@@ -465,6 +530,12 @@ namespace EventLogOutEmployeeService
             string title        = $"{computerName}\\{eventId}\\{username}";
             Exception? lastException = null;
 
+            // FIX FINDING 4: the token is now mutable. If a Graph call returns 401,
+            // we invalidate the shared token cache (Finding 1) AND clear this local
+            // copy so the next attempt fetches a genuinely fresh token instead of
+            // retrying with the same rejected one.
+            string? currentToken = accessToken;
+
             SafeWriteEventLog("Application",
                 $"[RAW] Inserting: title='{title}' eventTime={eventTimeStr} eventType='{eventType}'",
                 EventLogEntryType.Information, 4020);
@@ -473,7 +544,24 @@ namespace EventLogOutEmployeeService
             {
                 try
                 {
-                    using var client = CreateGraphClient(accessToken, timeoutSeconds);
+                    // FIX FINDING 4: if a previous attempt invalidated the token (401),
+                    // fetch a fresh one before retrying instead of failing immediately.
+                    if (string.IsNullOrWhiteSpace(currentToken))
+                    {
+                        currentToken = await GetAccessTokenAsync(eventTime, eventId, cancellationToken);
+                        if (string.IsNullOrWhiteSpace(currentToken))
+                        {
+                            lastException = new InvalidOperationException(
+                                $"[RAW] Attempt {attempt}/{maxRetries}: tidak bisa mendapatkan access token baru setelah 401.");
+                            SafeWriteEventLog("Application",
+                                $"[RAW] Insert attempt {attempt}/{maxRetries}: token refresh setelah 401 gagal (token null/empty).",
+                                EventLogEntryType.Warning, 4023);
+                            if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs = Math.Min(delayMs * 2, 10000); }
+                            continue;
+                        }
+                    }
+
+                    using var client = CreateGraphClient(currentToken, timeoutSeconds);
 
                     // ── Idempotency check ──────────────────────────────────────
                     if (await RawRecordAlreadyExistsAsync(client, title, eventTime, cancellationToken))
@@ -520,9 +608,24 @@ namespace EventLogOutEmployeeService
                     lastException = new InvalidOperationException(
                         $"Raw list insert failed HTTP {(int)response.StatusCode} for {title} at {eventTimeStr}: {responseBody}");
 
-                    SafeWriteEventLog("Application",
-                        $"[RAW] Insert attempt {attempt}/{maxRetries} failed: HTTP {(int)response.StatusCode} — {responseBody}",
-                        EventLogEntryType.Warning, 4023);
+                    // FIX FINDING 1+4: on 401, invalidate the shared token cache so
+                    // GetAccessTokenAsync stops handing out the rejected token to the
+                    // retry queue, and clear currentToken so THIS method also
+                    // self-heals on its next attempt instead of repeating the 401.
+                    if (InvalidateTokenCacheIfUnauthorized(response))
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[RAW] Insert attempt {attempt}/{maxRetries} failed: HTTP 401 — token cache invalidated, " +
+                            $"will fetch a fresh token before retrying. Body={responseBody}",
+                            EventLogEntryType.Warning, 4023);
+                        currentToken = null;
+                    }
+                    else
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[RAW] Insert attempt {attempt}/{maxRetries} failed: HTTP {(int)response.StatusCode} — {responseBody}",
+                            EventLogEntryType.Warning, 4023);
+                    }
 
                     if (attempt < maxRetries) { await Task.Delay(delayMs); delayMs = Math.Min(delayMs * 2, 10000); }
                 }
@@ -647,6 +750,7 @@ namespace EventLogOutEmployeeService
             var findResponse = await client.SendAsync(findRequest, cancellationToken);
             if (!findResponse.IsSuccessStatusCode)
             {
+                InvalidateTokenCacheIfUnauthorized(findResponse); // FIX FINDING 1
                 string body = await findResponse.Content.ReadAsStringAsync();
                 throw new InvalidOperationException(
                     $"Heartbeat lookup failed HTTP {(int)findResponse.StatusCode}. Body={body}");
@@ -695,6 +799,7 @@ namespace EventLogOutEmployeeService
                 var patchResponse = await client.SendAsync(patchRequest, cancellationToken);
                 if (!patchResponse.IsSuccessStatusCode)
                 {
+                    InvalidateTokenCacheIfUnauthorized(patchResponse); // FIX FINDING 1
                     string body = await patchResponse.Content.ReadAsStringAsync();
                     throw new InvalidOperationException(
                         $"Heartbeat update failed HTTP {(int)patchResponse.StatusCode}. Body={body}");
@@ -710,6 +815,7 @@ namespace EventLogOutEmployeeService
                 postContent);
             if (!postResponse.IsSuccessStatusCode)
             {
+                InvalidateTokenCacheIfUnauthorized(postResponse); // FIX FINDING 1
                 string body = await postResponse.Content.ReadAsStringAsync();
                 throw new InvalidOperationException(
                     $"Heartbeat insert failed HTTP {(int)postResponse.StatusCode}. Body={body}");
@@ -871,6 +977,7 @@ namespace EventLogOutEmployeeService
                     var patchResponse = await client.SendAsync(patchRequest, cancellationToken);
                     if (!patchResponse.IsSuccessStatusCode)
                     {
+                        InvalidateTokenCacheIfUnauthorized(patchResponse); // FIX FINDING 1
                         string body = await patchResponse.Content.ReadAsStringAsync();
                         throw new InvalidOperationException(
                             $"Failed to update LoginTime/LoginDevice for summary key '{summaryKey}' (item {itemId}). Status={patchResponse.StatusCode} Body={body}");
@@ -893,6 +1000,7 @@ namespace EventLogOutEmployeeService
                     var statusPatchResponse = await client.SendAsync(statusPatchRequest, cancellationToken);
                     if (!statusPatchResponse.IsSuccessStatusCode)
                     {
+                        InvalidateTokenCacheIfUnauthorized(statusPatchResponse); // FIX FINDING 1
                         string body = await statusPatchResponse.Content.ReadAsStringAsync();
                         throw new InvalidOperationException(
                             $"Failed to update summary Status for key '{summaryKey}' (item {itemId}). " +
@@ -939,6 +1047,7 @@ namespace EventLogOutEmployeeService
                 createContent);
             if (!createResponse.IsSuccessStatusCode)
             {
+                InvalidateTokenCacheIfUnauthorized(createResponse); // FIX FINDING 1
                 string body = await createResponse.Content.ReadAsStringAsync();
                 throw new InvalidOperationException(
                     $"Failed to create summary login row for key '{summaryKey}'. Status={createResponse.StatusCode} Body={body}");
@@ -983,6 +1092,7 @@ namespace EventLogOutEmployeeService
 
             if (!response.IsSuccessStatusCode)
             {
+                InvalidateTokenCacheIfUnauthorized(response); // FIX FINDING 1
                 string body = await response.Content.ReadAsStringAsync();
                 throw new InvalidOperationException(
                     $"Failed to create empty summary row for key '{summaryKey}'. Status={response.StatusCode} Body={body}");
@@ -1328,6 +1438,7 @@ namespace EventLogOutEmployeeService
 
             if (!patchResult.IsSuccessStatusCode)
             {
+                InvalidateTokenCacheIfUnauthorized(patchResult); // FIX FINDING 1
                 string body = await patchResult.Content.ReadAsStringAsync();
                 throw new InvalidOperationException(
                     $"Failed to update summary shutdown for item {itemId} ({eventId}). " +
@@ -1379,7 +1490,10 @@ namespace EventLogOutEmployeeService
                 var verifyRequest  = new HttpRequestMessage(HttpMethod.Get, verifyUrl);
                 var verifyResponse = await client.SendAsync(verifyRequest, cancellationToken);
                 if (!verifyResponse.IsSuccessStatusCode)
+                {
+                    InvalidateTokenCacheIfUnauthorized(verifyResponse); // FIX FINDING 1
                     return; // verify bersifat best-effort; biarkan caller terus
+                }
 
                 var verifyItem   = JsonConvert.DeserializeObject<JObject>(
                     await verifyResponse.Content.ReadAsStringAsync());
@@ -1493,6 +1607,7 @@ namespace EventLogOutEmployeeService
                 var response = await GetWithThrottleRetryAsync(client, url);
                 if (!response.IsSuccessStatusCode)
                 {
+                    InvalidateTokenCacheIfUnauthorized(response); // FIX FINDING 1
                     SafeWriteEventLog("Application",
                         $"[CLEANUP] Page fetch failed for listId='{listId}' — " +
                         $"HTTP {(int)response.StatusCode}. Stopping pagination, " +
@@ -1530,6 +1645,7 @@ namespace EventLogOutEmployeeService
                             }
                             else
                             {
+                                InvalidateTokenCacheIfUnauthorized(deleteResponse); // FIX FINDING 1
                                 SafeWriteEventLog("Application",
                                     $"[CLEANUP] Failed to delete itemId='{itemId}' from listId='{listId}' — " +
                                     $"HTTP {(int)deleteResponse.StatusCode}",
@@ -1829,6 +1945,7 @@ namespace EventLogOutEmployeeService
             var findResponse = await client.SendAsync(request, cancellationToken);
             if (!findResponse.IsSuccessStatusCode)
             {
+                InvalidateTokenCacheIfUnauthorized(findResponse); // FIX FINDING 1
                 string errBody = await findResponse.Content.ReadAsStringAsync();
                 SafeWriteEventLog("Application",
                     $"[DBG-Summary] FindSummaryItemAsync: HTTP {(int)findResponse.StatusCode} for key={summaryKey} body={errBody}",
@@ -1903,7 +2020,10 @@ namespace EventLogOutEmployeeService
             request.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
             var checkResponse = await client.SendAsync(request, cancellationToken);
             if (!checkResponse.IsSuccessStatusCode)
+            {
+                InvalidateTokenCacheIfUnauthorized(checkResponse); // FIX FINDING 1
                 return false;
+            }
 
             var checkObj = JsonConvert.DeserializeObject<JObject>(
                 await checkResponse.Content.ReadAsStringAsync());
