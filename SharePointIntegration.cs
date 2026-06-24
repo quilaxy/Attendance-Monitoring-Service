@@ -1300,7 +1300,7 @@ namespace EventLogOutEmployeeService
         /// Rules (summary = work-hour tracker, only final shutdown matters):
         ///   • Row must already exist (created by UpsertDailySummaryLoginAsync).
         ///     If no row exists yet, the event is too early in the day — skip.
-        ///   • Priority (higher wins): 4647 > 6006-confirmed > 1074-Shutdown > 6008/41.
+        ///   • Priority (higher wins): 4647 > 6006-confirmed > 1074-Shutdown > 4634 > 6006-unconfirmed > 6008/41 > 42.
         ///     4647 adalah priority tertinggi — reliable di semua skenario (sleep, fast startup, hibernate).
         ///     A lower-priority event never overwrites a higher-priority one.
         ///   • For same priority: keep the LATEST timestamp (most recent shutdown).
@@ -2333,8 +2333,11 @@ namespace EventLogOutEmployeeService
         ///   4634 = 3  Fallback logout — dipakai HANYA jika tidak ada 4647/1074/6006-confirmed.
         ///             Ketika ada dua 4634 di hari yang sama, same-priority logic mengambil yang
         ///             shutdownTime-nya LEBIH BESAR → selalu 4634 terakhir yang jadi ShutdownTime.
+        ///   6006 unconfirmed = 2  FIX [6006-FALLBACK]: last-resort fallback, di bawah 4634.
+        ///                         Sebelumnya 0 (diabaikan). Kini diizinkan sebagai fallback terakhir
+        ///                         kalau tidak ada event shutdown lain yang valid (kasus: 1074 tidak
+        ///                         ter-pair ke 6006 karena expire/restart, tidak ada 4647/4634/42).
         ///   6008/41 = 1
-        ///   6006 unconfirmed = 0
         ///   42 = -1 (last resort)
         ///
         /// PENTING: Harus selalu sinkron dengan GetShutdownEventPriority di LoginLogoutMonitorService.cs.
