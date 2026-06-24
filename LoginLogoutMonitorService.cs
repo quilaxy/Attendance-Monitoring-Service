@@ -3158,15 +3158,15 @@ namespace EventLogOutEmployeeService
                 }
 
                 // Shutdown group hold: tahan summary dispatch untuk 4647/1074/6006 sampai
-                // group lengkap atau timer 10 detik habis.
-                // Priority: 4647 (6) > 6006 confirmed (5) > 1074 (4).
+                // group lengkap atau timer 12 detik habis.
+                // Priority: 4647 (6) > 1074 (5) > 6006 confirmed (4).
                 // Kalau ada 4647 di group → 4647 yang dispatch, yang lain di-skip.
                 // Kalau tidak ada 4647 → 6006 confirmed yang dispatch kalau ada, fallback 1074.
                 // Raw tetap dispatch langsung — group hanya berlaku untuk summary.
                 if (needsSummary && item.ShutdownGroupId != null && item.ShutdownGroupHoldUntil.HasValue)
                 {
                     bool timerExpired = DateTime.UtcNow >= item.ShutdownGroupHoldUntil.Value;
-                    bool has6006InGroup = await eventQueue.GroupHas6006Async(item.ShutdownGroupId);
+                    bool has6006InGroup = await eventQueue.GroupHasPaired6006Async(item.ShutdownGroupId);
                     bool isThis6006 = item.EventId == 6006;
 
                     if (!timerExpired && !has6006InGroup && !isThis6006)
@@ -4391,9 +4391,24 @@ namespace EventLogOutEmployeeService
                 bool enqueued = await eventQueue.EnqueueIfNotDuplicateAsync(queuedEvent);
 
                 // Propagate restart flag ke seluruh group setelah enqueue,
-                // agar 4647 yang sudah ada di queue sebelum 1074 juga ter-mark.
+                // agar 6006 yang sudah ada di queue sebelum 1074 juga ter-mark
+                // (Windows kadang log 6006 sebelum 1074 selesai tulis — inverted order).
                 if (enqueued && queuedEvent.ShutdownGroupIsRestart && queuedEvent.ShutdownGroupId != null)
                     await eventQueue.MarkGroupAsRestartAsync(queuedEvent.ShutdownGroupId);
+
+                // FIX [RESTART-INHERIT]: Forward inheritance — event yang masuk ke group SETELAH
+                // restart-1074 (misal: 6006 yang tiba 24 detik setelah 1074) tidak mendapat
+                // ShutdownGroupIsRestart dari constructor karena flag hanya di-set di item 1074.
+                // MarkGroupAsRestartAsync yang dipanggil saat 1074 diproses hanya menyentuh member
+                // yang SUDAH ada di queue — 6006 yang belum masuk tidak ter-mark.
+                // Tanpa fix ini: ShouldProcessSummary tidak ter-guard oleh ShutdownGroupIsRestart,
+                // 6006 restart lolos ke summary dispatch sebagai "6006 unconfirmed" (priority 2).
+                else if (enqueued && !queuedEvent.ShutdownGroupIsRestart && queuedEvent.ShutdownGroupId != null)
+                {
+                    bool groupAlreadyRestart = await eventQueue.IsGroupMarkedAsRestartAsync(queuedEvent.ShutdownGroupId);
+                    if (groupAlreadyRestart)
+                        await eventQueue.MarkGroupAsRestartAsync(queuedEvent.ShutdownGroupId);
+                }
 
                 if (!enqueued)
                 {

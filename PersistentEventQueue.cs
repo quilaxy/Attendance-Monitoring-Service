@@ -794,7 +794,16 @@ namespace EventLogOutEmployeeService
             }
         }
 
-        public async Task<bool> GroupHas6006Async(string groupId, CancellationToken cancellationToken = default)
+        /// <summary>
+        /// Cek apakah group punya 6006 yang sudah ter-pair dengan 1074 (bukan unconfirmed).
+        /// Dipakai di dispatch group hold: kalau ada paired 6006 di group, 1074/4647 menunggu
+        /// sampai 6006 diproses (untuk menentukan siapa yang dispatch summary).
+        /// Return false untuk 6006 unconfirmed — grup dianggap belum punya 6006 valid.
+        ///
+        /// Nama sebelumnya: GroupHas6006Async (misleading — seolah cek any 6006,
+        /// padahal hanya return true untuk yang non-unconfirmed).
+        /// </summary>
+        public async Task<bool> GroupHasPaired6006Async(string groupId, CancellationToken cancellationToken = default)
         {
             await fileLock.WaitAsync(cancellationToken);
             try
@@ -1066,6 +1075,31 @@ namespace EventLogOutEmployeeService
                     await WriteItemInternalAsync(item);
                     CachePut(item);
                 }
+            }
+            finally
+            {
+                fileLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Cek apakah ada member dalam group yang sudah ter-mark sebagai restart
+        /// (ShutdownGroupIsRestart = true).
+        ///
+        /// Dipakai untuk forward inheritance: ketika event baru (misal 6006) masuk ke group
+        /// yang sudah mengandung restart-1074, event baru harus mewarisi flag restart.
+        /// MarkGroupAsRestartAsync yang dipanggil saat 1074 diproses hanya men-propagate ke
+        /// member yang SUDAH ada di queue — event yang datang belakangan tidak ter-cover.
+        /// </summary>
+        public async Task<bool> IsGroupMarkedAsRestartAsync(string groupId, CancellationToken cancellationToken = default)
+        {
+            await fileLock.WaitAsync(cancellationToken);
+            try
+            {
+                await EnsureCacheAsync();
+                return _cache.Values.Any(x =>
+                    x.ShutdownGroupId == groupId &&
+                    x.ShutdownGroupIsRestart);
             }
             finally
             {
