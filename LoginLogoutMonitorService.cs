@@ -178,16 +178,29 @@ namespace EventLogOutEmployeeService
         private static readonly TimeSpan MaxReplayLookback = TimeSpan.FromDays(7);
         private static readonly TimeSpan PendingQueueRetention = TimeSpan.FromDays(7);
 
+        // Shutdown events (1074, 6006, 4647) adalah fakta historis satu kali yang tidak
+        // bisa di-recover dari source lain jika expire. Retensi 45 hari untuk cover libur
+        // panjang (Lebaran + extend cuti) yang bisa mencapai 3 minggu + buffer aman.
+        // Login events tetap 7 hari — kalau tidak ketangkap dalam 7 hari, tidak actionable.
+        private static readonly TimeSpan ShutdownEventQueueRetention = TimeSpan.FromDays(45);
+
         private sealed class Last1074State
         {
-            public Last1074State(string username, DateTime eventTime, string shutdownType)
+            // FIX [1074-PAIRING]: Username nullable.
+            // Saat Security log corrupt (replay setelah crash), 4624 tidak ter-replay
+            // → lastActiveUser kosong → resolusi username 1074 gagal (pendingUsernameResolution=true).
+            // Kode lama bail-out di StoreLast1074State → state tidak tersimpan → 6006
+            // berikutnya tidak bisa menemukan pasangan → selalu "unconfirmed".
+            // Sekarang: null username boleh disimpan — timing + ShutdownType cukup untuk
+            // mengkonfirmasi pairing. 6006 resolve username via jalurnya sendiri.
+            public Last1074State(string? username, DateTime eventTime, string shutdownType)
             {
                 Username = username;
                 EventTime = eventTime;
                 ShutdownType = shutdownType;
             }
 
-            public string Username { get; }
+            public string? Username { get; }
             public DateTime EventTime { get; }
             public string ShutdownType { get; }
         }
@@ -2971,7 +2984,28 @@ namespace EventLogOutEmployeeService
                 ? DateTime.SpecifyKind(item.EventTime, DateTimeKind.Utc)
                 : item.EventTime.ToUniversalTime();
 
-            return nowUtc - eventTimeUtc > PendingQueueRetention;
+            // Shutdown events (1074, 6006, 4647) adalah fakta historis yang tidak bisa
+            // di-recover dari source lain — pakai ShutdownEventQueueRetention (45 hari).
+            //
+            // Skenario: device mati saat libur panjang (Lebaran + extend cuti ~3 minggu).
+            // Dengan 7 hari lama, pending shutdown dari hari kerja terakhir expire sebelum
+            // device dinyalakan → waktu logout hilang permanen.
+            //
+            // 4647 termasuk karena dia sering menjadi satu-satunya event shutdown yang
+            // tercatat (terutama di laptop WFH tanpa 1074 yang matched).
+            // 1074 dan 6006 jelas — mereka adalah event shutdown itu sendiri.
+            //
+            // Login events (4624, 4634) tetap 7 hari — kalau belum kerekam dalam 7 hari,
+            // sudah tidak actionable (Security log dan RawStore sudah tidak punya backup-nya).
+            bool isShutdownEvent = item.EventId == 1074 ||
+                                   item.EventId == 6006 ||
+                                   item.EventId == 4647;
+
+            TimeSpan retention = isShutdownEvent
+                ? ShutdownEventQueueRetention   // 45 hari
+                : PendingQueueRetention;        // 7 hari
+
+            return nowUtc - eventTimeUtc > retention;
         }
 
         private static bool ShouldProcessSummary(QueuedAttendanceEvent item)
@@ -4128,13 +4162,20 @@ namespace EventLogOutEmployeeService
                     }
                 }
 
-                if (eventId == 1074 && !pendingUsernameResolution &&
-                    !string.IsNullOrWhiteSpace(username) && IsValidUsername(username))
+                if (eventId == 1074)
                 {
                     string shutdownType = ParseShutdownType(eventMessage);
-                    StoreLast1074State(username, eventTime, shutdownType);
+
+                    // FIX [1074-PAIRING]: Selalu simpan state, termasuk saat username pending.
+                    // Jika pending → pass null; 6006 hanya butuh shutdownType untuk confirm.
+                    string? stateUsername = (!pendingUsernameResolution && IsValidUsername(username))
+                        ? username : null;
+                    StoreLast1074State(stateUsername, eventTime, shutdownType);
+
                     SafeWriteEventLog("Application",
-                        $"[DBG-1074] Stored state: Username={username} ShutdownType={shutdownType} Time={eventTime:O}",
+                        stateUsername != null
+                            ? $"[DBG-1074] Stored state: Username={stateUsername} ShutdownType={shutdownType} Time={eventTime:O}"
+                            : $"[DBG-1074] Stored state (username pending): ShutdownType={shutdownType} Time={eventTime:O} — 6006 will resolve username via fallback chain",
                         EventLogEntryType.Information, 2004);
                 }
 
@@ -5661,9 +5702,14 @@ namespace EventLogOutEmployeeService
             return null;
         }
 
-        private void StoreLast1074State(string username, DateTime eventTime, string shutdownType)
+        private void StoreLast1074State(string? username, DateTime eventTime, string shutdownType)
         {
-            if (!IsValidUsername(username))
+            // FIX [1074-PAIRING]: Dulu bail-out kalau !IsValidUsername(username).
+            // Aturan baru:
+            //   - null            : diperbolehkan — 6006 resolve username via fallback-nya sendiri.
+            //   - non-null valid  : disimpan seperti sebelumnya.
+            //   - non-null invalid: tetap di-reject (SYSTEM, DWM-, dsb.).
+            if (username != null && !IsValidUsername(username))
                 return;
 
             lock (last1074Lock)
@@ -6064,8 +6110,14 @@ namespace EventLogOutEmployeeService
             => $"Event{eventId}_Pending";
 
         // #3: IsValidUsername static agar tidak ada implicit instance capture.
-        private static bool IsValidUsername(string username)
+        private static bool IsValidUsername(string? username)
         {
+            // Guard null/whitespace di sini agar semua caller tidak perlu null-check manual
+            // sebelum memanggil method ini. Sebelumnya parameter non-nullable menyebabkan
+            // CS8604 warning di call site yang meneruskan string? (mis. stateUsername di
+            // StoreLast1074State, atau username dari path yang belum terkonfirmasi null-nya).
+            if (string.IsNullOrWhiteSpace(username))
+                return false;
             return SecurityEventParser.IsValidUsername(username);
         }
     }

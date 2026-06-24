@@ -926,18 +926,42 @@ namespace EventLogOutEmployeeService
             }
         }
 
+        /// <summary>
+        /// Priority shutdown untuk GroupHasHigherPriorityAsync.
+        /// HARUS selalu sinkron dengan:
+        ///   - LoginLogoutMonitorService.GetShutdownEventPriority  (myPriority = thanPriority yang dikirim ke sini)
+        ///   - SharePointIntegration.GetShutdownPriority
+        ///
+        /// Tabel priority (canonical):
+        ///   4647 = 6   User-initiated logoff — paling eksplisit
+        ///   1074 = 5   Shutdown (bukan restart)
+        ///   6006 confirmed = 4
+        ///   4634 = 3   Fallback logout
+        ///   6006 unconfirmed = 2   Last-resort fallback
+        ///   6008, 41   = 1   Crash / unexpected shutdown
+        ///   42         = -1  Sleep/hibernate — last resort
+        ///   lainnya    = 0
+        ///
+        /// FIX [PRIORITY-SYNC]: Versi lama tidak sinkron:
+        ///   4647=2 (seharusnya 6), 1074=4 (seharusnya 5), 6006-confirmed=5 (seharusnya 4), 4634 tidak ada (seharusnya 3).
+        ///   Akibat: GroupHasHigherPriorityAsync membandingkan myPriority (dari GetShutdownEventPriority, skala benar)
+        ///   dengan GetStaticShutdownPriority (skala lama yang berbeda) → hasil perbandingan salah.
+        ///   Contoh: group [4647, 4634], 4634 tanya "ada yang > 3?" → GetStaticShutdownPriority(4647)=2 → 2>3=false
+        ///   → 4634 dispatch duluan, padahal 4647 seharusnya menang.
+        ///   Data akhir tetap benar (SharePointIntegration punya priority yang benar dan overwrite),
+        ///   tapi ada satu API call sia-sia dan window kecil di mana summary row menunjukkan nilai 4634.
+        /// </summary>
         private static int GetStaticShutdownPriority(int eventId, string eventType)
         {
-            if (eventId == 6006)
-                // FIX [6006-FALLBACK]: Sinkron dengan LoginLogoutMonitorService.GetShutdownEventPriority
-                // dan SharePointIntegration.GetShutdownPriority — unconfirmed 6006 naik dari 0 ke 2.
-                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 2 : 5;
+            if (eventId == 4647) return 6;
             if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
-                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 4;
-            if (eventId == 4647) return 2;
+                                && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 5;
+            if (eventId == 6006)
+                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 2 : 4;
+            if (eventId == 4634) return 3;
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
-            if (eventId == 42)   return -1; // last resort, selalu di-overwrite event lain
+            if (eventId == 42)   return -1;
             return 0;
         }
 
