@@ -2991,10 +2991,18 @@ namespace EventLogOutEmployeeService
                  item.EventType.Contains("Reboot", StringComparison.OrdinalIgnoreCase)))
                 return false;
 
-            // 6006 Unconfirmed: tidak ada paired 1074 shutdown → kemungkinan restart → skip.
-            if (item.EventId == 6006 &&
-                item.EventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase))
-                return false;
+            // 6006 Unconfirmed: tidak ada paired 1074 shutdown yang teridentifikasi.
+            // FIX [6006-FALLBACK]: Sebelumnya di-skip sepenuhnya dari summary. Sekarang diizinkan
+            // masuk summary sebagai last-resort fallback dengan priority 2 (di bawah 4634=3).
+            // Kasus: PC shutdown tanpa 4647/4634/42, 1074 gagal di-pair ke 6006 (misal karena
+            // last1074States sudah expire atau service restart di antara keduanya).
+            // Priority system di TryUpdateDailySummaryShutdownAsync memastikan 6006 unconfirmed
+            // hanya menang kalau tidak ada event yang lebih baik. isNewSession check tetap berlaku
+            // sehingga 6006 unconfirmed mid-day (misal Fast Startup) tidak salah override logout
+            // akhir hari yang lebih baru.
+            //
+            // 6006 unconfirmed yang merupakan bagian dari shutdown group restart (ShutdownGroupIsRestart)
+            // sudah di-guard oleh check ShutdownGroupIsRestart di atas — tidak akan sampai ke sini.
 
             if (item.EventId == 1074 || item.EventId == 6006 || item.EventId == 4647)
                 return true;
@@ -3039,8 +3047,11 @@ namespace EventLogOutEmployeeService
         ///   6006 confirmed = 4
         ///   4634 = 3  Fallback logout — di bawah 1074/6006-confirmed.
         ///             Ketika ada dua 4634, same-priority → yang terbaru menang.
+        ///   6006 unconfirmed = 2  FIX [6006-FALLBACK]: last-resort fallback, di bawah 4634.
+        ///                         Sebelumnya 0 (diabaikan). Kini diizinkan sebagai fallback terakhir
+        ///                         kalau tidak ada event shutdown lain yang valid (kasus: 1074 tidak
+        ///                         ter-pair ke 6006 karena expire/restart, tidak ada 4647/4634/42).
         ///   6008/41 = 1
-        ///   6006 unconfirmed = 0
         ///   42 = -1 (last resort)
         ///
         /// Perubahan dari versi sebelumnya:
@@ -3048,6 +3059,7 @@ namespace EventLogOutEmployeeService
         ///     sehingga 4634 bisa mengalahkan system shutdown events yang lebih reliable.
         ///   - 1074/6006 tidak berubah nilainya; yang berubah hanya posisi relatif 4634.
         ///   - 6008, 41, 42 ditambahkan eksplisit (sebelumnya fall-through ke return 0).
+        ///   - 6006 unconfirmed: 0 → 2 (diizinkan sebagai fallback di atas crash events).
         /// </summary>
         private static int GetShutdownEventPriority(int eventId, string eventType)
         {
@@ -3055,7 +3067,7 @@ namespace EventLogOutEmployeeService
             if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
                                 && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 5;
             if (eventId == 6006)
-                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 4;
+                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 2 : 4;
             if (eventId == 4634) return 3;
             if (eventId == 6008) return 1;
             if (eventId == 41)   return 1;
@@ -3201,7 +3213,11 @@ namespace EventLogOutEmployeeService
                         }
                         // else: ini yang tertinggi → kirim summary
                     }
-                    // else: isThis6006=true → kirim summary dengan priority 5
+                    // else: isThis6006=true → kirim summary.
+                    // Mencakup 6006 confirmed (priority 4) maupun 6006 unconfirmed (priority 2).
+                    // 6006 unconfirmed diizinkan sebagai fallback [FIX 6006-FALLBACK] — priority
+                    // system di TryUpdateDailySummaryShutdownAsync akan menolak update kalau sudah
+                    // ada event yang lebih baik (4647/1074/4634) untuk sesi yang sama.
                 }
 
                 SafeWriteEventLog("Application",
@@ -4742,7 +4758,12 @@ namespace EventLogOutEmployeeService
         private string ParseShutdownType(string? eventMessage)
         {
             if (string.IsNullOrEmpty(eventMessage))
-                return "Shutdown/Restart Initiated";
+                // FIX [PARSE-FALLBACK]: Kalau message null/kosong, asumsikan shutdown bukan restart.
+                // "Shutdown/Restart Initiated" lama mengandung kata "Restart" sehingga terbaca
+                // sebagai restart oleh ShouldProcessSummary dan IsRestartShutdownType, yang
+                // menyebabkan 1074 dan 6006 paired-nya di-skip dari summary dispatch meskipun
+                // mesin benar-benar shutdown.
+                return "Shutdown Initiated";
 
             try
             {
@@ -4758,7 +4779,13 @@ namespace EventLogOutEmployeeService
             }
             catch { /* silent fail */ }
 
-            return "Shutdown/Restart Initiated";
+            // FIX [PARSE-FALLBACK]: Regex tidak match (field "Shut-down Type" tidak ada di message
+            // atau format berbeda). Default ke shutdown — bukan restart — karena:
+            // 1. Kalau confirmed restart, regex sudah match dan return "Restart Initiated" di atas.
+            // 2. "Shutdown/Restart Initiated" lama menyebabkan downstream treat ini sebagai
+            //    restart (ShouldProcessSummary, IsRestartShutdownType, TryResolve1074StateFor6006),
+            //    sehingga baik 1074 maupun 6006 paired-nya di-exclude dari summary secara salah.
+            return "Shutdown Initiated";
         }
 
         private string? GetMostRecentUserForComputer(

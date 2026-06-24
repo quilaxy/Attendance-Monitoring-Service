@@ -2344,7 +2344,10 @@ namespace EventLogOutEmployeeService
             if (eventId == 4647) return 6;
             if (eventId == 1074 && !IsRestartEventType(eventType)) return 5;
             if (eventId == 6006)
-                return IsUnconfirmed6006(eventType) ? 0 : 4;
+                // FIX [6006-FALLBACK]: Unconfirmed 6006 dinaikkan dari 0 ke 2 agar bisa
+                // menjadi fallback ShutdownTime kalau tidak ada event yang lebih baik.
+                // Confirmed 6006 tetap priority 4 — tidak berubah.
+                return IsUnconfirmed6006(eventType) ? 2 : 4;
             // 4634 fallback: di bawah 1074/6006-confirmed, di atas crash events.
             // Ketika ada dua 4634, same-priority → ambil yang shutdownTime lebih besar
             // (lihat blok "newPriority == effectiveCurrentPriority" di TryUpdateDailySummaryShutdownAsync).

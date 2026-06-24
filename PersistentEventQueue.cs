@@ -929,7 +929,9 @@ namespace EventLogOutEmployeeService
         private static int GetStaticShutdownPriority(int eventId, string eventType)
         {
             if (eventId == 6006)
-                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 0 : 5;
+                // FIX [6006-FALLBACK]: Sinkron dengan LoginLogoutMonitorService.GetShutdownEventPriority
+                // dan SharePointIntegration.GetShutdownPriority — unconfirmed 6006 naik dari 0 ke 2.
+                return eventType.Contains("unconfirmed", StringComparison.OrdinalIgnoreCase) ? 2 : 5;
             if (eventId == 1074 && !eventType.Contains("restart", StringComparison.OrdinalIgnoreCase)
                                 && !eventType.Contains("reboot", StringComparison.OrdinalIgnoreCase)) return 4;
             if (eventId == 4647) return 2;
