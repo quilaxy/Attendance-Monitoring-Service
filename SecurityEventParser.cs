@@ -20,21 +20,22 @@ namespace EventLogOutEmployeeService
         private static readonly HashSet<string> InvalidUsernames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             // Akun sistem Windows standar
-            "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "NETWORK SERVICE",
+            "SYSTEM", "LOCAL SERVICE", "LOCAL_SYSTEM", "LOCAL SYSTEM", "LOCALSYSTEM", "NETWORK SERVICE",
             "ANONYMOUS LOGON", "Guest", "DefaultAccount",
             // Nama Windows path component yang terbukti lolos lewat Pattern 3
             // karena ada di path executable di baris pertama event 1074
             // (misal C:\\WINDOWS\\servicing\\TrustedInstaller.exe → "servicing")
             "system32", "syswow64", "servicing", "winsxs", "uus",
             "trustedinstaller", "svchost", "services", "lsass", "winlogon",
-            "explorer", "consent", "credpro", "WsiAccount"
+            "explorer", "consent", "credpro", "WsiAccount", "WDAGUtilityAccount", "DefaultUser0",
+            "IUSR", "IWAM"
         };
 
         private static readonly string[] InvalidUsernamePrefixes =
         {
             "DWM-", "UMFD-", "NT Service",
             // Path-relative prefixes yang kadang tersisa setelah NormalizeDisplayUsername
-            "NT AUTHORITY", "BUILTIN"
+            "NT AUTHORITY", "BUILTIN", "FontDriverHost", "Window Manager"
         };
 
         private static readonly HashSet<string> ExcludedUsers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
