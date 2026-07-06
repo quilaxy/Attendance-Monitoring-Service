@@ -1613,13 +1613,24 @@ namespace EventLogOutEmployeeService
                 }
 
                 // Semua retry habis — tidak bisa menang dari race condition ini.
-                // Log warning; data mungkin perlu cek manual.
+                // FIX [BUG-3031-SILENT-DROP]: sebelumnya return; di sini membuat caller
+                // (TryDispatchQueuedEventAsync) menganggap dispatch SUKSES walau update
+                // Summary tidak pernah terjadi — item di-mark SummaryDispatched=true dan
+                // dihapus permanen dari queue, tidak pernah di-retry lagi.
+                // Sekarang throw, supaya caller masuk ke catch-block-nya (baris ~3331),
+                // return false, dan item tetap di queue untuk di-retry dengan backoff
+                // (dispatchBackoffSeconds) sampai ShutdownEventQueueRetention (45 hari)
+                // habis atau retry berikutnya berhasil. Ini konsisten dengan pola failure
+                // non-412 lain di fungsi ini (lihat throw InvalidOperationException di bawah).
                 SafeWriteEventLog("Application",
                     $"[DBG-Summary] TryUpdateShutdown: GAVE UP after {MaxRaceRetries} race retries " +
                     $"for itemId={itemId} user={username} shutdownTime={shutdownTime:O}. " +
-                    $"Row may have incorrect ShutdownTime — manual verification recommended.",
+                    $"Row may have incorrect ShutdownTime — will retry via dispatch queue.",
                     EventLogEntryType.Warning, 3031);
-                return;
+                throw new InvalidOperationException(
+                    $"TryUpdateDailySummaryShutdownAsync: gave up after {MaxRaceRetries} optimistic-concurrency " +
+                    $"retries (412 Precondition Failed) for itemId={itemId} user={username} computer={computerName} " +
+                    $"shutdownTime={shutdownTime:O} eventId={eventId}. Not marking as dispatched — caller should retry.");
             }
 
             if (!patchResult.IsSuccessStatusCode)

@@ -27,7 +27,7 @@ namespace EventLogOutEmployeeService
             // (misal C:\\WINDOWS\\servicing\\TrustedInstaller.exe → "servicing")
             "system32", "syswow64", "servicing", "winsxs", "uus",
             "trustedinstaller", "svchost", "services", "lsass", "winlogon",
-            "explorer", "consent", "credpro"
+            "explorer", "consent", "credpro", "WsiAccount"
         };
 
         private static readonly string[] InvalidUsernamePrefixes =
@@ -42,8 +42,8 @@ namespace EventLogOutEmployeeService
             "localadmin",
             "Administrator",
             "Admin",
-            "kidannafi",
-            "kidbenjamin"
+            // "kidannafi",
+            // "kidbenjamin"
         };
 
         public static ParsedSecurityEvent Parse(EventLogEntry entry)
