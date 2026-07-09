@@ -1254,13 +1254,39 @@ namespace EventLogOutEmployeeService
         /// Semua kolom lain (LoginTime, LoginDevice, dll) sengaja kosong.
         /// ShutdownTime akan diisi oleh caller setelah row ini terbuat.
         /// Yang penting: row dengan Title+WorkDate sudah ada sehingga ShutdownTime tidak terlewat.
+        ///
+        /// FIX [DUPLICATE-ROW-GUARD]: caller (TryUpdateDailySummaryShutdownAsync) sekarang throw
+        /// alih-alih silent-return kalau row tidak ketemu (lihat BUG-3027-SILENT-DROP), yang
+        /// berarti fungsi ini bisa dipanggil ulang untuk summaryKey yang sama pada retry
+        /// berikutnya. Kalau create sebelumnya SUKSES tapi caller gagal nemuin row-nya lagi
+        /// (Graph API eventual consistency — index belum ke-update), retry tanpa guard ini akan
+        /// bikin row duplikat untuk summaryKey yang sama. Cek existing dulu (single lookup, tanpa
+        /// retry-loop panjang supaya tidak menambah latensi ~21 detik di jalur umum) sebelum POST.
         /// </summary>
         private async Task CreateEmptySummaryRowAsync(
             HttpClient client, string username,
-            DateTime shutdownTime, SummaryCache? summaryCache = null)
+            DateTime shutdownTime, SummaryCache? summaryCache = null,
+            CancellationToken cancellationToken = default)
         {
             string workDate   = shutdownTime.ToLocalTime().ToString("yyyy-MM-dd");
             string summaryKey = BuildSummaryKey(username, workDate);
+
+            // Guard: cek dulu apakah row sudah ada (mis. dari attempt sebelumnya yang sukses
+            // create tapi gagal di-fetch balik karena eventual consistency). Single lookup,
+            // bukan FindSummaryItemWithRetryAsync — kita tidak mau menahan jalur umum
+            // (row memang belum ada) selama ~21 detik hanya untuk guard kasus retry ini.
+            var maybeExisting = await FindSummaryItemAsync(client, summaryKey, cancellationToken);
+            if (maybeExisting != null && maybeExisting.Count > 0)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] CreateEmptySummaryRow: row already exists for summaryKey={summaryKey} " +
+                    $"(likely created by a prior retry attempt) — skipping create to avoid duplicate.",
+                    EventLogEntryType.Information, 3029);
+
+                if (summaryCache != null)
+                    await summaryCache.AddAsync(summaryKey);
+                return;
+            }
 
             var fieldsData = new JObject
             {
@@ -1354,7 +1380,7 @@ namespace EventLogOutEmployeeService
                 {
                     // Buat row minimal — hanya Title, Username, WorkDate.
                     // Semua kolom lain kosong, ShutdownTime diisi setelah row terbuat.
-                    await CreateEmptySummaryRowAsync(client, username, shutdownTime, summaryCache);
+                    await CreateEmptySummaryRowAsync(client, username, shutdownTime, summaryCache, cancellationToken);
 
                     // Fetch row yang baru dibuat untuk lanjutkan update ShutdownTime
                     summaryItem = await FindSummaryItemForShutdownAsync(
@@ -1369,15 +1395,34 @@ namespace EventLogOutEmployeeService
 
                 if (summaryItem == null)
                 {
+                    // FIX [BUG-3027-SILENT-DROP]: sama seperti BUG-3031, return; di sini bikin
+                    // caller (TryDispatchQueuedEventAsync) menganggap dispatch sukses padahal
+                    // ShutdownTime tidak pernah tertulis — item di-mark SummaryDispatched=true
+                    // dan dihapus permanen dari queue. Trigger beda dari race 412 (di sini row
+                    // gagal ditemukan/dibuat, misal karena network timeout saat
+                    // CreateEmptySummaryRowAsync), tapi akibatnya identik. Throw supaya caller
+                    // retry lewat dispatch queue (backoff + retensi 45 hari), bukan silent-drop.
                     SafeWriteEventLog("Application",
                         $"[DBG-Summary] TryUpdateShutdown: SKIP — could not create or find summary row for user={username}",
                         EventLogEntryType.Warning, 3027);
-                    return;
+                    throw new InvalidOperationException(
+                        $"TryUpdateDailySummaryShutdownAsync: could not find or create summary row for " +
+                        $"user={username} computer={computerName} shutdownTime={shutdownTime:O}. " +
+                        $"Not marking as dispatched — caller should retry.");
                 }
             }
 
             string? itemId  = summaryItem?["id"]?.ToString();
-            if (string.IsNullOrWhiteSpace(itemId)) return;
+            if (string.IsNullOrWhiteSpace(itemId))
+            {
+                // FIX [BUG-3027-SILENT-DROP]: sama alasannya — itemId kosong berarti row hasil
+                // FindSummaryItemForShutdownAsync anomali (tidak punya field "id"). Daripada
+                // silently return (= caller anggap sukses), throw supaya di-retry.
+                throw new InvalidOperationException(
+                    $"TryUpdateDailySummaryShutdownAsync: summary row found but itemId is null/empty for " +
+                    $"user={username} computer={computerName} shutdownTime={shutdownTime:O}. " +
+                    $"Not marking as dispatched — caller should retry.");
+            }
 
             // ── ETag untuk optimistic concurrency ──────────────────────────────────
             // Graph API menyertakan @odata.etag di setiap item. ETag ini di-set sebagai
