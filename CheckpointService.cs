@@ -146,7 +146,14 @@ namespace EventLogOutEmployeeService
                 lock (checkpointWriteLock)
                 {
                     EnsureLastWrittenCheckpointInitialized();
-                    DateTime checkpointUtc = checkpoint.ToUniversalTime();
+                    // FIX [BUG-TZ-CHECKPOINT]: sama seperti TryLoadCheckpoint — kalau
+                    // parameter checkpoint ini tiba dengan Kind=Unspecified (nilai
+                    // sudah UTC dari pemanggil, cuma kehilangan label), jangan geser
+                    // pakai .ToUniversalTime(). Checkpoint di codebase ini selalu
+                    // dimaksudkan UTC.
+                    DateTime checkpointUtc = checkpoint.Kind == DateTimeKind.Unspecified
+                        ? DateTime.SpecifyKind(checkpoint, DateTimeKind.Utc)
+                        : checkpoint.ToUniversalTime();
                     if (_lastWrittenCheckpoint.HasValue && _lastWrittenCheckpoint.Value >= checkpointUtc)
                         return;
 
@@ -217,7 +224,12 @@ namespace EventLogOutEmployeeService
                     Directory.CreateDirectory(dir);
 
                 // Tulis atomik via temp+rename agar tidak corrupted kalau process mati di tengah write.
-                string content = checkpoint.ToUniversalTime().ToString("O");
+                // FIX [BUG-TZ-CHECKPOINT]: sama seperti SaveStopCheckpoint — jangan geser
+                // nilai yang Kind=Unspecified via .ToUniversalTime(), cukup relabel.
+                DateTime checkpointUtc = checkpoint.Kind == DateTimeKind.Unspecified
+                    ? DateTime.SpecifyKind(checkpoint, DateTimeKind.Utc)
+                    : checkpoint.ToUniversalTime();
+                string content = checkpointUtc.ToString("O");
                 string tempPath = replayCheckpointPath + ".tmp";
                 File.WriteAllText(tempPath, content);
                 File.Move(tempPath, replayCheckpointPath, overwrite: true);
@@ -236,8 +248,25 @@ namespace EventLogOutEmployeeService
                     System.Globalization.DateTimeStyles.RoundtripKind, out DateTime parsed))
                 return null;
 
+            // FIX [BUG-TZ-CHECKPOINT]: SEBELUMNYA baris di bawah memanggil
+            // .ToUniversalTime() untuk semua Kind selain Utc, termasuk Unspecified.
+            // Itu salah — kalau file checkpoint ini ditulis tanpa suffix 'Z' (misal
+            // file lama dari versi app sebelumnya, atau file .bak yang sempat ditulis
+            // dengan cara berbeda), hasil parse-nya Unspecified, dan .ToUniversalTime()
+            // MENGASUMSIKAN itu waktu lokal lalu menggeser -7 jam — padahal isinya
+            // memang selalu dimaksudkan UTC (lihat komentar di bawah). Konsisten
+            // dengan fix yang sama di ParseFieldDateTime/ToUtcString
+            // (SharePointIntegration.cs) dan ProcessEvent (LoginLogoutMonitorService.cs):
+            // Unspecified di codebase ini berarti "sudah UTC, label hilang", bukan
+            // "genuinely lokal" — jadi direlabel (SpecifyKind), bukan digeser.
+            //
             // Checkpoint disimpan sebagai UTC (Z suffix) — return as UTC.
-            return parsed.Kind == DateTimeKind.Utc ? parsed : parsed.ToUniversalTime();
+            if (parsed.Kind == DateTimeKind.Utc)
+                return parsed;
+
+            return parsed.Kind == DateTimeKind.Unspecified
+                ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc)
+                : parsed.ToUniversalTime();
         }
     }
 }

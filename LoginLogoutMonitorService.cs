@@ -4288,8 +4288,22 @@ namespace EventLogOutEmployeeService
                     _ => "Unknown Event"
                 };
 
+                // FIX [BUG-TZ-PROCESSEVENT]: SEBELUMNYA baris ini mengasumsikan
+                // Kind=Unspecified berarti "genuinely waktu lokal" dan melabelnya
+                // sebagai Local. Itu salah untuk satu-satunya jalur yang bisa membuat
+                // eventTime tiba di sini dengan Kind=Unspecified: replay dari
+                // RawEventStore (raw.EventTimeUtc, lihat ProcessRawSecurityEventAsync)
+                // — nilai itu SUDAH UTC sejak awal (live capture selalu pakai
+                // .ToUniversalTime() sebelum sampai sini), cuma kehilangan label Kind
+                // lewat round-trip serialize/deserialize di disk. Melabelnya Local di
+                // sini membuatnya lolos dari penanganan defensif di titik lain
+                // (ToUtcString/ParseFieldDateTime di SharePointIntegration.cs) karena
+                // sudah terlanjur "confidently" berlabel Local, bukan Unspecified lagi.
+                // Konsisten dengan fix di ToUtcString/ParseFieldDateTime: Unspecified
+                // di codebase ini selalu berarti "sudah UTC, label hilang", bukan
+                // "genuinely lokal".
                 if (eventTime.Kind == DateTimeKind.Unspecified)
-                    eventTime = DateTime.SpecifyKind(eventTime, DateTimeKind.Local);
+                    eventTime = DateTime.SpecifyKind(eventTime, DateTimeKind.Utc);
 
                 if (eventId == 1074 || eventId == 6006 || eventId == 4647 || eventId == 4634 || eventId == 42)
                     SharePointIntegration.MarkShutdownEvent(eventTime);
@@ -4976,10 +4990,26 @@ namespace EventLogOutEmployeeService
             // Tunggu minimal 15 detik setelah event time agar event shutdown yang lebih baik
             // sempat masuk queue sebelum kita memutuskan 42 adalah last-resort.
             // Kalau belum 15 detik, return false — dispatch loop akan retry event ini nanti.
-            if (DateTime.UtcNow - item.EventTime.ToUniversalTime() < TimeSpan.FromSeconds(15))
+            // FIX [BUG-TZ-PROMOTE42]: SEBELUMNYA baris di bawah memanggil
+            // item.EventTime.ToUniversalTime() tanpa cek Kind. Kalau item.EventTime
+            // ber-Kind Unspecified (bisa terjadi lewat round-trip antrian lokal, lihat
+            // IsPendingQueueItemExpired), .ToUniversalTime() SALAH menganggap nilai itu
+            // waktu lokal dan menggeser -7 jam — membuat "elapsed" di sini tampak 7 jam
+            // LEBIH BESAR dari yang sebenarnya. Karena 7 jam jauh melebihi ambang 15
+            // detik, cek "belum 15 detik" jadi TIDAK PERNAH true kalau kena bug ini —
+            // event 42 langsung dipromosikan sebagai last-resort meski baru sedetik
+            // sejak event terjadi, membatalkan tujuan proteksi ini (kasih waktu untuk
+            // event yang lebih baik seperti 4647/1074 masuk duluan). Konsisten dengan
+            // fix Kind lain di codebase ini: Unspecified berarti "sudah UTC, label
+            // hilang", jadi direlabel, bukan digeser.
+            DateTime itemEventTimeUtc = item.EventTime.Kind == DateTimeKind.Unspecified
+                ? DateTime.SpecifyKind(item.EventTime, DateTimeKind.Utc)
+                : item.EventTime.ToUniversalTime();
+
+            if (DateTime.UtcNow - itemEventTimeUtc < TimeSpan.FromSeconds(15))
             {
                 SafeWriteEventLog("Application",
-                    $"[DBG-42] Too early to promote: elapsed={( DateTime.UtcNow - item.EventTime.ToUniversalTime()).TotalSeconds:F1}s < 15s. " +
+                    $"[DBG-42] Too early to promote: elapsed={(DateTime.UtcNow - itemEventTimeUtc).TotalSeconds:F1}s < 15s. " +
                     $"computer={item.ComputerName} user={item.Username}",
                     EventLogEntryType.Information, 2032);
                 return false;

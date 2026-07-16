@@ -203,18 +203,28 @@ namespace EventLogOutEmployeeService
 
         public static void SetServiceStartTime(DateTime startTime) { /* reserved */ }
 
+        // FIX [BUG-TZ-WAKESLEEP]: helper lokal — eventTime di sini bisa berasal dari
+        // item antrian (item.EventTime) yang terbukti bisa Kind=Unspecified. Konsisten
+        // dengan fix Kind lain: relabel, jangan geser.
+        private static DateTime NormalizeToUtc(DateTime dt) => dt.Kind switch
+        {
+            DateTimeKind.Utc => dt,
+            DateTimeKind.Unspecified => DateTime.SpecifyKind(dt, DateTimeKind.Utc),
+            _ => dt.ToUniversalTime()
+        };
+
         public static void MarkShutdownEvent(DateTime eventTime)
-            => Interlocked.Exchange(ref _lastShutdownEventTicks, eventTime.ToUniversalTime().Ticks);
+            => Interlocked.Exchange(ref _lastShutdownEventTicks, NormalizeToUtc(eventTime).Ticks);
 
         public static void MarkSleepEvent(DateTime eventTime)
-            => Interlocked.Exchange(ref _lastSleepEventTicks, eventTime.ToUniversalTime().Ticks);
+            => Interlocked.Exchange(ref _lastSleepEventTicks, NormalizeToUtc(eventTime).Ticks);
 
         public static bool IsValidWakeEvent(DateTime eventTime)
         {
             DateTime lastSleepEventTime = new DateTime(
                 Interlocked.Read(ref _lastSleepEventTicks),
                 DateTimeKind.Utc);
-            var diff = eventTime.ToUniversalTime() - lastSleepEventTime;
+            var diff = NormalizeToUtc(eventTime) - lastSleepEventTime;
             return diff.TotalHours > 0 && diff.TotalHours <= 2;
         }
 
@@ -570,7 +580,12 @@ namespace EventLogOutEmployeeService
 
                 // Fix 3: tambah filter EventTime ge 30 hari lalu agar tidak return username
                 // dari bulan lalu kalau user sudah lama tidak login di device itu.
-                DateTime windowStart = referenceTime.AddDays(-30).ToUniversalTime();
+                // FIX [BUG-TZ-USERNAMELOOKUP]: konsisten dengan fix Kind lain di codebase
+                // ini — jangan geser nilai Unspecified via ToUniversalTime().
+                DateTime referenceTimeUtc = referenceTime.Kind == DateTimeKind.Unspecified
+                    ? DateTime.SpecifyKind(referenceTime, DateTimeKind.Utc)
+                    : referenceTime.ToUniversalTime();
+                DateTime windowStart = referenceTimeUtc.AddDays(-30);
                 string windowStartStr = windowStart.ToString("yyyy-MM-ddTHH:mm:ssZ");
                 string filter = $"fields/ComputerName eq '{EscapeODataLiteral(computerName)}'" +
                                 $" and fields/EventTime ge '{windowStartStr}'";
@@ -2003,12 +2018,38 @@ namespace EventLogOutEmployeeService
         }
 
         /// <summary>
-        /// Converts a local DateTime to UTC and formats as ISO 8601 with Z suffix.
-        /// SharePoint Graph API accepts this format and auto-converts for display
-        /// based on the site's Regional Settings timezone (e.g. UTC+7).
+        /// Format DateTime jadi ISO 8601 dengan suffix Z untuk SharePoint Graph API.
+        /// SharePoint menyimpan semua DateTime secara internal sebagai UTC — Regional
+        /// Settings di site cuma memengaruhi tampilan (mis. UTC+7 WIB), bukan nilai
+        /// yang disimpan.
+        ///
+        /// FIX [BUG-TZ-TOUTCSTRING]: SEBELUMNYA komentar di sini bilang "converts a
+        /// local DateTime to UTC" dan selalu memanggil .ToUniversalTime() tanpa
+        /// mengecek Kind. Itu benar HANYA kalau input genuinely Kind=Local. Tapi semua
+        /// pemanggil fungsi ini (eventTime/loginTime/shutdownTime) sudah dikonversi ke
+        /// UTC sejak titik capture (via entry.TimeGenerated.ToUniversalTime()) — satu-
+        /// satunya cara nilai itu kehilangan Kind=Utc dan menjadi Kind=Unspecified
+        /// adalah lewat round-trip serialize/deserialize di antrian lokal (lihat
+        /// IsPendingQueueItemExpired yang sudah menangani kasus ini). Kalau dibiarkan,
+        /// .ToUniversalTime() pada nilai Unspecified itu SALAH mengasumsikan waktu
+        /// lokal dan menggeser -7 jam terhadap nilai yang aslinya sudah benar.
+        ///
+        /// Kalau di masa depan ada pemanggil baru yang genuinely mengirim Kind=Local
+        /// (misal sumber waktu baru yang belum dikonversi), .ToUniversalTime() tetap
+        /// dipanggil untuk kasus itu — cuma Kind=Unspecified yang diperlakukan beda
+        /// (relabel, bukan geser), karena di codebase ini Unspecified selalu berarti
+        /// "sudah UTC, cuma kehilangan label", bukan "genuinely lokal".
         /// </summary>
         private static string ToUtcString(DateTime dt)
-            => dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
+        {
+            DateTime utc = dt.Kind switch
+            {
+                DateTimeKind.Utc => dt,
+                DateTimeKind.Unspecified => DateTime.SpecifyKind(dt, DateTimeKind.Utc),
+                _ => dt.ToUniversalTime()
+            };
+            return utc.ToString("yyyy-MM-ddTHH:mm:ssZ");
+        }
 
         /// <summary>
         /// Converts a DateTime to local time and formats only the clock part (HH:mm:ss)
@@ -2275,8 +2316,18 @@ namespace EventLogOutEmployeeService
             // Title mengandung backslash → OData filter HTTP 400.
             // Filter pakai EventTime window saja — sudah cukup unik karena
             // title (ComputerName+EventId+Username) di-check dari hasil query.
-            DateTime from = eventTime.ToUniversalTime().AddSeconds(-60);
-            DateTime to   = eventTime.ToUniversalTime().AddSeconds(60);
+            // FIX [BUG-TZ-DEDUP]: SEBELUMNYA eventTime.ToUniversalTime() dipanggil tanpa
+            // cek Kind. Kalau eventTime ini berasal dari item antrian yang di-retry
+            // (item.EventTime, bisa Kind=Unspecified), window dedup [from, to] di bawah
+            // akan salah geser -7 jam dari waktu sebenarnya — membuat query pencarian
+            // duplikat mengarah ke jam yang salah, sehingga TIDAK menemukan record yang
+            // sebenarnya sudah ada, dan menulis DUPLIKAT ke raw list. Konsisten dengan
+            // fix Kind lain: relabel Unspecified, jangan digeser.
+            DateTime eventTimeUtc = eventTime.Kind == DateTimeKind.Unspecified
+                ? DateTime.SpecifyKind(eventTime, DateTimeKind.Utc)
+                : eventTime.ToUniversalTime();
+            DateTime from = eventTimeUtc.AddSeconds(-60);
+            DateTime to   = eventTimeUtc.AddSeconds(60);
 
             string filter = $"fields/EventTime ge '{from:yyyy-MM-ddTHH:mm:ssZ}' and " +
                             $"fields/EventTime le '{to:yyyy-MM-ddTHH:mm:ssZ}'";
@@ -2348,9 +2399,31 @@ namespace EventLogOutEmployeeService
             if (string.IsNullOrWhiteSpace(value)) return null;
             if (!DateTime.TryParse(value, null, System.Globalization.DateTimeStyles.RoundtripKind, out DateTime parsed))
                 return null;
-            // SharePoint returns UTC (Z suffix) — keep as UTC for consistent comparison
-            // with eventTime which is also now always UTC throughout the codebase.
-            return parsed.Kind == DateTimeKind.Utc ? parsed : parsed.ToUniversalTime();
+
+            // FIX [BUG-TZ-PARSEFIELD]: SharePoint field ini SELALU merepresentasikan UTC.
+            // SEBELUMNYA: kalau Kind != Utc, kode memanggil .ToUniversalTime() tanpa pandang
+            // bulu. Tapi .ToUniversalTime() pada DateTime ber-Kind Unspecified MENGASUMSIKAN
+            // nilainya adalah waktu LOKAL dan menggeser sesuai offset timezone device (mis.
+            // -7 jam untuk WIB) — padahal Graph API kadang membalikkan value TANPA suffix
+            // 'Z'/offset (walau isinya tetap UTC), sehingga DateTime.TryParse menghasilkan
+            // Kind=Unspecified, bukan Kind=Local maupun Kind=Utc. Akibatnya nilai yang
+            // sebenarnya sudah UTC (mis. 2026-07-10T11:08:18) ikut digeser jadi salah
+            // (2026-07-10T04:08:18) — offset 7 jam persis sesuai timezone lokal, bukan race
+            // condition seperti yang sempat disimpulkan dari log VERIFY MISMATCH.
+            //
+            // FIX: kalau Kind==Unspecified, RELABEL saja jadi Utc (SpecifyKind, tidak
+            // menggeser angka) — karena field ini oleh desain SharePoint/Graph API selalu
+            // UTC, terlepas dari ada-tidaknya suffix 'Z' di response. .ToUniversalTime()
+            // hanya dipakai kalau Kind benar-benar Local (skenario yang seharusnya tidak
+            // terjadi untuk field ini, tapi ditangani untuk jaga-jaga).
+            // Pola ini konsisten dengan IsPendingQueueItemExpired() yang sudah menangani
+            // kasus serupa dengan benar.
+            if (parsed.Kind == DateTimeKind.Utc)
+                return parsed;
+
+            return parsed.Kind == DateTimeKind.Unspecified
+                ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc)
+                : parsed.ToUniversalTime();
         }
 
         private static string BuildShutdownType(int eventId, string eventType)
