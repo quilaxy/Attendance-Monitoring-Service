@@ -3014,34 +3014,43 @@ namespace EventLogOutEmployeeService
             if (item.EventId == 4624)
                 return item.IsSummaryEligible;
 
+            // ── FIX [SUMMARY-SCOPE] ──────────────────────────────────────────────
+            // Keputusan desain: System log events (1074, 6006, 42) TIDAK LAGI masuk
+            // Summary — cuma tetap masuk Attendance Log (raw) seperti biasa (diatur
+            // terpisah lewat item.WriteRawRecord, tidak terpengaruh perubahan ini).
+            //
+            // Alasan: hampir semua bug ShutdownTime yang ditemukan (group-hold vs
+            // sprint budget, priority 4647-vs-6006 yang tidak terlindungi sesuai
+            // ekspektasi, dsb) berasal dari mekanisme pairing/priority System log ini.
+            // Summary yang dipakai untuk keperluan attendance/payroll sebaiknya cuma
+            // diisi dari sumber yang paling reliable dan paling sederhana logic-nya:
+            //   - 4647 (User Logout, Security log) — sinyal paling reliable.
+            //   - 4634 (fallback) — dipakai HANYA kalau 4647 tidak ada sama sekali.
+            //
+            // Trade-off yang disadari: hari user sleep (bukan shutdown) atau force-
+            // shutdown (tidak ada 4647/4634 sama sekali), ShutdownTime di Summary akan
+            // KOSONG untuk hari itu. Ini disengaja — kosong (kelihatan jelas perlu
+            // dicek manual) dianggap lebih aman daripada data yang diam-diam salah.
+            //
+            // 1074/6006/42 tetap di-enqueue dan tetap dispatch ke raw list seperti
+            // biasa (needsRaw tidak berubah) — cuma tidak pernah update ShutdownTime
+            // di Summary. Mekanisme ShutdownGroupHold/priority-arbitration di
+            // TryDispatchQueuedEventAsync jadi otomatis tidak relevan lagi untuk
+            // 1074/6006 (needsSummary sudah false sebelum sampai ke situ) — sengaja
+            // tidak dihapus kodenya, biar perubahan ini minimal dan gampang di-revert
+            // kalau ternyata keputusan ini mau ditinjau ulang nanti.
+            if (item.EventId == 1074 || item.EventId == 6006 || item.EventId == 42)
+                return false;
+
             // Seluruh group ditandai restart → semua member skip summary.
-            // Ini mencakup 4647, 1074, dan 6006 dalam rangkaian restart.
+            // Ini mencakup 4647 dalam rangkaian restart.
             if (item.ShutdownGroupIsRestart)
                 return false;
 
-            // 1074 Restart: skip — bukan shutdown, tidak perlu tulis ShutdownTime.
-            if (item.EventId == 1074 &&
-                (item.EventType.Contains("Restart", StringComparison.OrdinalIgnoreCase) ||
-                 item.EventType.Contains("Reboot", StringComparison.OrdinalIgnoreCase)))
-                return false;
-
-            // 6006 Unconfirmed: tidak ada paired 1074 shutdown yang teridentifikasi.
-            // FIX [6006-FALLBACK]: Sebelumnya di-skip sepenuhnya dari summary. Sekarang diizinkan
-            // masuk summary sebagai last-resort fallback dengan priority 2 (di bawah 4634=3).
-            // Kasus: PC shutdown tanpa 4647/4634/42, 1074 gagal di-pair ke 6006 (misal karena
-            // last1074States sudah expire atau service restart di antara keduanya).
-            // Priority system di TryUpdateDailySummaryShutdownAsync memastikan 6006 unconfirmed
-            // hanya menang kalau tidak ada event yang lebih baik. isNewSession check tetap berlaku
-            // sehingga 6006 unconfirmed mid-day (misal Fast Startup) tidak salah override logout
-            // akhir hari yang lebih baru.
-            //
-            // 6006 unconfirmed yang merupakan bagian dari shutdown group restart (ShutdownGroupIsRestart)
-            // sudah di-guard oleh check ShutdownGroupIsRestart di atas — tidak akan sampai ke sini.
-
-            if (item.EventId == 1074 || item.EventId == 6006 || item.EventId == 4647)
+            if (item.EventId == 4647)
                 return true;
 
-            // 4634: fallback logout.
+            // 4634: fallback logout — HANYA dipakai kalau 4647 tidak ada.
             //
             // Raw List SharePoint: 4634 user standard SELALU masuk (kecuali 4634 admin — sudah
             // di-drop di admin correlation gate sebelum sampai ke sini).
@@ -3049,9 +3058,8 @@ namespace EventLogOutEmployeeService
             // Summary List SharePoint: 4634 masuk summary dan update ShutdownTime HANYA jika:
             //   - status bukan STALE_SESSION_CLOSE (4634 yang fire ≤30 detik setelah 4624 —
             //     bukan logout sesungguhnya; raw record tetap di-dispatch sebagai audit trail)
-            //   - tidak ada 4647/1074/6006-confirmed di queue yang sama — dikendalikan oleh
-            //     priority system di TryUpdateDailySummaryShutdownAsync (4634 = priority 3,
-            //     di bawah 4647=6, 1074=5, 6006-confirmed=4).
+            //   - tidak ada 4647 di queue yang sama — dikendalikan oleh priority system di
+            //     TryUpdateDailySummaryShutdownAsync (4634 = priority 3, di bawah 4647=6).
             //
             // Ketika ada dua atau lebih 4634 di hari yang sama, keduanya masuk summary queue.
             // TryUpdateDailySummaryShutdownAsync memilih yang shutdownTime LEBIH BESAR
@@ -3062,12 +3070,6 @@ namespace EventLogOutEmployeeService
                     return false;
                 return true;
             }
-
-            // FIX [BUG-2+3]: Event 42 (Sleep/Modern Standby) sebagai last-resort shutdown.
-            // Hanya masuk summary kalau belum ada ShutdownTime sama sekali (IsLastResort42 flag).
-            // Validasi wake (apakah 42 ini shutdown final) dilakukan di TryDispatchQueuedEventAsync.
-            if (item.EventId == 42)
-                return item.IsLastResort42;
 
             return false;
         }
@@ -3137,25 +3139,13 @@ namespace EventLogOutEmployeeService
                 bool needsRaw     = item.WriteRawRecord && !item.RawRecordDispatched;
                 bool needsSummary = ShouldProcessSummary(item) && !item.SummaryDispatched;
 
-                // FIX [BUG-2+3]: Evaluasi apakah event 42 layak jadi last-resort ShutdownTime.
-                // Dilakukan di sini (saat dispatch, bukan enqueue) karena kita perlu cek
-                // apakah ada event shutdown "lebih baik" yang sudah masuk queue setelahnya.
-                if (item.EventId == 42 && !item.IsLastResort42 && !item.SummaryDispatched)
-                {
-                    bool shouldUse42 = await ShouldUseEvent42AsLastResortAsync(item);
-                    if (shouldUse42)
-                    {
-                        item.IsLastResort42 = true;
-                        await eventQueue.ReplaceAsync(item);
-                        // Re-evaluate needsSummary setelah flag di-set
-                        needsSummary = ShouldProcessSummary(item) && !item.SummaryDispatched;
-                        SafeWriteEventLog("Application",
-                            $"[DISPATCH] Event 42 promoted to last-resort shutdown: " +
-                            $"queueId={item.QueueId} user={item.Username} computer={item.ComputerName} " +
-                            $"time={item.EventTime:O}",
-                            EventLogEntryType.Information, 4011);
-                    }
-                }
+                // FIX [SUMMARY-SCOPE]: sejak event 42 dikecualikan permanen dari Summary
+                // (lihat ShouldProcessSummary), evaluasi "layak jadi last-resort" ini tidak
+                // lagi memengaruhi apapun — needsSummary untuk eventId==42 selalu false
+                // terlepas dari IsLastResort42. Blok ini dimatikan supaya tidak buang resource
+                // scan seluruh antrian (ShouldUseEvent42AsLastResortAsync) untuk hasil yang
+                // sudah pasti tidak dipakai. Fungsi ShouldUseEvent42AsLastResortAsync sengaja
+                // tidak dihapus — biar gampang diaktifkan lagi kalau keputusan ini ditinjau ulang.
 
                 // Shutdown group hold: tahan summary dispatch untuk 4647/1074/6006 sampai
                 // group lengkap atau timer 12 detik habis.
