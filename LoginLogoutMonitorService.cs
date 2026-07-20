@@ -3055,21 +3055,33 @@ namespace EventLogOutEmployeeService
             // Raw List SharePoint: 4634 user standard SELALU masuk (kecuali 4634 admin — sudah
             // di-drop di admin correlation gate sebelum sampai ke sini).
             //
-            // Summary List SharePoint: 4634 masuk summary dan update ShutdownTime HANYA jika:
-            //   - status bukan STALE_SESSION_CLOSE (4634 yang fire ≤30 detik setelah 4624 —
-            //     bukan logout sesungguhnya; raw record tetap di-dispatch sebagai audit trail)
-            //   - tidak ada 4647 di queue yang sama — dikendalikan oleh priority system di
-            //     TryUpdateDailySummaryShutdownAsync (4634 = priority 3, di bawah 4647=6).
+            // Summary List SharePoint: 4634 masuk summary dan update ShutdownTime kalau
+            // tidak ada 4647 di queue yang sama — dikendalikan oleh priority system di
+            // TryUpdateDailySummaryShutdownAsync (4634 = priority 3, di bawah 4647=6).
             //
             // Ketika ada dua atau lebih 4634 di hari yang sama, keduanya masuk summary queue.
             // TryUpdateDailySummaryShutdownAsync memilih yang shutdownTime LEBIH BESAR
-            // (same-priority → ambil yang lebih baru) → selalu 4634 terakhir yang menang.
+            // (same-priority → ambil yang lebih baru) → selalu 4634 TERAKHIR hari itu yang menang.
+            //
+            // FIX [4634-STALE-FALLBACK]: SEBELUMNYA status STALE_SESSION_CLOSE (4634 yang
+            // fire ≤30 detik setelah SEMBARANG 4624 hari itu — biasanya unlock-screen/
+            // CachedInteractive, bukan logout sungguhan) di-exclude total dari Summary.
+            //
+            // Keputusan baru: tidak lagi di-exclude. Alasan — kalau kebetulan TIDAK ADA
+            // 4647 sama sekali hari itu, dan 4634 terakhir hari itu kebetulan juga kena
+            // tandai stale (misal user unlock/re-login sesaat sebelum benar-benar pulang),
+            // exclude total bikin ShutdownTime kosong — padahal 4634 itu tetap sinyal
+            // TERBAIK yang tersedia untuk hari itu.
+            //
+            // Trade-off yang disadari dan diterima: dalam skenario tail-case di mana HANYA
+            // ADA SATU 4634 sepanjang hari dan itu stale (dekat ke waktu LOGIN, bukan dekat
+            // waktu pulang), ShutdownTime yang tersimpan akan terlihat ganjil (nyaris sama
+            // dengan LoginTime) — bukan salah proses, tapi memang mencerminkan satu-satunya
+            // sinyal yang ada. Dianggap lebih baik daripada kosong. Raw List tetap mencatat
+            // status STALE_SESSION_CLOSE pada record itu untuk keperluan audit/investigasi
+            // kalau ada yang perlu dicek manual.
             if (item.EventId == 4634)
-            {
-                if (item.Status == "STALE_SESSION_CLOSE")
-                    return false;
                 return true;
-            }
 
             return false;
         }
