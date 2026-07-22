@@ -96,12 +96,42 @@ namespace EventLogOutEmployeeService
                     // ResubscribeAndMiniReplayAsync sudah melakukan pemisahan ini; startup path harus
                     // mengikuti pola yang sama untuk konsistensi dan ketahanan yang setara.
 
+                    // FIX [SEC-GAP]: ShouldSkipLiveEntry() memberi Security events (4624/4647)
+                    // grace window +LiveEventGracePeriod (10s) di atas _replayUpperBoundTicks
+                    // sebelum menganggap event itu "live, bukan tanggung jawab replay" (lihat
+                    // ShouldSkipLiveEntry di bawah). Tapi upper-bound filter di ReplaySecurityEvents
+                    // sendiri (`eventTime > toTime`) sebelumnya memakai replayTo yang SAMA tanpa
+                    // extension yang setara — menciptakan dead zone: event Security yang jatuh di
+                    // (replayTo, replayTo+grace] ditolak DUA-DUANYA — replay (dianggap "terlalu baru
+                    // untuk window ini") dan live tap (dianggap "masih dalam grace window replay").
+                    //
+                    // Insiden nyata: 4624 pada replayTo+~7s saat startup replay hilang total dari
+                    // Security-log-replay maupun RawStore-replay, tidak pernah sampai ke ProgramData
+                    // raw store atau SharePoint — padahal event itu terkonfirmasi benar-benar terjadi
+                    // (Windows Security log lokal + Sentinel forwarder, dua sumber independen).
+                    //
+                    // Fix: lebarkan upper bound scan Security log (dan RawStore, untuk konsistensi
+                    // fallback) sebesar grace period yang sama, supaya cakupan replay dan live tap
+                    // bersambungan, bukan cuma bersebelahan dengan celah di antaranya.
+                    //
+                    // System events TIDAK perlu perubahan ini: ShouldSkipLiveEntry tidak memberi
+                    // grace period untuk event non-Security (lihat effectiveBound di bawah), jadi
+                    // window replay System (replayTo) sudah align dengan window live-tap System
+                    // (replayUpperBound tanpa grace) — tidak ada dead zone di jalur itu.
+                    DateTime securityReplayTo = replayTo.Add(LiveEventGracePeriod);
+
+                    _writeEventLog("Application",
+                        $"[SEC-GAP] Security replay window widened by grace period: " +
+                        $"scan upper bound={securityReplayTo:O} (replayTo={replayTo:O} + {LiveEventGracePeriod.TotalSeconds}s), " +
+                        $"aligns with ShouldSkipLiveEntry's effectiveBound for Security events.",
+                        EventLogEntryType.Information, 1043);
+
                     // ── Phase 1: Security log replay (sumber primer) ─────────────────────────
                     // Security events harus selesai lebih dulu agar lastActiveUser ter-populate
                     // sebelum System events (1074/6006) diproses.
                     try
                     {
-                        ReplaySecurityEvents(replayFrom, replayTo);
+                        ReplaySecurityEvents(replayFrom, securityReplayTo);
                     }
                     catch (Exception ex)
                     {
@@ -114,9 +144,16 @@ namespace EventLogOutEmployeeService
                     // Selalu dijalankan — bukan hanya jika Phase 1 gagal.
                     // Menangkap 4624/4647 yang sudah hilang dari Security log karena rotation
                     // tapi sempat disimpan ke rawevents\ saat terjadi secara real-time.
+                    //
+                    // FIX [SEC-GAP]: window dilebarkan sama seperti Phase 1 (securityReplayTo).
+                    // RawStore tidak digate oleh ShouldSkipLiveEntry, jadi ini bukan syarat untuk
+                    // menutup dead zone di atas — tapi kalau tidak diselaraskan, Phase 1 dan Phase 2
+                    // akan mengecek window yang berbeda untuk kelas event yang sama, yang membuat
+                    // "RawStore replay will cover gap" (lihat pesan di ReplaySecurityEvents saat log
+                    // rotation) tidak lagi benar untuk 10 detik terakhir window itu.
                     try
                     {
-                        await ReplayFromRawStore(replayFrom.Value, replayTo);
+                        await ReplayFromRawStore(replayFrom.Value, securityReplayTo);
                     }
                     catch (Exception ex)
                     {
@@ -130,6 +167,11 @@ namespace EventLogOutEmployeeService
                     // tepat sebelum checkpoint window tetap ter-load ke memory sebelum 6006 di-replay.
                     // Tanpa ini, 1074 di detik terakhir sebelum replayFrom ter-potong → 6006 unconfirmed.
                     // DedupWindow 30 detik akan tangkap duplikat kalau 1074 sudah ada di queue.
+                    //
+                    // Upper bound TETAP replayTo (bukan securityReplayTo) — lihat catatan FIX [SEC-GAP]
+                    // di atas: System events tidak dapat grace period dari ShouldSkipLiveEntry, jadi
+                    // melebarkan window di sini hanya akan menciptakan overlap yang tidak perlu dengan
+                    // live tap, bukan menutup celah apa pun.
                     try
                     {
                         DateTime systemReplayFrom = replayFrom.Value.AddSeconds(-30);
@@ -149,6 +191,15 @@ namespace EventLogOutEmployeeService
                         EventLogEntryType.Information, 1029);
                 }
 
+                // NOTE: checkpoint tetap disimpan sebagai replayTo (bukan securityReplayTo).
+                // Konsekuensinya: startup berikutnya akan me-replay ulang window 10 detik terakhir
+                // ini untuk Security events. Ini disengaja, bukan oversight — checkpoint yang
+                // konservatif (mundur, bukan maju melewati apa yang pasti sudah tertangani live tap)
+                // lebih aman, dan overlap-nya sudah ditangani oleh dedup di EnqueueIfNotDuplicateAsync.
+                // Melebarkan checkpoint ke securityReplayTo akan menghemat sedikit re-scan tapi
+                // menambah risiko: kalau grace period pernah diperbesar di kemudian hari, checkpoint
+                // lama yang sudah "maju" duluan bisa membuat window itu tidak ke-cover di startup
+                // berikutnya.
                 _checkpointService.SaveReplayCheckpoint(replayTo);
             }
             catch (Exception ex)
@@ -190,7 +241,17 @@ namespace EventLogOutEmployeeService
             int corruptSkipCount = 0;
             string? firstCorruptExType = null;
 
-            for (int i = _securityEventLog.Entries.Count - 1; i >= 0; i--)
+            // FIX OBS-1 (2026-07-21 incident, User D): aggregate count alone gave no way to
+            // trace WHICH entry was lost. Capture index + event time (when readable) for each
+            // skipped entry so a future incident can be correlated against Sentinel/raw store
+            // directly instead of guessing from a bare count. Capped to avoid unbounded growth
+            // on machines with many corrupt entries — same rationale as FIX-SPAM-1039.
+            var corruptDetails = new List<string>();
+            const int MaxCorruptDetailsLogged = 5;
+
+            bool stopScanning = false;
+
+            for (int i = _securityEventLog.Entries.Count - 1; i >= 0 && !stopScanning; i--)
             {
                 // FIX BUG-A: Seluruh blok akses per-entry dibungkus try-catch.
                 // EventLog.Entries adalah live collection — log rotation saat iterasi berlangsung
@@ -199,71 +260,125 @@ namespace EventLogOutEmployeeService
                 // Sebelumnya: satu exception di index manapun mengabort seluruh loop — semua
                 // entry di index lebih rendah (lebih lama) tidak pernah dikumpulkan, tanpa warning.
                 // Setelah fix: entry bermasalah di-skip (log + continue), loop tetap berjalan.
-                // ArgumentException → break (log sudah di-rotate, lanjutkan ke tahap berikutnya).
-                // Exception lain     → continue (entry korup, lanjut ke entry berikutnya).
+                // ArgumentException → stop (log sudah di-rotate, lanjutkan ke tahap berikutnya).
+                // Exception lain     → retry sekali, lalu skip kalau masih gagal (lihat RETRY-1).
+                //
+                // FIX PERF-1 (2026-07-21 incident, User D): iterasi berjalan descending
+                // (terbaru → terlama), jadi begitu eventTime < fromTime.Value, SEMUA entry di
+                // index lebih rendah juga pasti lebih lama — aman untuk stop total, bukan cuma
+                // continue. Sebelumnya loop selalu memindai seluruh log (23k+ entries diamati di
+                // produksi) pada setiap startup replay, apa pun umur checkpoint-nya. Scan
+                // berkepanjangan ini memperlebar jendela race antara replay startup dan live
+                // event tap (lihat ShouldSkipLiveEntry): makin lama replay berjalan, makin besar
+                // kemungkinan event live tiba saat replayInProgress masih true dan ditolak oleh
+                // jendela yang sudah lewat.
+                //
+                // FIX RETRY-1: exception non-rotation biasanya race transient melawan penulisan
+                // log yang sedang berlangsung (lihat komentar FIX BUG-A) — bukan entry yang benar-
+                // benar rusak permanen. Retry sekali setelah jeda singkat sebelum menyerah.
                 EventLogEntry? entry = null;
-                try
+                DateTime? readTime = null;
+                Exception? lastEx = null;
+                bool handled = false;
+
+                for (int attempt = 0; attempt < 2 && !handled; attempt++)
                 {
-                    entry = _securityEventLog.Entries[i];
-                    DateTime eventTime = entry.TimeGenerated.ToUniversalTime();
-
-                    if (eventTime < fromTime.Value)
-                        continue;
-
-                    if (eventTime > toTime)
-                        continue;
-
-                    int eventId = _getNormalizedEventId(entry);
-                    if (eventId != 4624 && eventId != 4647 && eventId != 4634)
-                        continue;
-
-                    // Pre-filter 4624: skip irrelevant logon types saja.
-                    // Admin split-token filtering TIDAK dilakukan di sini — deferral ke
-                    // ProcessSecurityEntryAsync agar SaveRawSecurityEventAsync sempat
-                    // menyimpan metadata Logon ID yang dibutuhkan untuk korelasi 4634.
-                    if (eventId == 4624 && entry.Message != null)
+                    try
                     {
-                        int lt = SecurityEventParser.ParseLogonType(entry.Message);
-                        if (!_isRelevantLogonType(lt))
-                            continue;
-                    }
+                        entry = _securityEventLog.Entries[i];
+                        DateTime eventTime = entry.TimeGenerated.ToUniversalTime();
+                        readTime = eventTime;
 
-                    entries.Add((eventTime, entry, eventId));
-                }
-                catch (ArgumentException)
-                {
-                    // Log sudah di-rotate selama iterasi: Entries[i] tidak lagi valid.
-                    // Semua index lebih rendah juga tidak valid — hentikan loop dengan aman.
-                    // Rotation sudah log satu event saja (break) — tidak ada spam di sini.
-                    collectionErrors++;
-                    _writeEventLog("Application",
-                        $"[SEC-REPLAY] Security log rotated at index {i} during collection — stopping scan. " +
-                        $"Collected {entries.Count} entries before rotation. RawStore replay will cover gap.",
-                        EventLogEntryType.Warning, 1039);
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    // FIX-SPAM-1039: Entry korup — increment counter dan lanjut.
-                    // JANGAN panggil _writeEventLog di sini: pada mesin dengan ribuan
-                    // corrupt entries, per-entry log menghasilkan ribuan event 1039 yang
-                    // membuat Event Viewer tidak bisa dipakai untuk troubleshooting.
-                    // Summary warning satu baris ditulis setelah loop selesai.
-                    collectionErrors++;
-                    corruptSkipCount++;
-                    if (firstCorruptExType == null)
-                        firstCorruptExType = ex.GetType().Name;
-                    continue;
+                        if (eventTime < fromTime.Value)
+                        {
+                            _writeEventLog("Application",
+                                $"[SEC-REPLAY] Reached checkpoint lower bound at index {i} " +
+                                $"(eventTime={eventTime:O} < fromTime={fromTime.Value:O}) — stopping scan, " +
+                                "remaining entries are older.",
+                                EventLogEntryType.Information, 1045);
+                            stopScanning = true;
+                            handled = true;
+                            break;
+                        }
+
+                        if (eventTime <= toTime)
+                        {
+                            int eventId = _getNormalizedEventId(entry);
+                            if (eventId == 4624 || eventId == 4647 || eventId == 4634)
+                            {
+                                // Pre-filter 4624: skip irrelevant logon types saja.
+                                // Admin split-token filtering TIDAK dilakukan di sini — deferral ke
+                                // ProcessSecurityEntryAsync agar SaveRawSecurityEventAsync sempat
+                                // menyimpan metadata Logon ID yang dibutuhkan untuk korelasi 4634.
+                                bool relevant = true;
+                                if (eventId == 4624 && entry.Message != null)
+                                {
+                                    int lt = SecurityEventParser.ParseLogonType(entry.Message);
+                                    relevant = _isRelevantLogonType(lt);
+                                }
+
+                                if (relevant)
+                                    entries.Add((eventTime, entry, eventId));
+                            }
+                        }
+
+                        handled = true;
+                    }
+                    catch (ArgumentException)
+                    {
+                        // Log sudah di-rotate selama iterasi: Entries[i] tidak lagi valid.
+                        // Semua index lebih rendah juga tidak valid — hentikan loop dengan aman.
+                        // Rotation sudah log satu event saja — tidak ada spam di sini.
+                        collectionErrors++;
+                        _writeEventLog("Application",
+                            $"[SEC-REPLAY] Security log rotated at index {i} during collection — stopping scan. " +
+                            $"Collected {entries.Count} entries before rotation. RawStore replay will cover gap.",
+                            EventLogEntryType.Warning, 1039);
+                        stopScanning = true;
+                        handled = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        lastEx = ex;
+                        if (attempt == 0)
+                        {
+                            // FIX RETRY-1: beri jeda singkat lalu coba index yang sama sekali lagi —
+                            // kebanyakan kasus ini adalah race sesaat melawan penulisan log live,
+                            // yang biasanya selesai dalam puluhan milidetik.
+                            Thread.Sleep(50);
+                            continue;
+                        }
+
+                        // Kedua percobaan gagal — genuinely corrupt/inaccessible, menyerah untuk index ini.
+                        collectionErrors++;
+                        corruptSkipCount++;
+                        if (firstCorruptExType == null)
+                            firstCorruptExType = ex.GetType().Name;
+                        if (corruptDetails.Count < MaxCorruptDetailsLogged)
+                        {
+                            corruptDetails.Add(readTime.HasValue
+                                ? $"index={i},time={readTime.Value:O}"
+                                : $"index={i},time=unknown");
+                        }
+                        handled = true;
+                    }
                 }
             }
 
-            // FIX-SPAM-1039: Emit satu aggregated warning menggantikan ribuan per-entry logs.
+            // FIX-SPAM-1039 / FIX OBS-1: satu aggregated warning menggantikan ribuan per-entry
+            // logs, tapi sekarang menyertakan index+waktu (dibatasi MaxCorruptDetailsLogged) agar
+            // bisa dikorelasikan ke sumber independen (Sentinel/Event Viewer) saat investigasi.
             // Tetap pakai event ID 1039 agar filter Event Viewer yang sudah ada tetap bekerja.
             if (corruptSkipCount > 0)
             {
+                string detailSuffix = corruptDetails.Count > 0
+                    ? $" [{string.Join("; ", corruptDetails)}" +
+                      (corruptSkipCount > corruptDetails.Count ? $"; +{corruptSkipCount - corruptDetails.Count} more]" : "]")
+                    : string.Empty;
+
                 _writeEventLog("Application",
                     $"[SEC-REPLAY] Skipped {corruptSkipCount} corrupt Security entr{(corruptSkipCount == 1 ? "y" : "ies")} during collection " +
-                    $"(exType={firstCorruptExType ?? "unknown"}).",
+                    $"(exType={firstCorruptExType ?? "unknown"}){detailSuffix}.",
                     EventLogEntryType.Warning, 1039);
             }
 
@@ -339,7 +454,9 @@ namespace EventLogOutEmployeeService
             int corruptSkipCount = 0;
             string? firstCorruptExType = null;
 
-            for (int i = _systemEventLog.Entries.Count - 1; i >= 0; i--)
+            bool stopScanning = false;
+
+            for (int i = _systemEventLog.Entries.Count - 1; i >= 0 && !stopScanning; i--)
             {
                 // FIX BUG-C: Pola guard yang sama dengan ReplaySecurityEvents (FIX BUG-A).
                 // System log juga live collection — rotation selama iterasi throw ArgumentException.
@@ -347,6 +464,11 @@ namespace EventLogOutEmployeeService
                 // terkumpul tapi sebelum 1074, urutan sort tetap benar (sort by time), tapi
                 // jika 1074 sama sekali tidak terkumpul karena abort awal, 6006 menjadi unresolved.
                 // Dengan per-entry guard: entry korup di-skip, loop lanjut mencari 1074 yang valid.
+                //
+                // FIX PERF-1 (sama seperti ReplaySecurityEvents): descending iteration berarti
+                // begitu eventTime < fromTime.Value, seluruh entry di index lebih rendah juga
+                // lebih lama — stop total, bukan cuma continue, supaya startup replay tidak
+                // memindai seluruh log setiap kali.
                 EventLogEntry? entry = null;
                 try
                 {
@@ -354,7 +476,10 @@ namespace EventLogOutEmployeeService
                     DateTime eventTime = entry.TimeGenerated.ToUniversalTime();
 
                     if (eventTime < fromTime.Value)  // fromTime non-null guaranteed by guard above
+                    {
+                        stopScanning = true;
                         continue;
+                    }
 
                     if (eventTime > toTime)
                         continue;
