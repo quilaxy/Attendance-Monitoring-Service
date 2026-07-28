@@ -689,8 +689,57 @@ namespace EventLogOutEmployeeService
                     using var client = CreateGraphClient(currentToken, timeoutSeconds);
 
                     // ── Idempotency check ──────────────────────────────────────
-                    if (await RawRecordAlreadyExistsAsync(client, title, eventTime, cancellationToken))
+                    // EventTime  : UTC ISO 8601 — dipakai untuk filter/sort/cleanup (Date Only di SharePoint).
+                    // Time       : string HH:mm:ss local — kolom Single Line of Text, untuk tampilan jam.
+                    //              Konsisten dengan ClockIn/ClockOut di Summary list.
+                    string timeStr = eventTime.ToLocalTime().ToString("HH:mm:ss");
+
+                    var existsResult = await RawRecordAlreadyExistsAsync(client, title, eventTime, cancellationToken);
+                    if (existsResult.Exists)
                     {
+                        // FIX [BUG-EMPTY-TIME]: sebelumnya di sini langsung return —
+                        // row lama yang Time-nya kosong (misal dibuat sebelum kolom Time
+                        // dipakai, atau gagal ke-set karena sebab lain) permanen tidak
+                        // pernah diperbaiki karena raw list tidak punya jalur update selain
+                        // ini. Sekarang, kalau ketemu row existing dengan Time kosong dan
+                        // itemId-nya ada, kita PATCH Time-nya sebelum skip insert.
+                        if (existsResult.TimeMissing && !string.IsNullOrWhiteSpace(existsResult.ItemId))
+                        {
+                            try
+                            {
+                                var repairPatch = new JObject { ["Time"] = timeStr };
+                                var repairContent = new StringContent(
+                                    repairPatch.ToString(Newtonsoft.Json.Formatting.None), Encoding.UTF8, "application/json");
+                                using var repairRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
+                                    $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items/{existsResult.ItemId}/fields")
+                                { Content = repairContent };
+                                var repairResponse = await client.SendAsync(repairRequest, cancellationToken);
+
+                                if (repairResponse.IsSuccessStatusCode)
+                                {
+                                    SafeWriteEventLog("Application",
+                                        $"[RAW] Repair: Time backfilled for existing item {existsResult.ItemId} (title='{title}') = {timeStr}",
+                                        EventLogEntryType.Information, 4026);
+                                }
+                                else
+                                {
+                                    InvalidateTokenCacheIfUnauthorized(repairResponse); // FIX FINDING 1
+                                    string repairBody = await repairResponse.Content.ReadAsStringAsync();
+                                    SafeWriteEventLog("Application",
+                                        $"[RAW] Repair failed for item {existsResult.ItemId} (title='{title}'): HTTP {(int)repairResponse.StatusCode} {repairBody}",
+                                        EventLogEntryType.Warning, 4027);
+                                }
+                            }
+                            catch (Exception repairEx)
+                            {
+                                // Non-critical — jangan sampai kegagalan repair menghalangi
+                                // alur normal (event ini tetap dianggap sudah tercatat).
+                                SafeWriteEventLog("Application",
+                                    $"[RAW] Repair exception for item {existsResult.ItemId} (title='{title}'): {repairEx.Message}",
+                                    EventLogEntryType.Warning, 4027);
+                            }
+                        }
+
                         SafeWriteEventLog("Application",
                             $"[RAW] Idempotency: record already exists for title='{title}' at {eventTimeStr} — skipping insert.",
                             EventLogEntryType.Information, 4021);
@@ -698,10 +747,6 @@ namespace EventLogOutEmployeeService
                     }
 
                     // ── Insert ────────────────────────────────────────────────
-                    // EventTime  : UTC ISO 8601 — dipakai untuk filter/sort/cleanup (Date Only di SharePoint).
-                    // Time       : string HH:mm:ss local — kolom Single Line of Text, untuk tampilan jam.
-                    //              Konsisten dengan ClockIn/ClockOut di Summary list.
-                    string timeStr = eventTime.ToLocalTime().ToString("HH:mm:ss");
 
                     var postData = new
                     {
@@ -1145,15 +1190,30 @@ namespace EventLogOutEmployeeService
 
                 // Update ke loginTime yang lebih awal kalau perlu,
                 // sekaligus update LoginDevice kalau belum terisi.
+                //
+                // FIX [BUG-EMPTY-CLOCKIN]: SEBELUMNYA needsEarlierLogin mensyaratkan
+                // storedLogin.HasValue == true. Row yang dibuat lewat CreateEmptySummaryRowAsync
+                // (fallback saat 4624 tidak ter-capture) tidak punya LoginTime sama sekali
+                // (storedLogin == null). Begitu 4624 akhirnya ketemu belakangan (replay/device
+                // lain), needsEarlierLogin selalu false untuk row ini → jatuh ke cabang
+                // needsLoginDevice yang HANYA menulis LoginDevice, LoginTime/ClockIn/
+                // ExpectedClockOut tidak pernah terisi — dan karena LoginDevice sekali terisi,
+                // needsLoginDevice juga jadi false di panggilan berikutnya, jadi baris itu
+                // permanen kosong ClockIn-nya.
+                //
+                // FIX: !storedLogin.HasValue juga dianggap "perlu diisi login" (bukan cuma
+                // "perlu diisi kalau lebih awal dari yang tersimpan"), supaya baris stub ini
+                // dapat LoginTime/ClockIn/ExpectedClockOut secara penuh saat 4624 pertama kali
+                // berhasil diproses untuknya.
                 string? storedLoginDevice = fields?["LoginDevice"]?.ToString();
-                bool needsEarlierLogin = storedLogin.HasValue && loginTime < storedLogin.Value && !string.IsNullOrWhiteSpace(itemId);
+                bool needsEarlierLogin = (!storedLogin.HasValue || loginTime < storedLogin.Value) && !string.IsNullOrWhiteSpace(itemId);
                 bool needsLoginDevice  = string.IsNullOrWhiteSpace(storedLoginDevice) && !string.IsNullOrWhiteSpace(itemId);
 
                 if (needsEarlierLogin || needsLoginDevice)
                 {
                     SafeWriteEventLog("Application",
                         $"[DBG-Summary] UpsertLogin: patching — earlierLogin={needsEarlierLogin} loginDevice={needsLoginDevice} " +
-                        $"loginTime={loginTime:O} device={computerName}",
+                        $"storedLogin={storedLogin?.ToString("O") ?? "(null)"} loginTime={loginTime:O} device={computerName}",
                         EventLogEntryType.Information, 3003);
 
                     var loginPatch = new JObject();
@@ -2307,7 +2367,21 @@ namespace EventLogOutEmployeeService
             return null;
         }
 
-        private async Task<bool> RawRecordAlreadyExistsAsync(
+        /// <summary>
+        /// Hasil pengecekan duplikat raw record.
+        /// FIX [BUG-EMPTY-TIME]: sebelumnya cuma return bool exists/tidak — kalau row
+        /// sudah ada, insert langsung di-skip tanpa pernah cek apakah field Time-nya
+        /// kosong (misal row lama dari sebelum kolom Time dipakai). ItemId + TimeMissing
+        /// dipakai AddRecordToSharePointAsync untuk repair row itu alih-alih diam saja.
+        /// </summary>
+        private sealed class RawExistsResult
+        {
+            public bool Exists { get; init; }
+            public string? ItemId { get; init; }
+            public bool TimeMissing { get; init; }
+        }
+
+        private async Task<RawExistsResult> RawRecordAlreadyExistsAsync(
             HttpClient client,
             string title,
             DateTime eventTime,
@@ -2341,7 +2415,7 @@ namespace EventLogOutEmployeeService
             if (!checkResponse.IsSuccessStatusCode)
             {
                 InvalidateTokenCacheIfUnauthorized(checkResponse); // FIX FINDING 1
-                return false;
+                return new RawExistsResult { Exists = false };
             }
 
             var checkObj = JsonConvert.DeserializeObject<JObject>(
@@ -2349,7 +2423,7 @@ namespace EventLogOutEmployeeService
 
             var existing = checkObj?["value"] as JArray;
             if (existing == null || existing.Count == 0)
-                return false;
+                return new RawExistsResult { Exists = false };
 
             // Cek apakah ada row dengan Title yang sama (ComputerName+EventId+Username)
             // dalam window waktu tersebut.
@@ -2359,14 +2433,23 @@ namespace EventLogOutEmployeeService
                 string? existingTitle = fields?["Title"]?.ToString();
                 if (string.Equals(existingTitle, title, StringComparison.OrdinalIgnoreCase))
                 {
+                    string? existingItemId = row["id"]?.ToString();
+                    bool timeMissing = string.IsNullOrWhiteSpace(fields?["Time"]?.ToString());
+
                     SafeWriteEventLog("Application",
-                        $"[RAW] Idempotency hit: title='{title}' eventTime={eventTime:O}",
+                        $"[RAW] Idempotency hit: title='{title}' eventTime={eventTime:O} itemId={existingItemId} timeMissing={timeMissing}",
                         EventLogEntryType.Information, 4025);
-                    return true;
+
+                    return new RawExistsResult
+                    {
+                        Exists      = true,
+                        ItemId      = existingItemId,
+                        TimeMissing = timeMissing
+                    };
                 }
             }
 
-            return false;
+            return new RawExistsResult { Exists = false };
         }
 
         private static string BuildSummaryKey(string username, string workDate)
