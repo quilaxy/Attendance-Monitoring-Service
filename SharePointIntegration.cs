@@ -1498,7 +1498,9 @@ namespace EventLogOutEmployeeService
                     $"incoming eventId={eventId} priority={newPriority} cannot overwrite regardless of " +
                     $"isNewSession/cross-device. currentShutdown={currentShutdown:O} incomingShutdown={shutdownTime:O} " +
                     $"computer={computerName} incomingDevice-vs-currentDevice='{currentLogoutDevice}'.",
-                    EventLogEntryType.Warning, 3033);
+                    EventLogEntryType.Warning, 3036); // NOTE: 3033 sudah dipakai untuk log lain
+                                                        // (verbose-only) — pakai 3036 agar tidak
+                                                        // ikut ke-suppress saat VerboseLogging=false.
                 return;
             }
 
@@ -2194,6 +2196,13 @@ namespace EventLogOutEmployeeService
             3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019, 3021, 3022, 3023,
             // Post-PATCH verify OK (3033) — verbose only; mismatch (3032) dan race (3030/3031) selalu di-log
             3033,
+            // Cross-midnight write allowed (3035) — verbose only. Ini konfirmasi "normal, tidak ada
+            // masalah" untuk sesi yang genuinely lewat tengah malam (shift malam dll) — bisa cukup
+            // sering muncul di operasional normal, jadi bukan kandidat untuk selalu tampil di production.
+            // Beda dengan 3034/3036 (anomali ketangkep & diblokir) yang SENGAJA tidak dimasukkan ke sini —
+            // keduanya seharusnya jarang/nggak pernah nyala, jadi tetap selalu di-log agar kelihatan
+            // kalau ada kejadian yang perlu diperhatikan, tanpa perlu nyalain VerboseLogging.
+            3035,
             // Dispatch & raw detail
             4010, 4011, 4020, 4021, 4022, 4025,
             // Cleanup progress
