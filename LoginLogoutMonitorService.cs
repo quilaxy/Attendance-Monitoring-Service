@@ -4616,15 +4616,46 @@ namespace EventLogOutEmployeeService
                 return true;
 
             // Cek 2: RawEventStore di disk (fallback untuk post-restart scenario)
+            //
+            // FIX [4634-PAIR-DIRECTION]: Insiden nyata — 4634 dan 4624 dari Windows CachedInteractive
+            // transition tercatat di detik yang SAMA (08:06:33), tapi 4634-nya lolos dari stale-check
+            // ini dan malah dianggap logout beneran (status=CONFIRMED). Penyebabnya: kondisi
+            // `r.EventTimeUtc <= eventTimeUtc` hanya mengakui 4624 yang terjadi SEBELUM atau BARENGAN
+            // 4634 — kalau urutan riil (atau urutan tulis ke RawEventStore) kebalik, yaitu 4634
+            // tercatat lebih dulu walau selisihnya cuma milidetik, pasangannya tidak pernah ketemu.
+            // Windows tidak menjamin urutan 4634-sebelum-4624 untuk transisi cached-interactive ini
+            // (lihat komentar di pemanggil soal logon type 11) — jadi pengecekan harus dua arah:
+            // "apakah ada 4624 dalam windowSeconds dari 4634 ini, SEBELUM ATAUPUN SESUDAHNYA."
+            //
+            // Juga cek tanggal lokal SEBELUMNYA selain tanggal event sendiri, untuk menutup kasus
+            // pairing yang jatuh persis di sekitar tengah malam (4634 di 00:00:05, pasangan 4624
+            // tersimpan di file rawevents hari sebelumnya).
             try
             {
                 DateTime localDate = eventTimeUtc.ToLocalTime().Date;
                 var rawLogins = rawEventStore.GetEventsForDate(computerName, localDate, 4624);
-                return rawLogins.Any(r =>
+
+                bool pairedSameDay = rawLogins.Any(r =>
                     r.Username != null &&
                     r.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
-                    r.EventTimeUtc <= eventTimeUtc &&
-                    (eventTimeUtc - r.EventTimeUtc).TotalSeconds <= windowSeconds);
+                    Math.Abs((r.EventTimeUtc - eventTimeUtc).TotalSeconds) <= windowSeconds);
+                if (pairedSameDay)
+                    return true;
+
+                // Guard tambahan hanya relevan kalau event dekat tengah malam — hindari query
+                // ekstra yang tidak perlu untuk kasus umum (jauh dari batas hari).
+                bool nearMidnight = eventTimeUtc.ToLocalTime().TimeOfDay <= TimeSpan.FromSeconds(windowSeconds)
+                    || eventTimeUtc.ToLocalTime().TimeOfDay >= TimeSpan.FromHours(24) - TimeSpan.FromSeconds(windowSeconds);
+                if (nearMidnight)
+                {
+                    var rawLoginsPrevDay = rawEventStore.GetEventsForDate(computerName, localDate.AddDays(-1), 4624);
+                    return rawLoginsPrevDay.Any(r =>
+                        r.Username != null &&
+                        r.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
+                        Math.Abs((r.EventTimeUtc - eventTimeUtc).TotalSeconds) <= windowSeconds);
+                }
+
+                return false;
             }
             catch (Exception ex)
             {

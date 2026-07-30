@@ -689,57 +689,8 @@ namespace EventLogOutEmployeeService
                     using var client = CreateGraphClient(currentToken, timeoutSeconds);
 
                     // ── Idempotency check ──────────────────────────────────────
-                    // EventTime  : UTC ISO 8601 — dipakai untuk filter/sort/cleanup (Date Only di SharePoint).
-                    // Time       : string HH:mm:ss local — kolom Single Line of Text, untuk tampilan jam.
-                    //              Konsisten dengan ClockIn/ClockOut di Summary list.
-                    string timeStr = eventTime.ToLocalTime().ToString("HH:mm:ss");
-
-                    var existsResult = await RawRecordAlreadyExistsAsync(client, title, eventTime, cancellationToken);
-                    if (existsResult.Exists)
+                    if (await RawRecordAlreadyExistsAsync(client, title, eventTime, cancellationToken))
                     {
-                        // FIX [BUG-EMPTY-TIME]: sebelumnya di sini langsung return —
-                        // row lama yang Time-nya kosong (misal dibuat sebelum kolom Time
-                        // dipakai, atau gagal ke-set karena sebab lain) permanen tidak
-                        // pernah diperbaiki karena raw list tidak punya jalur update selain
-                        // ini. Sekarang, kalau ketemu row existing dengan Time kosong dan
-                        // itemId-nya ada, kita PATCH Time-nya sebelum skip insert.
-                        if (existsResult.TimeMissing && !string.IsNullOrWhiteSpace(existsResult.ItemId))
-                        {
-                            try
-                            {
-                                var repairPatch = new JObject { ["Time"] = timeStr };
-                                var repairContent = new StringContent(
-                                    repairPatch.ToString(Newtonsoft.Json.Formatting.None), Encoding.UTF8, "application/json");
-                                using var repairRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
-                                    $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items/{existsResult.ItemId}/fields")
-                                { Content = repairContent };
-                                var repairResponse = await client.SendAsync(repairRequest, cancellationToken);
-
-                                if (repairResponse.IsSuccessStatusCode)
-                                {
-                                    SafeWriteEventLog("Application",
-                                        $"[RAW] Repair: Time backfilled for existing item {existsResult.ItemId} (title='{title}') = {timeStr}",
-                                        EventLogEntryType.Information, 4026);
-                                }
-                                else
-                                {
-                                    InvalidateTokenCacheIfUnauthorized(repairResponse); // FIX FINDING 1
-                                    string repairBody = await repairResponse.Content.ReadAsStringAsync();
-                                    SafeWriteEventLog("Application",
-                                        $"[RAW] Repair failed for item {existsResult.ItemId} (title='{title}'): HTTP {(int)repairResponse.StatusCode} {repairBody}",
-                                        EventLogEntryType.Warning, 4027);
-                                }
-                            }
-                            catch (Exception repairEx)
-                            {
-                                // Non-critical — jangan sampai kegagalan repair menghalangi
-                                // alur normal (event ini tetap dianggap sudah tercatat).
-                                SafeWriteEventLog("Application",
-                                    $"[RAW] Repair exception for item {existsResult.ItemId} (title='{title}'): {repairEx.Message}",
-                                    EventLogEntryType.Warning, 4027);
-                            }
-                        }
-
                         SafeWriteEventLog("Application",
                             $"[RAW] Idempotency: record already exists for title='{title}' at {eventTimeStr} — skipping insert.",
                             EventLogEntryType.Information, 4021);
@@ -747,6 +698,10 @@ namespace EventLogOutEmployeeService
                     }
 
                     // ── Insert ────────────────────────────────────────────────
+                    // EventTime  : UTC ISO 8601 — dipakai untuk filter/sort/cleanup (Date Only di SharePoint).
+                    // Time       : string HH:mm:ss local — kolom Single Line of Text, untuk tampilan jam.
+                    //              Konsisten dengan ClockIn/ClockOut di Summary list.
+                    string timeStr = eventTime.ToLocalTime().ToString("HH:mm:ss");
 
                     var postData = new
                     {
@@ -1190,30 +1145,15 @@ namespace EventLogOutEmployeeService
 
                 // Update ke loginTime yang lebih awal kalau perlu,
                 // sekaligus update LoginDevice kalau belum terisi.
-                //
-                // FIX [BUG-EMPTY-CLOCKIN]: SEBELUMNYA needsEarlierLogin mensyaratkan
-                // storedLogin.HasValue == true. Row yang dibuat lewat CreateEmptySummaryRowAsync
-                // (fallback saat 4624 tidak ter-capture) tidak punya LoginTime sama sekali
-                // (storedLogin == null). Begitu 4624 akhirnya ketemu belakangan (replay/device
-                // lain), needsEarlierLogin selalu false untuk row ini → jatuh ke cabang
-                // needsLoginDevice yang HANYA menulis LoginDevice, LoginTime/ClockIn/
-                // ExpectedClockOut tidak pernah terisi — dan karena LoginDevice sekali terisi,
-                // needsLoginDevice juga jadi false di panggilan berikutnya, jadi baris itu
-                // permanen kosong ClockIn-nya.
-                //
-                // FIX: !storedLogin.HasValue juga dianggap "perlu diisi login" (bukan cuma
-                // "perlu diisi kalau lebih awal dari yang tersimpan"), supaya baris stub ini
-                // dapat LoginTime/ClockIn/ExpectedClockOut secara penuh saat 4624 pertama kali
-                // berhasil diproses untuknya.
                 string? storedLoginDevice = fields?["LoginDevice"]?.ToString();
-                bool needsEarlierLogin = (!storedLogin.HasValue || loginTime < storedLogin.Value) && !string.IsNullOrWhiteSpace(itemId);
+                bool needsEarlierLogin = storedLogin.HasValue && loginTime < storedLogin.Value && !string.IsNullOrWhiteSpace(itemId);
                 bool needsLoginDevice  = string.IsNullOrWhiteSpace(storedLoginDevice) && !string.IsNullOrWhiteSpace(itemId);
 
                 if (needsEarlierLogin || needsLoginDevice)
                 {
                     SafeWriteEventLog("Application",
                         $"[DBG-Summary] UpsertLogin: patching — earlierLogin={needsEarlierLogin} loginDevice={needsLoginDevice} " +
-                        $"storedLogin={storedLogin?.ToString("O") ?? "(null)"} loginTime={loginTime:O} device={computerName}",
+                        $"loginTime={loginTime:O} device={computerName}",
                         EventLogEntryType.Information, 3003);
 
                     var loginPatch = new JObject();
@@ -1537,6 +1477,71 @@ namespace EventLogOutEmployeeService
 
             int newPriority     = GetShutdownPriority(eventId, eventType);
             int currentPriority = GetPriorityFromShutdownType(currentShutdownType);
+
+            // FIX [4647-LOCK]: Insiden nyata — row yang sudah ditutup dengan 4647 (explicit user
+            // logout, priority 6, TERTINGGI) ternyata bisa ditimpa oleh event priority lebih rendah
+            // (4634 fallback, priority 3) lewat isNewSession bypass di bawah. isNewSession HANYA
+            // mengecek "ada login baru setelah currentShutdown?" — tidak pernah mengecek APAKAH
+            // currentShutdown itu 4647 (final, definitif) atau sekadar fallback (masih bisa dikoreksi).
+            //
+            // 4647 berbeda dari event lain: begitu tertulis, ia bukan "priority tertinggi yang bisa
+            // dikalahkan priority sama tinggi" — ia adalah closing signal definitif. Sesi baru di hari
+            // yang SAMA tetap sah update row yang sama (mis. dua sesi login-logout dalam 1 hari), makanya
+            // guard ini hanya menolak kalau incoming event priority-nya LEBIH RENDAH dari 4647 — 4647
+            // baru (priority sama, 6) tetap boleh lewat ke logic newPriority==effectiveCurrentPriority
+            // di bawah, yang akan pilih waktu terbaru.
+            bool currentIsLockedBy4647 = currentShutdown.HasValue && currentPriority == 6;
+            if (currentIsLockedBy4647 && newPriority < 6)
+            {
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] TryUpdateShutdown: SKIP — row locked by existing 4647 (definitive close), " +
+                    $"incoming eventId={eventId} priority={newPriority} cannot overwrite regardless of " +
+                    $"isNewSession/cross-device. currentShutdown={currentShutdown:O} incomingShutdown={shutdownTime:O} " +
+                    $"computer={computerName} incomingDevice-vs-currentDevice='{currentLogoutDevice}'.",
+                    EventLogEntryType.Warning, 3033);
+                return;
+            }
+
+            // FIX [WORKDATE-SANITY]: Insiden nyata — 4634 pada 30/07 08:06 (nyaris berbarengan
+            // dengan 4624 baru di 30/07 08:06, pola Windows CachedInteractive yang sama seperti
+            // di komentar isStaleSessionClose) lolos dari stale-check, lalu FindSummaryItemForShutdownAsync
+            // fallback ke row WorkDate=29/07 (row 30/07 belum ke-index saat itu), dan isNewSession
+            // bypass mengizinkan overwrite — hasil akhir: ShutdownTime 30/07 tertulis di row 29/07.
+            //
+            // "Yesterday fallback" di FindSummaryItemForShutdownAsync memang didesain untuk sesi yang
+            // genuinely nyambung lewat tengah malam (login 23:00, shutdown 01:00 — masih 1 sesi).
+            // Tapi ia tidak pernah mengecek: "apakah hari event ini SENDIRI sudah punya login-nya
+            // sendiri?" Kalau sudah, ini bukan overnight continuation — ini sesi baru yang harus
+            // punya row sendiri, bukan menimpa row hari sebelumnya.
+            string? rowWorkDate = fields?["WorkDate"]?.ToString();
+            if (!string.IsNullOrWhiteSpace(rowWorkDate))
+            {
+                string incomingDate = shutdownTime.ToLocalTime().ToString("yyyy-MM-dd");
+                if (!string.Equals(rowWorkDate, incomingDate, StringComparison.Ordinal))
+                {
+                    string indexKeyOwnDay = $"{computerName}::{incomingDate}";
+                    bool hasOwnDayLogin = allLogon4624Index.TryGetValue(indexKeyOwnDay, out var ownDayLogins)
+                        && ownDayLogins.Any(t => t <= shutdownTime);
+
+                    if (hasOwnDayLogin)
+                    {
+                        SafeWriteEventLog("Application",
+                            $"[DBG-Summary] TryUpdateShutdown: SKIP — row WorkDate={rowWorkDate} differs from " +
+                            $"incoming event's own calendar day ({incomingDate}), and computer={computerName} " +
+                            $"already has its own login on {incomingDate} before {shutdownTime:O}. This is a " +
+                            $"same-day session, not an overnight continuation — refusing to write into the " +
+                            $"previous day's row. eventId={eventId} shutdownTime={shutdownTime:O}.",
+                            EventLogEntryType.Warning, 3034);
+                        return;
+                    }
+
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] TryUpdateShutdown: cross-midnight write allowed — row WorkDate={rowWorkDate}, " +
+                        $"incoming day={incomingDate}, no login found yet on {incomingDate} for computer={computerName}. " +
+                        $"Treated as genuine overnight session continuation.",
+                        EventLogEntryType.Information, 3035);
+                }
+            }
 
             // FIX [NEW-SESSION]: Kalau shutdown baru terjadi SETELAH shutdown yang tersimpan,
             // Kalau belum ada ShutdownTime sama sekali, set sentinel priority -2 agar
@@ -2367,21 +2372,7 @@ namespace EventLogOutEmployeeService
             return null;
         }
 
-        /// <summary>
-        /// Hasil pengecekan duplikat raw record.
-        /// FIX [BUG-EMPTY-TIME]: sebelumnya cuma return bool exists/tidak — kalau row
-        /// sudah ada, insert langsung di-skip tanpa pernah cek apakah field Time-nya
-        /// kosong (misal row lama dari sebelum kolom Time dipakai). ItemId + TimeMissing
-        /// dipakai AddRecordToSharePointAsync untuk repair row itu alih-alih diam saja.
-        /// </summary>
-        private sealed class RawExistsResult
-        {
-            public bool Exists { get; init; }
-            public string? ItemId { get; init; }
-            public bool TimeMissing { get; init; }
-        }
-
-        private async Task<RawExistsResult> RawRecordAlreadyExistsAsync(
+        private async Task<bool> RawRecordAlreadyExistsAsync(
             HttpClient client,
             string title,
             DateTime eventTime,
@@ -2415,7 +2406,7 @@ namespace EventLogOutEmployeeService
             if (!checkResponse.IsSuccessStatusCode)
             {
                 InvalidateTokenCacheIfUnauthorized(checkResponse); // FIX FINDING 1
-                return new RawExistsResult { Exists = false };
+                return false;
             }
 
             var checkObj = JsonConvert.DeserializeObject<JObject>(
@@ -2423,7 +2414,7 @@ namespace EventLogOutEmployeeService
 
             var existing = checkObj?["value"] as JArray;
             if (existing == null || existing.Count == 0)
-                return new RawExistsResult { Exists = false };
+                return false;
 
             // Cek apakah ada row dengan Title yang sama (ComputerName+EventId+Username)
             // dalam window waktu tersebut.
@@ -2433,23 +2424,14 @@ namespace EventLogOutEmployeeService
                 string? existingTitle = fields?["Title"]?.ToString();
                 if (string.Equals(existingTitle, title, StringComparison.OrdinalIgnoreCase))
                 {
-                    string? existingItemId = row["id"]?.ToString();
-                    bool timeMissing = string.IsNullOrWhiteSpace(fields?["Time"]?.ToString());
-
                     SafeWriteEventLog("Application",
-                        $"[RAW] Idempotency hit: title='{title}' eventTime={eventTime:O} itemId={existingItemId} timeMissing={timeMissing}",
+                        $"[RAW] Idempotency hit: title='{title}' eventTime={eventTime:O}",
                         EventLogEntryType.Information, 4025);
-
-                    return new RawExistsResult
-                    {
-                        Exists      = true,
-                        ItemId      = existingItemId,
-                        TimeMissing = timeMissing
-                    };
+                    return true;
                 }
             }
 
-            return new RawExistsResult { Exists = false };
+            return false;
         }
 
         private static string BuildSummaryKey(string username, string workDate)
