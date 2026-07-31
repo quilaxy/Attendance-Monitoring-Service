@@ -1515,11 +1515,30 @@ namespace EventLogOutEmployeeService
             // Tapi ia tidak pernah mengecek: "apakah hari event ini SENDIRI sudah punya login-nya
             // sendiri?" Kalau sudah, ini bukan overnight continuation — ini sesi baru yang harus
             // punya row sendiri, bukan menimpa row hari sebelumnya.
-            string? rowWorkDate = fields?["WorkDate"]?.ToString();
-            if (!string.IsNullOrWhiteSpace(rowWorkDate))
+            // FIX [WORKDATE-SANITY-FORMAT]: Insiden nyata — rowWorkDate sebelumnya diambil via
+            // fields?["WorkDate"]?.ToString() mentah-mentah. Kalau kolom "WorkDate" di SharePoint
+            // bertipe Date (bukan Text), Graph/JSON.NET mengembalikannya sebagai JValue bertipe
+            // DateTime, sehingga .ToString() menghasilkan format DateTime penuh dengan kultur
+            // default (mis. "29/07/2026 17:00:00" — representasi UTC dari tengah malam lokal),
+            // bukan string tanggal polos. Dibandingkan Ordinal terhadap incomingDate yang selalu
+            // di-format "yyyy-MM-dd", dua string ini TIDAK PERNAH sama meski merepresentasikan
+            // hari yang identik — guard jadi SELALU menyimpulkan "beda hari", lalu (karena device
+            // hampir selalu sudah login di hari itu) SELALU menolak tulis shutdown yang valid ke
+            // row yang sebenarnya benar. Karena guard keluar lewat return; (bukan throw), caller
+            // (TryDispatchQueuedEventAsync) menganggap dispatch sukses dan menandai
+            // SummaryDispatched=true — ShutdownTime hilang permanen tanpa ada error/exception
+            // sama sekali (silent drop yang tidak ke-cover oleh fix BUG-3027/BUG-3031 karena
+            // keduanya cuma menyasar jalur yang throw).
+            //
+            // Fix: parse WorkDate dengan ParseFieldDateTime yang sama seperti LoginTime/
+            // ExpectedTimeOut/ShutdownTime (sudah menangani UTC-normalization dengan benar),
+            // lalu bandingkan tanggal lokalnya — bukan string mentah dari sumber yang berbeda format.
+            DateTime? rowWorkDateUtc = ParseFieldDateTime(fields, "WorkDate");
+            if (rowWorkDateUtc.HasValue)
             {
+                string rowWorkDateLocal = rowWorkDateUtc.Value.ToLocalTime().ToString("yyyy-MM-dd");
                 string incomingDate = shutdownTime.ToLocalTime().ToString("yyyy-MM-dd");
-                if (!string.Equals(rowWorkDate, incomingDate, StringComparison.Ordinal))
+                if (!string.Equals(rowWorkDateLocal, incomingDate, StringComparison.Ordinal))
                 {
                     string indexKeyOwnDay = $"{computerName}::{incomingDate}";
                     bool hasOwnDayLogin = allLogon4624Index.TryGetValue(indexKeyOwnDay, out var ownDayLogins)
@@ -1528,7 +1547,7 @@ namespace EventLogOutEmployeeService
                     if (hasOwnDayLogin)
                     {
                         SafeWriteEventLog("Application",
-                            $"[DBG-Summary] TryUpdateShutdown: SKIP — row WorkDate={rowWorkDate} differs from " +
+                            $"[DBG-Summary] TryUpdateShutdown: SKIP — row WorkDate={rowWorkDateLocal} differs from " +
                             $"incoming event's own calendar day ({incomingDate}), and computer={computerName} " +
                             $"already has its own login on {incomingDate} before {shutdownTime:O}. This is a " +
                             $"same-day session, not an overnight continuation — refusing to write into the " +
@@ -1538,7 +1557,7 @@ namespace EventLogOutEmployeeService
                     }
 
                     SafeWriteEventLog("Application",
-                        $"[DBG-Summary] TryUpdateShutdown: cross-midnight write allowed — row WorkDate={rowWorkDate}, " +
+                        $"[DBG-Summary] TryUpdateShutdown: cross-midnight write allowed — row WorkDate={rowWorkDateLocal}, " +
                         $"incoming day={incomingDate}, no login found yet on {incomingDate} for computer={computerName}. " +
                         $"Treated as genuine overnight session continuation.",
                         EventLogEntryType.Information, 3035);
