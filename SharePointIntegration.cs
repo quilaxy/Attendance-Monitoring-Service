@@ -1145,8 +1145,17 @@ namespace EventLogOutEmployeeService
 
                 // Update ke loginTime yang lebih awal kalau perlu,
                 // sekaligus update LoginDevice kalau belum terisi.
+                //
+                // FIX [MISSING-LOGIN-BACKFILL]: sebelumnya needsEarlierLogin cuma true kalau
+                // SUDAH ADA storedLogin dan incoming lebih awal darinya. Row yang dibuat duluan
+                // lewat CreateEmptySummaryRowAsync (fallback shutdown, sebelum event 4624 login
+                // sempat diproses) punya LoginTime kosong (storedLogin == null) — kondisi lama
+                // menganggap ini "tidak perlu di-update", jadi cuma LoginDevice yang ke-patch
+                // (lewat needsLoginDevice) dan LoginTime tidak pernah ditulis sama sekali.
+                // "Tidak ada LoginTime tersimpan sama sekali" harus dianggap butuh tulis juga,
+                // bukan cuma "incoming lebih awal dari yang sudah ada".
                 string? storedLoginDevice = fields?["LoginDevice"]?.ToString();
-                bool needsEarlierLogin = storedLogin.HasValue && loginTime < storedLogin.Value && !string.IsNullOrWhiteSpace(itemId);
+                bool needsEarlierLogin = (!storedLogin.HasValue || loginTime < storedLogin.Value) && !string.IsNullOrWhiteSpace(itemId);
                 bool needsLoginDevice  = string.IsNullOrWhiteSpace(storedLoginDevice) && !string.IsNullOrWhiteSpace(itemId);
 
                 if (needsEarlierLogin || needsLoginDevice)
@@ -2364,6 +2373,219 @@ namespace EventLogOutEmployeeService
                 EventLogEntryType.Information, 3021);
 
             return result;
+        }
+
+        /// <summary>
+        /// FIX [MISSING-LOGIN-RECONCILE]: reconciliation pass — jaring pengaman untuk kasus
+        /// Login kosong di Summary (kolom LoginTime dan/atau ClockIn — lihat catatan schema di
+        /// bawah) padahal raw Attendance-Log sudah punya event 4624 login pertama hari itu
+        /// (mis. race shutdown-vs-login yang dulu bikin bug needsEarlierLogin, atau penyebab
+        /// lain yang belum ketahuan). Sistem sebelumnya murni reaktif — begitu
+        /// SummaryDispatched=true, tidak ada apapun yang mengunjungi ulang row itu. Method ini
+        /// dipanggil periodik (lihat caller di LoginLogoutMonitorService) untuk WorkDate tertentu
+        /// (biasanya "hari ini") supaya gap semacam ini ketahuan &amp; ke-backfill sebelum sore/malam,
+        /// bukan baru ketahuan pas ada yang komplain payroll.
+        ///
+        /// SCHEMA-VERIFIED: ada DUA field terpisah yang gampang tertukar —
+        ///   • LoginTime — kolom Date/Time asli ("dateTime" format "dateTime"), satu kategori
+        ///     dengan WorkDate/ShutdownTime. Ini backing field, tidak ditampilkan langsung di
+        ///     CSV/export.
+        ///   • ClockIn — kolom Single Line of Text, tapi displayName-nya di SharePoint adalah
+        ///     "Login" — INI yang muncul di CSV/export Summary yang selama ini dicek user.
+        /// Keduanya normalnya ditulis bareng dalam satu PATCH/POST (lihat
+        /// UpsertDailySummaryLoginAsync), tapi method ini mengecek DUA-DUANYA secara terpisah
+        /// (ParseFieldDateTime untuk LoginTime, string check untuk ClockIn) supaya tidak
+        /// terlewat kalau suatu saat ada partial-write yang cuma kena salah satu.
+        ///
+        /// Return: jumlah row yang berhasil di-backfill.
+        /// </summary>
+        public async Task<int> BackfillMissingLoginTimesAsync(
+            string accessToken,
+            DateTime workDateLocal,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(_summaryListId) || string.IsNullOrWhiteSpace(_listId))
+                return 0;
+
+            string workDate = workDateLocal.ToLocalTime().ToString("yyyy-MM-dd");
+            using var client = CreateGraphClient(accessToken, 60);
+
+            // ── 1. Ambil semua row Summary untuk WorkDate ini ──────────────────────
+            string summaryFilter = $"fields/WorkDate eq '{EscapeODataLiteral(workDate)}'";
+            string summaryUrl = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items" +
+                $"?$expand=fields&$filter={Uri.EscapeDataString(summaryFilter)}&$top=999";
+
+            var summaryRequest = new HttpRequestMessage(HttpMethod.Get, summaryUrl);
+            summaryRequest.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
+            var summaryResponse = await client.SendAsync(summaryRequest, cancellationToken);
+            if (!summaryResponse.IsSuccessStatusCode)
+            {
+                InvalidateTokenCacheIfUnauthorized(summaryResponse);
+                string errBody = await summaryResponse.Content.ReadAsStringAsync();
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] BackfillMissingLoginTimes: HTTP {(int)summaryResponse.StatusCode} " +
+                    $"listing rows for workDate={workDate} body={errBody}",
+                    EventLogEntryType.Warning, 3040);
+                return 0;
+            }
+
+            var summaryObj = JsonConvert.DeserializeObject<JObject>(await summaryResponse.Content.ReadAsStringAsync());
+            var summaryRows = summaryObj?["value"] as JArray;
+            if (summaryRows == null || summaryRows.Count == 0)
+                return 0;
+
+            int patchedCount = 0;
+
+            foreach (var row in summaryRows)
+            {
+                var fields  = row["fields"] as JObject;
+                string? itemId   = row["id"]?.ToString();
+                string? username = fields?["Username"]?.ToString();
+
+                // FIX [SCHEMA-VERIFIED]: dua field terpisah perlu dicek, beda tipe:
+                //   • LoginTime — kolom Date/Time asli ("dateTime" format "dateTime"), satu
+                //     kategori dengan WorkDate/ShutdownTime. Cek via ParseFieldDateTime, sama
+                //     seperti storedLogin di UpsertDailySummaryLoginAsync.
+                //   • ClockIn — kolom Single Line of Text, TAPI ini yang tampil ke user dengan
+                //     displayName "Login" (lihat schema list: displayName:"Login" → name:"ClockIn").
+                //     Ini field yang sebenarnya muncul di CSV/export Summary yang dikeluhkan
+                //     kosong — beda dari LoginTime yang cuma backing field. Cek sebagai string
+                //     mentah (IsNullOrWhiteSpace), BUKAN ParseFieldDateTime, karena memang Text.
+                // Row dianggap butuh backfill kalau SALAH SATU kosong — normalnya keduanya
+                // ditulis bareng dalam satu PATCH/POST (lihat UpsertDailySummaryLoginAsync), tapi
+                // cek dua-duanya lebih aman untuk menangkap kasus partial-write yang belum
+                // ketahuan.
+                bool loginTimeIsEmpty = !ParseFieldDateTime(fields, "LoginTime").HasValue;
+                bool clockInIsEmpty   = string.IsNullOrWhiteSpace(fields?["ClockIn"]?.ToString());
+                bool loginIsEmpty     = loginTimeIsEmpty || clockInIsEmpty;
+
+                if (!loginIsEmpty || string.IsNullOrWhiteSpace(itemId) || string.IsNullOrWhiteSpace(username))
+                    continue; // sudah terisi lengkap, atau row tidak lengkap — lewati.
+
+                // ── 2. Cari 4624 (Login) paling awal hari itu di raw Attendance-Log ──
+                DateTime? earliestLogin = await FindEarliestRawLoginAsync(client, username, workDate, cancellationToken);
+                if (!earliestLogin.HasValue)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] BackfillMissingLoginTimes: itemId={itemId} user={username} " +
+                        $"workDate={workDate} LoginTime kosong, tapi belum ada 4624 di raw log hari itu — dilewati.",
+                        EventLogEntryType.Information, 3041);
+                    continue;
+                }
+
+                // ── 3. Ambil ComputerName dari raw event yang sama (bukan asumsi) ──
+                string? computerName = await FindComputerNameForRawEventAsync(
+                    client, username, earliestLogin.Value, 4624, cancellationToken);
+                if (string.IsNullOrWhiteSpace(computerName))
+                    computerName = fields?["LoginDevice"]?.ToString(); // fallback kalau raw tidak ketemu device-nya
+
+                DateTime loginTime = earliestLogin.Value;
+                var loginPatch = new JObject
+                {
+                    ["LoginTime"]        = ToUtcString(loginTime),
+                    ["ExpectedTimeOut"]  = ToUtcString(loginTime.AddHours(9)),
+                    ["ClockIn"]          = ToLocalTimeString(loginTime),
+                    ["ExpectedClockOut"] = ToLocalTimeString(loginTime.AddHours(9))
+                };
+                if (!string.IsNullOrWhiteSpace(computerName))
+                    loginPatch["LoginDevice"] = computerName;
+
+                var patchContent = new StringContent(
+                    loginPatch.ToString(Newtonsoft.Json.Formatting.None), Encoding.UTF8, "application/json");
+                using var patchRequest = new HttpRequestMessage(new HttpMethod("PATCH"),
+                    $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_summaryListId}/items/{itemId}/fields")
+                { Content = patchContent };
+                var patchResponse = await client.SendAsync(patchRequest, cancellationToken);
+
+                if (!patchResponse.IsSuccessStatusCode)
+                {
+                    InvalidateTokenCacheIfUnauthorized(patchResponse);
+                    string patchBody = await patchResponse.Content.ReadAsStringAsync();
+                    SafeWriteEventLog("Application",
+                        $"[DBG-Summary] BackfillMissingLoginTimes: gagal patch LoginTime itemId={itemId} " +
+                        $"user={username} Status={patchResponse.StatusCode} Body={patchBody}",
+                        EventLogEntryType.Warning, 3042);
+                    continue;
+                }
+
+                patchedCount++;
+                SafeWriteEventLog("Application",
+                    $"[DBG-Summary] BackfillMissingLoginTimes: berhasil backfill LoginTime={loginTime:O} " +
+                    $"device={computerName} itemId={itemId} user={username} workDate={workDate}",
+                    EventLogEntryType.Information, 3043);
+            }
+
+            return patchedCount;
+        }
+
+        /// <summary>
+        /// Cari event 4624 (Login) paling awal untuk Username tertentu pada WorkDate tertentu
+        /// (local date) di raw Attendance-Log list. Dipakai oleh BackfillMissingLoginTimesAsync.
+        /// </summary>
+        private async Task<DateTime?> FindEarliestRawLoginAsync(
+            HttpClient client, string username, string workDate, CancellationToken cancellationToken)
+        {
+            DateTime dayStartLocal = DateTime.SpecifyKind(
+                DateTime.ParseExact(workDate, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                DateTimeKind.Local);
+            DateTime fromUtc = dayStartLocal.ToUniversalTime();
+            DateTime toUtc   = fromUtc.AddDays(1);
+
+            string filter = $"fields/Username eq '{EscapeODataLiteral(username)}' and " +
+                            $"fields/EventID eq 4624 and " +
+                            $"fields/EventTime ge '{fromUtc:yyyy-MM-ddTHH:mm:ssZ}' and " +
+                            $"fields/EventTime lt '{toUtc:yyyy-MM-ddTHH:mm:ssZ}'";
+
+            string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
+                $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$orderby=fields/EventTime asc&$top=1";
+
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
+            var response = await client.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                InvalidateTokenCacheIfUnauthorized(response);
+                return null;
+            }
+
+            var obj = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
+            var items = obj?["value"] as JArray;
+            if (items == null || items.Count == 0)
+                return null;
+
+            var loginFields = items[0]["fields"] as JObject;
+            return ParseFieldDateTime(loginFields, "EventTime");
+        }
+
+        /// <summary>
+        /// Cari ComputerName dari raw event tertentu (Username+EventID+EventTime). Dipakai oleh
+        /// BackfillMissingLoginTimesAsync supaya LoginDevice diisi dari data asli, bukan tebakan.
+        /// </summary>
+        private async Task<string?> FindComputerNameForRawEventAsync(
+            HttpClient client, string username, DateTime eventTimeUtc, int eventId, CancellationToken cancellationToken)
+        {
+            string filter = $"fields/Username eq '{EscapeODataLiteral(username)}' and " +
+                            $"fields/EventID eq {eventId} and " +
+                            $"fields/EventTime eq '{eventTimeUtc:yyyy-MM-ddTHH:mm:ssZ}'";
+
+            string url = $"https://graph.microsoft.com/v1.0/sites/{_siteId}/lists/{_listId}/items" +
+                $"?$expand=fields&$filter={Uri.EscapeDataString(filter)}&$top=1";
+
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("Prefer", "HonorNonIndexedQueriesWarningMayFailRandomly");
+            var response = await client.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                InvalidateTokenCacheIfUnauthorized(response);
+                return null;
+            }
+
+            var obj = JsonConvert.DeserializeObject<JObject>(await response.Content.ReadAsStringAsync());
+            var items = obj?["value"] as JArray;
+            if (items == null || items.Count == 0)
+                return null;
+
+            return (items[0]["fields"] as JObject)?["ComputerName"]?.ToString();
         }
 
         /// <summary>

@@ -124,6 +124,13 @@ namespace EventLogOutEmployeeService
         private Task? watchdogTask;
         private Timer? _supervisorWatchdogTimer;
 
+        // FIX [MISSING-LOGIN-RECONCILE]: jaring pengaman periodik — Summary list bersifat
+        // reaktif murni (lihat SharePointIntegration.BackfillMissingLoginTimesAsync), jadi
+        // row dengan LoginTime kosong padahal raw log sudah punya 4624 hari itu tidak akan
+        // pernah ke-perbaiki sendiri kalau tidak ada event baru lagi hari itu. Timer ini
+        // yang menutup celah tersebut.
+        private Timer? _missingLoginReconcileTimer;
+
         private CancellationTokenSource? _cleanupTaskCts;
         private CancellationTokenSource? _queueTaskCts;
         private CancellationTokenSource? _securityHealthTaskCts;
@@ -1603,6 +1610,67 @@ namespace EventLogOutEmployeeService
             }
 
             StartSupervisorWatchdogTimer(cancellationToken);
+            StartMissingLoginReconcileTimer(cancellationToken);
+        }
+
+        /// <summary>
+        /// FIX [MISSING-LOGIN-RECONCILE]: tiap 2 jam, cek row Summary hari ini yang LoginTime-nya
+        /// kosong padahal raw Attendance-Log sudah punya event 4624 login pertama hari itu, dan
+        /// backfill kalau ketemu. Interval sengaja tidak terlalu rapat (bukan proses kritis,
+        /// tidak perlu near-real-time) — tujuannya supaya gap semacam ini ketahuan &amp; ke-perbaiki
+        /// dalam hitungan jam kalau memang terjadi, bukan didiamkan sampai ada yang komplain.
+        /// Dijalankan lewat Timer sederhana (bukan supervised task) karena bukan proses yang
+        /// perlu auto-restart-guard — kalau satu run gagal (network/token), run berikutnya 2 jam
+        /// lagi tetap jalan seperti biasa.
+        /// </summary>
+        private void StartMissingLoginReconcileTimer(CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            _missingLoginReconcileTimer?.Dispose();
+            _missingLoginReconcileTimer = new Timer(_ =>
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
+                _ = RunMissingLoginReconcileAsync(cancellationToken);
+            }, null, TimeSpan.FromMinutes(10), TimeSpan.FromHours(2));
+        }
+
+        private async Task RunMissingLoginReconcileAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var sharePoint = sharePointIntegration.Value;
+                DateTime nowUtc = DateTime.UtcNow;
+                string? accessToken = await sharePoint.GetAccessTokenAsync(nowUtc, 0, cancellationToken);
+                if (string.IsNullOrWhiteSpace(accessToken))
+                {
+                    SafeWriteEventLog("Application",
+                        "[RECONCILE] MissingLoginReconcile: skip — access token null.",
+                        EventLogEntryType.Warning, 1094);
+                    return;
+                }
+
+                // Cek "hari ini" (local time) — kalau baru lewat tengah malam, ini juga otomatis
+                // mulai memeriksa row hari yang baru.
+                int patched = await sharePoint.BackfillMissingLoginTimesAsync(
+                    accessToken, DateTime.Now, cancellationToken);
+
+                if (patched > 0)
+                {
+                    SafeWriteEventLog("Application",
+                        $"[RECONCILE] MissingLoginReconcile: berhasil backfill {patched} row LoginTime kosong.",
+                        EventLogEntryType.Information, 1095);
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeWriteEventLog("Application",
+                    $"[RECONCILE] MissingLoginReconcile: gagal — {ex.Message}",
+                    EventLogEntryType.Warning, 1096);
+            }
         }
 
         private void StartSupervisorWatchdogTimer(CancellationToken cancellationToken)
@@ -2066,6 +2134,8 @@ namespace EventLogOutEmployeeService
                 CancelTask(ref _heartbeatTaskCts);
                 _supervisorWatchdogTimer?.Dispose();
                 _supervisorWatchdogTimer = null;
+                _missingLoginReconcileTimer?.Dispose();
+                _missingLoginReconcileTimer = null;
 
                 cleanupTask = null;
                 queueTask = null;
